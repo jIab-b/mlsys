@@ -5,72 +5,58 @@ import sys
 from pathlib import Path
 
 from app import app, sync_sglang, run_eval
+from format import format_result
 
 PROJECT_ROOT = Path(__file__).parent.parent
-EVAL_ROOT = PROJECT_ROOT / "eval_suite" / "sparse_attention"
-
+EVAL_ROOT = PROJECT_ROOT / "eval_suite"
+TASKS = {"sparse_attention": "sparse_attention"}
 
 def _log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def cmd_sync(_args):
-    """Sync eval_suite to Modal volume."""
-    sync_sglang()
+def get_task_dir(task: str) -> Path:
+    return EVAL_ROOT / TASKS[task]
 
 
-def cmd_eval(args):
-    """Run eval_suite sparse attention on Modal."""
+def run_single(submission: Path, output: Path, mode: str, task: str, no_sync: bool):
+    task_dir = get_task_dir(task)
+    tests_file = task_dir / ("benchmarks.txt" if mode in ("benchmark", "leaderboard") else "tests.txt")
+    if not tests_file.exists():
+        raise FileNotFoundError(f"Tests not found: {tests_file}")
+    if not no_sync:
+        sync_sglang()
+    submission_code = submission.read_text()
+    tests_content = tests_file.read_text()
+    _log(f"Running {mode} for task '{task}' on Modal...")
+    with app.run():
+        result = run_eval.remote(submission_code, tests_content, mode)
+    formatted = format_result(result, mode)
+    output.write_text(formatted)
+    print(formatted)
+    _log(f"Output saved to {output}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run eval_suite kernels on Modal")
+    parser.add_argument("submission", nargs="?", help="Submission file path")
+    parser.add_argument("-o", "--output", default="out.txt", help="Output file for formatted result")
+    parser.add_argument("-m", "--mode", default="benchmark", choices=["test", "benchmark", "leaderboard", "profile"])
+    parser.add_argument("-t", "--task", default="sparse_attention", choices=list(TASKS.keys()))
+    parser.add_argument("--no-sync", action="store_true", help="Skip syncing eval_suite")
+    args = parser.parse_args()
+
+    if not args.submission:
+        parser.error("submission is required")
+
     submission = Path(args.submission)
     if not submission.exists():
         submission = PROJECT_ROOT / args.submission
     if not submission.exists():
         raise FileNotFoundError(f"Submission not found: {args.submission}")
 
-    tests_file = EVAL_ROOT / ("benchmarks.txt" if args.mode in ("benchmark", "leaderboard") else "tests.txt")
-    if not tests_file.exists():
-        raise FileNotFoundError(f"Tests not found: {tests_file}")
-
-    if not args.no_sync:
-        sync_sglang()
-
-    submission_code = submission.read_text()
-    tests_content = tests_file.read_text()
-
-    _log(f"Running {args.mode} on Modal...")
-    with app.run():
-        result = run_eval.remote(submission_code, tests_content, args.mode)
-
-    print(result.get("popcorn", ""))
-    stdout = result.get("stdout", "")
-    stderr = result.get("stderr", "")
-    if stdout:
-        print("--- stdout ---")
-        print(stdout.rstrip("\n"))
-    if stderr:
-        print("--- stderr ---", file=sys.stderr)
-        print(stderr.rstrip("\n"), file=sys.stderr)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Run eval_suite sparse attention on Modal")
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
-
-    p_sync = subparsers.add_parser("sync", help="Sync eval_suite to Modal volume")
-    p_sync.set_defaults(func=cmd_sync)
-
-    p_eval = subparsers.add_parser("eval", help="Run eval_suite sparse attention")
-    p_eval.add_argument("submission", help="Submission file path")
-    p_eval.add_argument("-m", "--mode", default="test", choices=["test", "benchmark", "leaderboard", "profile"])
-    p_eval.add_argument("--no-sync", action="store_true", help="Skip syncing eval_suite")
-    p_eval.set_defaults(func=cmd_eval)
-
-    args = parser.parse_args()
-    if not args.command:
-        parser.print_help()
-        sys.exit(1)
-
-    args.func(args)
+    output = Path(args.output)
+    run_single(submission, output, args.mode, args.task, args.no_sync)
 
 
 if __name__ == "__main__":
