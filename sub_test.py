@@ -129,3 +129,36 @@ def sparse_attn(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
         output[t] = out.to(torch.bfloat16)
 
     return output, lse
+
+
+def compile_kernel():
+    """Optional hook for JIT/PTX compile."""
+    return None
+
+
+@torch.no_grad()
+def custom_kernel(data):
+    """
+    Combined sparse index + attention pipeline.
+
+    Expected data tuple:
+      (q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table,
+       q_nope, q_pe, ckv_cache, kpe_cache, sm_scale)
+    """
+    (
+        q_index_fp8,
+        k_index_cache_fp8,
+        weights,
+        seq_lens,
+        block_table,
+        q_nope,
+        q_pe,
+        ckv_cache,
+        kpe_cache,
+        sm_scale,
+    ) = data
+
+    topk_indices = sparse_index(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table)[0]
+    sparse_indices = topk_indices.to(torch.int32)
+
+    return sparse_attn(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale)

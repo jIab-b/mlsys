@@ -195,7 +195,7 @@ def sync_sglang() -> int:
         except Exception:
             changed = _sync_directory(
                 local_root=LOCAL_EVAL_SUITE,
-                remote_root=REMOTE_EVAL_SUITE,
+                remote_root=VOLUME_EVAL_SUITE,
                 manifest_path=SGLANG_MANIFEST_PATH,
                 extensions={".py", ".json", ".yaml", ".yml", ".txt", ".md", ".toml"},
                 force=True,
