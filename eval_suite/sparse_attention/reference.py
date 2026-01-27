@@ -1,5 +1,8 @@
+import json
 import math
+import os
 import sys
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,7 +66,7 @@ def generate_input(batch: int, num_pages: int, seq_len: int, seed: int) -> input
 
     sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV)
 
-    return (
+    data = (
         q_index_fp8,
         k_index_cache_fp8,
         weights,
@@ -75,6 +78,53 @@ def generate_input(batch: int, num_pages: int, seq_len: int, seed: int) -> input
         kpe_cache,
         sm_scale,
     )
+    _maybe_dump_trace(data, batch=batch, num_pages=num_pages, seq_len=seq_len, seed=seed)
+    return data
+
+
+def _maybe_dump_trace(data: input_t, **spec) -> None:
+    trace_root = os.environ.get("TRACE_OUT")
+    if not trace_root:
+        return
+
+    trace_root = Path(trace_root)
+    def_dir = trace_root / "definitions"
+    wl_dir = trace_root / "workloads" / "sparse_attention"
+    tr_dir = trace_root / "traces" / "sparse_attention"
+    def_dir.mkdir(parents=True, exist_ok=True)
+    wl_dir.mkdir(parents=True, exist_ok=True)
+    tr_dir.mkdir(parents=True, exist_ok=True)
+
+    definition_path = def_dir / "sparse_attention.json"
+    if not definition_path.exists():
+        definition = {
+            "name": "sparse_attention",
+            "inputs": [
+                "q_index_fp8",
+                "k_index_cache_fp8",
+                "weights",
+                "seq_lens",
+                "block_table",
+                "q_nope",
+                "q_pe",
+                "ckv_cache",
+                "kpe_cache",
+                "sm_scale",
+            ],
+            "outputs": ["output", "lse"],
+        }
+        definition_path.write_text(json.dumps(definition, indent=2))
+
+    uid = uuid.uuid4().hex
+    payload_path = wl_dir / f"{uid}.pt"
+    meta_path = wl_dir / f"{uid}.json"
+    torch.save(data, payload_path)
+    meta = {"id": uid, "spec": spec, "payload": str(payload_path.name)}
+    meta_path.write_text(json.dumps(meta, indent=2))
+
+    trace_path = tr_dir / f"{uid}.json"
+    if not trace_path.exists():
+        trace_path.write_text(json.dumps({"id": uid, "status": "generated"}, indent=2))
 
 
 def ref_kernel(data: input_t) -> output_t:

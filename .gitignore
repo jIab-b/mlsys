@@ -3,3 +3,5 @@ fi_bench_skit/
 eval_test/
 __pycache__/
 *.pyc
+trace/
+flash_infer_datasets/

@@ -269,7 +269,12 @@ def sync_outputs(clean: bool = True) -> int:
     gpu=_gpu_type(),
     timeout=1200,
 )
-def run_eval(submission_code: str, tests_content: str, mode: str = "test") -> dict:
+def run_eval(
+    submission_code: str,
+    tests_content: str,
+    mode: str = "test",
+    trace_dir: str | None = None,
+) -> dict:
     """Run eval_suite/sparse_attention eval remotely."""
     import sys
 
@@ -283,6 +288,9 @@ def run_eval(submission_code: str, tests_content: str, mode: str = "test") -> di
     os.set_inheritable(w, True)
     env = os.environ.copy()
     env["POPCORN_FD"] = str(w)
+    if trace_dir:
+        env["TRACE_OUT"] = trace_dir
+        Path(trace_dir).mkdir(parents=True, exist_ok=True)
 
     proc = subprocess.Popen(
         [sys.executable, "eval.py", mode, "tests.txt"],
@@ -298,13 +306,29 @@ def run_eval(submission_code: str, tests_content: str, mode: str = "test") -> di
     output = os.read(r, 1 << 20).decode()
     os.close(r)
 
-    return {
+    result = {
         "popcorn": output,
         "stdout": stdout.decode(errors="replace"),
         "stderr": stderr.decode(errors="replace"),
         "mode": mode,
         "system": _system_info(),
     }
+    if trace_dir:
+        import base64
+        import tarfile
+        import shutil
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            with tarfile.open(tmp_path, "w:gz") as tar:
+                tar.add(trace_dir, arcname=".")
+            payload = tmp_path.read_bytes()
+            result["trace_archive_b64"] = base64.b64encode(payload).decode("ascii")
+            result["trace_archive_name"] = "trace.tar.gz"
+        finally:
+            tmp_path.unlink(missing_ok=True)
+            shutil.rmtree(trace_dir, ignore_errors=True)
+    return result
 
 
 # --- Shell helpers ---
