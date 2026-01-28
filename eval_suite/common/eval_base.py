@@ -7,12 +7,14 @@ import time
 import os
 import sys
 import math
+import datetime
 from pathlib import Path
 from typing import Optional
 
 import torch.cuda
 
 from .utils import set_seed
+from . import trace as trace_ctx
 
 
 class PopcornOutput:
@@ -133,6 +135,123 @@ def clone_data(data):
     return data
 
 
+def _system_info_trace() -> dict:
+    info = {
+        "hardware": "CPU",
+        "libs": {
+            "torch": str(torch.__version__),
+            "cuda": str(torch.version.cuda) if torch.version.cuda else "",
+        },
+    }
+    if torch.cuda.is_available():
+        info["hardware"] = torch.cuda.get_device_name(0)
+    try:
+        import triton
+        info["libs"]["triton"] = str(triton.__version__)
+    except Exception:
+        info["libs"]["triton"] = ""
+    return info
+
+
+def _max_error_tensor(received, expected, rtol=1e-3, atol=1e-3):
+    diff = (received - expected).abs()
+    max_abs = diff.max().item() if diff.numel() else 0.0
+    denom = expected.abs().clamp_min(1e-12)
+    max_rel = (diff / denom).max().item() if diff.numel() else 0.0
+    close = torch.isclose(received, expected, rtol=rtol, atol=atol)
+    matched = close.count_nonzero().item()
+    total = close.numel()
+    ratio = matched / total if total else 1.0
+    return max_abs, max_rel, matched, total, ratio
+
+
+def _compute_error_metrics(output, expected, rtol=1e-3, atol=1e-3):
+    max_abs = 0.0
+    max_rel = 0.0
+    matched = 0
+    total = 0
+
+    def walk(o, e):
+        nonlocal max_abs, max_rel, matched, total
+        if isinstance(o, torch.Tensor) and isinstance(e, torch.Tensor):
+            a, r, m, t, _ = _max_error_tensor(o, e, rtol=rtol, atol=atol)
+            max_abs = max(max_abs, a)
+            max_rel = max(max_rel, r)
+            matched += m
+            total += t
+            return
+        if isinstance(o, (list, tuple)) and isinstance(e, (list, tuple)):
+            for oo, ee in zip(o, e):
+                walk(oo, ee)
+            return
+        if isinstance(o, dict) and isinstance(e, dict):
+            for key in o.keys() & e.keys():
+                walk(o[key], e[key])
+
+    walk(output, expected)
+    ratio = matched / total if total else 1.0
+    return {
+        "max_absolute_error": max_abs,
+        "max_relative_error": max_rel,
+        "extra": {"matched_ratio": ratio},
+    }
+
+
+def _time_reference(reference_kernel, data):
+    if reference_kernel is None:
+        return None
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    reference_kernel(clone_data(data))
+    end_event.record()
+    torch.cuda.synchronize()
+    return start_event.elapsed_time(end_event)
+
+
+def _write_trace_record(
+    definition: str,
+    solution: str,
+    workload: dict | None,
+    status: str,
+    output,
+    data,
+    reference_kernel,
+    latency_ms: float | None,
+    reference_latency_ms: float | None,
+    log: str,
+):
+    if workload is None:
+        return
+    correctness = None
+    if reference_kernel is not None and output is not None:
+        expected = reference_kernel(clone_data(data))
+        correctness = _compute_error_metrics(output, expected)
+    performance = None
+    if latency_ms is not None:
+        performance = {
+            "latency_ms": latency_ms,
+            "reference_latency_ms": reference_latency_ms,
+            "speedup_factor": (reference_latency_ms / latency_ms) if reference_latency_ms else None,
+        }
+    record = {
+        "definition": definition,
+        "workload": workload,
+        "solution": solution,
+        "evaluation": {
+            "status": "PASSED" if status == "PASSED" else "FAILED",
+            "environment": _system_info_trace(),
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "log": log,
+            "correctness": correctness,
+            "performance": performance,
+        },
+    }
+    op_type = os.environ.get("TRACE_OP_TYPE", "sparse_attention")
+    trace_ctx.append_trace_record(definition, record, op_type)
+
+
 class EvalRunner:
     """Base class for evaluation runners. Override methods as needed."""
 
@@ -164,6 +283,10 @@ class EvalRunner:
 
     def get_check_implementation(self):
         raise NotImplementedError
+
+    def get_reference_kernel(self):
+        """Optional reference kernel for trace metrics."""
+        return None
 
     def get_compile_kernel(self):
         return None
@@ -209,6 +332,7 @@ class EvalRunner:
         custom_kernel = self.get_custom_kernel()
         generate_input = self.get_generate_input()
         check_implementation = self.get_check_implementation()
+        reference_kernel = self.get_reference_kernel()
 
         data = generate_input(**test.args)
         torch.cuda.synchronize()
@@ -217,7 +341,21 @@ class EvalRunner:
         except Exception as E:
             return self.handle_kernel_error(E)
         torch.cuda.synchronize()
-        return check_implementation(data, output)
+        good, message = check_implementation(data, output)
+        if trace_ctx.get_trace_root() is not None:
+            _write_trace_record(
+                definition=os.environ.get("TRACE_DEFINITION", "sparse_attention"),
+                solution=os.environ.get("TRACE_SOLUTION", "submission"),
+                workload=trace_ctx.get_current_workload(),
+                status="PASSED" if good else "FAILED",
+                output=output,
+                data=data,
+                reference_kernel=reference_kernel,
+                latency_ms=None,
+                reference_latency_ms=None,
+                log=message or "",
+            )
+        return good, message
 
     def run_single_benchmark(
         self, test: TestCase, recheck: bool, max_repeats: int, max_time_ns: float
@@ -227,6 +365,7 @@ class EvalRunner:
         custom_kernel = self.get_custom_kernel()
         generate_input = self.get_generate_input()
         check_implementation = self.get_check_implementation()
+        reference_kernel = self.get_reference_kernel()
 
         durations = []
         correctness_error = None
@@ -246,6 +385,7 @@ class EvalRunner:
         good, message = check_implementation(check_copy, output)
         if not good:
             correctness_error = message
+        first_output = output
 
         bm_start_time = time.perf_counter_ns()
         for i in range(max_repeats):
@@ -283,7 +423,22 @@ class EvalRunner:
                 ):
                     break
 
-        return BenchmarkResult(stats=calculate_stats(durations), error=correctness_error)
+        stats = calculate_stats(durations)
+        if trace_ctx.get_trace_root() is not None:
+            ref_latency = _time_reference(reference_kernel, check_copy) if reference_kernel else None
+            _write_trace_record(
+                definition=os.environ.get("TRACE_DEFINITION", "sparse_attention"),
+                solution=os.environ.get("TRACE_SOLUTION", "submission"),
+                workload=trace_ctx.get_current_workload(),
+                status="PASSED" if correctness_error is None else "FAILED",
+                output=first_output,
+                data=check_copy,
+                reference_kernel=reference_kernel,
+                latency_ms=stats.mean / 1e6,
+                reference_latency_ms=ref_latency,
+                log=correctness_error or "",
+            )
+        return BenchmarkResult(stats=stats, error=correctness_error)
 
     def run_single_benchmark_batched(
         self, test: TestCase, recheck: bool, max_repeats: int, max_time_ns: float
@@ -293,6 +448,7 @@ class EvalRunner:
         custom_kernel = self.get_custom_kernel()
         generate_input = self.get_generate_input()
         check_implementation = self.get_check_implementation()
+        reference_kernel = self.get_reference_kernel()
 
         durations = []
         data_list = []
@@ -355,7 +511,22 @@ class EvalRunner:
                 ):
                     break
 
-        return BenchmarkResult(stats=calculate_stats(durations), error=correctness_error)
+        stats = calculate_stats(durations)
+        if trace_ctx.get_trace_root() is not None:
+            ref_latency = _time_reference(reference_kernel, check_copy[-1]) if reference_kernel else None
+            _write_trace_record(
+                definition=os.environ.get("TRACE_DEFINITION", "sparse_attention"),
+                solution=os.environ.get("TRACE_SOLUTION", "submission"),
+                workload=trace_ctx.get_current_workload(),
+                status="PASSED" if correctness_error is None else "FAILED",
+                output=outputs[-1] if outputs else None,
+                data=check_copy[-1],
+                reference_kernel=reference_kernel,
+                latency_ms=stats.mean / 1e6,
+                reference_latency_ms=ref_latency,
+                log=correctness_error or "",
+            )
+        return BenchmarkResult(stats=stats, error=correctness_error)
 
     def run_single_profile(self, test: TestCase) -> str:
         from torch.profiler import profile, ProfilerActivity

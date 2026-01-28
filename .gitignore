@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 trace/
 flash_infer_datasets/
+flashinfer_trace/

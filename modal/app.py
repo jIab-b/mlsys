@@ -41,6 +41,7 @@ SGLANG_MANIFEST_PATH = "/manifest.json"
 
 ADDITIONAL_DEPS = [
     "transformers==5.0.0",
+    "safetensors",
 ]
 
 
@@ -180,24 +181,36 @@ def _sync_directory(
     return len(changed)
 
 
+SYNC_EXTENSIONS = {".py", ".json", ".jsonl", ".yaml", ".yml", ".txt", ".md", ".toml", ".safetensors"}
+
+
 def sync_sglang() -> int:
     """Sync eval_suite directory to Modal volume."""
     changed = _sync_directory(
         local_root=LOCAL_EVAL_SUITE,
         remote_root=VOLUME_EVAL_SUITE,
         manifest_path=SGLANG_MANIFEST_PATH,
-        extensions={".py", ".json", ".yaml", ".yml", ".txt", ".md", ".toml"},
+        extensions=SYNC_EXTENSIONS,
     )
     if changed == 0:
-        eval_path = str(VOLUME_EVAL_SUITE / "sparse_attention" / "eval.py")
-        try:
-            list(volume.read_file(eval_path))
-        except Exception:
+        # Check critical paths exist
+        critical_paths = [
+            str(VOLUME_EVAL_SUITE / "test_kernels" / "sparse_attention" / "eval.py"),
+            str(VOLUME_EVAL_SUITE / "common" / "workload_loader.py"),
+        ]
+        needs_sync = False
+        for path in critical_paths:
+            try:
+                list(volume.read_file(path))
+            except Exception:
+                needs_sync = True
+                break
+        if needs_sync:
             changed = _sync_directory(
                 local_root=LOCAL_EVAL_SUITE,
                 remote_root=VOLUME_EVAL_SUITE,
                 manifest_path=SGLANG_MANIFEST_PATH,
-                extensions={".py", ".json", ".yaml", ".yml", ".txt", ".md", ".toml"},
+                extensions=SYNC_EXTENSIONS,
                 force=True,
             )
     return changed
@@ -263,6 +276,14 @@ def sync_outputs(clean: bool = True) -> int:
     return downloaded
 
 
+# Map task names to their directory paths
+TASK_PATHS = {
+    "sparse_attention": "test_kernels/sparse_attention",
+    "sparse_index": "test_kernels/sparse_index",
+    "sparse_attn": "test_kernels/sparse_attn",
+}
+
+
 @app.function(
     image=image,
     volumes={str(VOLUME_MOUNT_PATH): volume},
@@ -274,11 +295,16 @@ def run_eval(
     tests_content: str,
     mode: str = "test",
     trace_dir: str | None = None,
+    definition_name: str | None = None,
+    solution_name: str | None = None,
+    op_type: str | None = None,
+    task: str = "sparse_attention",
 ) -> dict:
-    """Run eval_suite/sparse_attention eval remotely."""
+    """Run eval_suite task eval remotely."""
     import sys
 
-    work = Path(CONTAINER_EVAL_SUITE / "sparse_attention")
+    task_path = TASK_PATHS.get(task, f"test_kernels/{task}")
+    work = Path(CONTAINER_EVAL_SUITE / task_path)
     work.mkdir(parents=True, exist_ok=True)
 
     (work / "submission.py").write_text(submission_code)
@@ -288,6 +314,12 @@ def run_eval(
     os.set_inheritable(w, True)
     env = os.environ.copy()
     env["POPCORN_FD"] = str(w)
+    if definition_name:
+        env["TRACE_DEFINITION"] = definition_name
+    if solution_name:
+        env["TRACE_SOLUTION"] = solution_name
+    if op_type:
+        env["TRACE_OP_TYPE"] = op_type
     if trace_dir:
         env["TRACE_OUT"] = trace_dir
         Path(trace_dir).mkdir(parents=True, exist_ok=True)

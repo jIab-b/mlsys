@@ -1,7 +1,8 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add eval_suite/ to path for common imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import torch.cuda
 
@@ -10,7 +11,7 @@ torch.cuda.init()
 from common.eval_base import EvalRunner, main
 
 
-class SparseAttentionEvalRunner(EvalRunner):
+class SparseAttnEvalRunner(EvalRunner):
     use_cutlass = False
     use_batched_benchmark = False
 
@@ -26,6 +27,10 @@ class SparseAttentionEvalRunner(EvalRunner):
         from reference import check_implementation
         return check_implementation
 
+    def get_reference_kernel(self):
+        from reference import ref_kernel
+        return ref_kernel
+
     def get_compile_kernel(self):
         try:
             from submission import compile_kernel
@@ -35,4 +40,4 @@ class SparseAttentionEvalRunner(EvalRunner):
 
 
 if __name__ == "__main__":
-    sys.exit(main(SparseAttentionEvalRunner()))
+    sys.exit(main(SparseAttnEvalRunner()))
