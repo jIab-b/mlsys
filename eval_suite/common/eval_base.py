@@ -71,6 +71,25 @@ def get_test_cases(file_name: str, seed: Optional[int]) -> list[TestCase]:
     tests = []
     lines = content.splitlines()
     for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Handle __real__ format: "__real__:{json_workload}"
+        if line.startswith("__real__:"):
+            import json
+            json_str = line[len("__real__:"):]
+            try:
+                workload_record = json.loads(json_str)
+                # Store the full workload record in args with special key
+                case = {"__real_workload__": workload_record}
+                tests.append(TestCase(spec=line[:50] + "...", args=case))
+                continue
+            except json.JSONDecodeError as e:
+                print(f"Invalid __real__ JSON: {e}", file=sys.stderr)
+                exit(113)
+
+        # Standard format: "key: value; key: value; ..."
         parts = line.split(";")
         case = {}
         for part in parts:

@@ -234,3 +234,185 @@ def list_available_workloads() -> dict[str, list[str]]:
             result[op_dir.name] = sorted(definitions)
 
     return result
+
+
+# ============================================================================
+# Real workload loading (with safetensors)
+# ============================================================================
+
+def load_real_workload_tensors(
+    workload: dict,
+    base_path: Path | None = None,
+    device: str = "cuda",
+) -> dict:
+    """Load tensors from a workload, including real data from safetensors.
+
+    Args:
+        workload: Workload dict with 'inputs' containing type/path/tensor_key
+        base_path: Base path for resolving relative safetensor paths
+        device: Device to load tensors to
+
+    Returns:
+        Dict mapping input name to tensor or scalar value
+    """
+    import torch
+    from safetensors.torch import load_file
+
+    if base_path is None:
+        base_path = FLASHINFER_TRACE
+
+    tensors = {}
+    inputs = workload.get("inputs", {})
+
+    for name, spec in inputs.items():
+        input_type = spec.get("type")
+
+        if input_type == "safetensors":
+            # Load real tensor from safetensors file
+            rel_path = spec["path"]
+            # Handle relative paths (./blob/...)
+            if rel_path.startswith("./"):
+                rel_path = rel_path[2:]
+            full_path = base_path / rel_path
+            tensor_key = spec["tensor_key"]
+
+            if full_path.exists():
+                data = load_file(str(full_path))
+                tensors[name] = data[tensor_key].to(device)
+            else:
+                # File not found - mark as None, caller should generate random
+                tensors[name] = None
+
+        elif input_type == "scalar":
+            tensors[name] = spec["value"]
+
+        elif input_type == "random":
+            # Mark as None - caller should generate random tensor
+            tensors[name] = None
+
+        else:
+            tensors[name] = None
+
+    return tensors
+
+
+def sample_real_workloads(
+    op_type: str,
+    count: int = 3,
+    seed: int = 42,
+    fallback_op_types: list[str] | None = None,
+) -> list[dict]:
+    """Sample complete workload records (with safetensor paths) for real loading.
+
+    Args:
+        op_type: The op_type to sample from
+        count: Number of workloads to sample
+        seed: Random seed
+        fallback_op_types: Fallback op_types if primary not found
+
+    Returns:
+        List of full workload records (definition, workload, etc.)
+    """
+    if fallback_op_types is None:
+        fallback_op_types = {
+            "dsa_paged": ["mla_paged", "gqa_paged"],
+            "sparse_attention": ["mla_paged", "gqa_paged"],
+            "sparse_index": ["mla_paged", "gqa_paged"],
+            "sparse_attn": ["mla_paged", "gqa_paged"],
+        }.get(op_type, [])
+
+    all_records = []
+
+    # Try primary op_type
+    op_dir = WORKLOADS_DIR / op_type
+    if op_dir.exists():
+        for jsonl_file in op_dir.glob("*.jsonl"):
+            with jsonl_file.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            record = json.loads(line)
+                            record["_source_file"] = str(jsonl_file)
+                            all_records.append(record)
+                        except json.JSONDecodeError:
+                            continue
+
+    # Try fallbacks if needed
+    if not all_records:
+        for fallback in fallback_op_types:
+            fallback_dir = WORKLOADS_DIR / fallback
+            if fallback_dir.exists():
+                for jsonl_file in fallback_dir.glob("*.jsonl"):
+                    with jsonl_file.open() as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                try:
+                                    record = json.loads(line)
+                                    record["_source_file"] = str(jsonl_file)
+                                    all_records.append(record)
+                                except json.JSONDecodeError:
+                                    continue
+                if all_records:
+                    break
+
+    if not all_records:
+        return []
+
+    random.seed(seed)
+    return random.sample(all_records, min(count, len(all_records)))
+
+
+def workload_to_real_spec(workload_record: dict, index: int = 0) -> str:
+    """Convert a workload record to a special spec string for real loading.
+
+    The format is: __real__:<json_encoded_workload>
+
+    Args:
+        workload_record: Full workload record from jsonl
+        index: Index for identification
+
+    Returns:
+        Special spec string that can be parsed by generate_input
+    """
+    # Encode the workload as JSON in the spec
+    workload_json = json.dumps(workload_record)
+    return f"__real__:{workload_json}"
+
+
+def parse_real_spec(spec: str) -> dict | None:
+    """Parse a real workload spec string.
+
+    Args:
+        spec: Spec string, possibly starting with __real__:
+
+    Returns:
+        Workload record dict if it's a real spec, None otherwise
+    """
+    if not spec.startswith("__real__:"):
+        return None
+    json_str = spec[len("__real__:"):]
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        return None
+
+
+def generate_real_workload_specs(
+    op_type: str,
+    count: int = 3,
+    seed: int = 42,
+) -> list[str]:
+    """Generate spec strings for real workload loading.
+
+    Args:
+        op_type: The op_type (task name)
+        count: Number of specs
+        seed: Random seed
+
+    Returns:
+        List of __real__:<json> spec strings
+    """
+    records = sample_real_workloads(op_type, count, seed)
+    return [workload_to_real_spec(r, i) for i, r in enumerate(records)]

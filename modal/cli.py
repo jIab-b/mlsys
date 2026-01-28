@@ -47,7 +47,7 @@ def get_task_dir(task: str) -> Path:
 
 
 def generate_random_tests(task: str, count: int = 3, seed: int = 42) -> str:
-    """Generate random test specs from FlashInfer workloads."""
+    """Generate random test specs from FlashInfer workloads (axis values only)."""
     from common.workload_loader import generate_sparse_attention_specs
 
     # All three tasks use the same input spec (batch, num_pages, seq_len)
@@ -55,6 +55,18 @@ def generate_random_tests(task: str, count: int = 3, seed: int = 42) -> str:
         specs = generate_sparse_attention_specs(count=count, seed=seed)
     else:
         raise ValueError(f"Random tests not supported for task: {task}")
+
+    return "\n".join(specs)
+
+
+def generate_real_tests(task: str, count: int = 3, seed: int = 42) -> str:
+    """Generate test specs with real workload data from safetensors."""
+    from common.workload_loader import generate_real_workload_specs
+
+    if task in ("sparse_attention", "sparse_index", "sparse_attn"):
+        specs = generate_real_workload_specs(task, count=count, seed=seed)
+    else:
+        raise ValueError(f"Real workloads not supported for task: {task}")
 
     return "\n".join(specs)
 
@@ -67,11 +79,16 @@ def run_single(
     no_sync: bool,
     trace_dir: Path | None,
     random_tests: int | None = None,
+    real_tests: int | None = None,
     random_seed: int = 42,
 ):
     task_dir = get_task_dir(task)
 
-    if random_tests is not None:
+    if real_tests is not None:
+        _log(f"Generating {real_tests} REAL test(s) from FlashInfer workloads (with safetensors)...")
+        tests_content = generate_real_tests(task, count=real_tests, seed=random_seed)
+        _log(f"Generated {real_tests} real workload specs")
+    elif random_tests is not None:
         _log(f"Generating {random_tests} random test(s) from FlashInfer workloads...")
         tests_content = generate_random_tests(task, count=random_tests, seed=random_seed)
         _log(f"Generated tests:\n{tests_content}")
@@ -128,10 +145,18 @@ def main():
         help="Sample N random test inputs from FlashInfer workloads (default: 3)",
     )
     parser.add_argument(
+        "--real",
+        type=int,
+        nargs="?",
+        const=3,
+        metavar="N",
+        help="Sample N REAL test inputs with safetensor data from FlashInfer (default: 3)",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed for --random option (default: 42)",
+        help="Random seed for --random/--real options (default: 42)",
     )
     parser.add_argument(
         "--sync-only",
@@ -178,6 +203,7 @@ def main():
         args.no_sync,
         trace_dir,
         random_tests=args.random,
+        real_tests=args.real,
         random_seed=args.seed,
     )
 
