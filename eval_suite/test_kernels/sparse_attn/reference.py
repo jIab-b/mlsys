@@ -96,8 +96,17 @@ def _convert_mla_to_sparse_attn(
     # Cap seq_lens to match block_table capacity
     seq_lens = torch.clamp(seq_lens, max=max_pages_per_seq * PAGE_SIZE)
 
+    # Remap page indices to a compact range to keep cache sizes bounded
+    block_table_cpu = block_table.cpu()
+    unique_pages = torch.unique(block_table_cpu)
+    unique_pages = torch.sort(unique_pages).values
+    page_map = {int(old): idx for idx, old in enumerate(unique_pages.tolist())}
+    for old, new in page_map.items():
+        block_table_cpu[block_table_cpu == old] = new
+    block_table = block_table_cpu.to(device)
+
     # Find actual number of unique pages needed
-    actual_num_pages = max(int(block_table.max().item()) + 1, 1)
+    actual_num_pages = max(len(unique_pages), 1)
 
     return seq_lens, block_table, actual_num_pages
 
@@ -139,21 +148,45 @@ def generate_input(
             b = len(seq_lens_t)
             n_pages = actual_num_pages
 
-            # Generate random compute tensors with correct shapes
-            q_nope = torch.randn((b, NUM_QO_HEADS, HEAD_DIM_CKV), device=device, dtype=torch.float16)
-            q_pe = torch.randn((b, NUM_QO_HEADS, HEAD_DIM_KPE), device=device, dtype=torch.float16)
-            ckv_cache = torch.randn((n_pages, PAGE_SIZE, HEAD_DIM_CKV), device=device, dtype=torch.float16)
-            kpe_cache = torch.randn((n_pages, PAGE_SIZE, HEAD_DIM_KPE), device=device, dtype=torch.float16)
+            q_nope = tensors.get("q_nope")
+            if q_nope is None:
+                q_nope = torch.randn((b, NUM_QO_HEADS, HEAD_DIM_CKV), device=device, dtype=torch.float16)
 
-            # Compute sparse indices using the reference indexer
-            q_index_fp8 = torch.randn((b, NUM_INDEX_HEADS, INDEX_HEAD_DIM), device=device, dtype=torch.float16)
-            k_index_cache_fp8 = _make_k_index_cache_fp8(n_pages, device)
-            weights = torch.rand((b, NUM_INDEX_HEADS), device=device, dtype=torch.float32)
+            q_pe = tensors.get("q_pe")
+            if q_pe is None:
+                q_pe = torch.randn((b, NUM_QO_HEADS, HEAD_DIM_KPE), device=device, dtype=torch.float16)
 
-            topk_indices = sparse_index_run(
-                q_index_fp8, k_index_cache_fp8, weights, seq_lens_t, block_table
-            )[0]
-            sparse_indices = topk_indices.to(torch.int32)
+            ckv_cache = tensors.get("ckv_cache")
+            if ckv_cache is None or ckv_cache.shape[0] < n_pages:
+                ckv_cache = torch.randn((n_pages, PAGE_SIZE, HEAD_DIM_CKV), device=device, dtype=torch.float16)
+
+            kpe_cache = tensors.get("kpe_cache")
+            if kpe_cache is None or kpe_cache.shape[0] < n_pages:
+                kpe_cache = torch.randn((n_pages, PAGE_SIZE, HEAD_DIM_KPE), device=device, dtype=torch.float16)
+
+            # Compute sparse indices using the reference indexer (or load if present)
+            sparse_indices = tensors.get("sparse_indices")
+            if sparse_indices is None:
+                q_index_fp8 = tensors.get("q_index_fp8")
+                if q_index_fp8 is None:
+                    q_index_fp8 = torch.randn(
+                        (b, NUM_INDEX_HEADS, INDEX_HEAD_DIM),
+                        device=device,
+                        dtype=torch.float16,
+                    )
+
+                k_index_cache_fp8 = tensors.get("k_index_cache_fp8")
+                if k_index_cache_fp8 is None or k_index_cache_fp8.shape[0] < n_pages:
+                    k_index_cache_fp8 = _make_k_index_cache_fp8(n_pages, device)
+
+                weights = tensors.get("weights")
+                if weights is None:
+                    weights = torch.rand((b, NUM_INDEX_HEADS), device=device, dtype=torch.float32)
+
+                topk_indices = sparse_index_run(
+                    q_index_fp8, k_index_cache_fp8, weights, seq_lens_t, block_table
+                )[0]
+                sparse_indices = topk_indices.to(torch.int32)
 
             sm_scale = tensors.get("sm_scale")
             if sm_scale is None:

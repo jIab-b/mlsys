@@ -24,8 +24,8 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
     device = q_nope.device
 
     # Flatten paged KV cache to token-level: [num_pages, page_size, dim] -> [num_pages * page_size, dim]
-    Kc_all = ckv_cache.reshape(-1, head_dim_ckv).to(torch.float32)  # [total_kv_tokens, head_dim_ckv]
-    Kp_all = kpe_cache.reshape(-1, head_dim_kpe).to(torch.float32)  # [total_kv_tokens, head_dim_kpe]
+    Kc_all = ckv_cache.reshape(-1, head_dim_ckv).to(torch.float32)
+    Kp_all = kpe_cache.reshape(-1, head_dim_kpe).to(torch.float32)
 
     output = torch.zeros(
         (num_tokens, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device
@@ -33,7 +33,7 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
     lse = torch.full((num_tokens, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
 
     for t in range(num_tokens):
-        indices = sparse_indices[t]  # [topk]
+        indices = sparse_indices[t]
 
         # Handle padding: -1 indicates invalid indices
         valid_mask = indices != -1
@@ -46,21 +46,31 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
         # For page_size=64, indices encode (page_idx * 64 + offset)
         tok_idx = valid_indices.to(torch.long)
 
-        Kc = Kc_all[tok_idx]  # [num_valid, head_dim_ckv]
-        Kp = Kp_all[tok_idx]  # [num_valid, head_dim_kpe]
-        qn = q_nope[t].to(torch.float32)  # [num_qo_heads, head_dim_ckv]
-        qp = q_pe[t].to(torch.float32)  # [num_qo_heads, head_dim_kpe]
+        Kc = Kc_all[tok_idx]
+        Kp = Kp_all[tok_idx]
+        qn = q_nope[t].to(torch.float32)
+        qp = q_pe[t].to(torch.float32)
 
         # Compute attention logits
-        logits = (qn @ Kc.T) + (qp @ Kp.T)  # [num_qo_heads, num_valid]
+        logits = (qn @ Kc.T) + (qp @ Kp.T)
         logits_scaled = logits * sm_scale
 
         # Compute 2-base LSE
         lse[t] = torch.logsumexp(logits_scaled, dim=-1) / math.log(2.0)
 
         # Compute attention output
-        attn = torch.softmax(logits_scaled, dim=-1)  # [num_qo_heads, num_valid]
-        out = attn @ Kc  # [num_qo_heads, head_dim_ckv]
+        attn = torch.softmax(logits_scaled, dim=-1)
+        out = attn @ Kc
         output[t] = out.to(torch.bfloat16)
 
     return output, lse
+
+
+def custom_kernel(data):
+    q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale = data
+    return run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale)
+
+
+def compile_kernel():
+    """Optional: pre-compile/warm up the kernel."""
+    pass

@@ -1,5 +1,5 @@
-"**Modal ❌ failure**
-> ❌ Benchmarking failed
+"**Modal ✅ success**
+> ✅ Benchmarking successful
 
 Running on:
 * GPU: `NVIDIA B200`
@@ -14,13 +14,16 @@ Running on:
 ## Benchmarks:
 ```
 __real__: {"definition": "mla_paged_prefill_causal_...
- ❌ Encountered not enough values to unpack (expected 6, got 5)
+ ⏱ 4410.0 ± 12.84 µs
+ ⚡ 4269.1 µs 🐌 5509.6 µs
 
 __real__: {"definition": "mla_paged_decode_h16_ckv5...
- ❌ Encountered not enough values to unpack (expected 6, got 5)
+ ⏱ 287.7 ± 1.70 µs
+ ⚡ 268.9 µs 🐌 342.6 µs
 
 __real__: {"definition": "mla_paged_decode_h16_ckv5...
- ❌ Encountered not enough values to unpack (expected 6, got 5)
+ ⏱ 290.5 ± 1.93 µs
+ ⚡ 267.6 µs 🐌 376.4 µs
 ```
 
 ## Program stdout:
