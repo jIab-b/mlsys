@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
 # ptx_lib lives at repo root (not nested under submission/)
 PTX_LIB = REPO_ROOT / "ptx_lib"
+COMPILER = ROOT / "compile.py"
 
 # Strip local ptx_lib includes since we inline headers into CUDA_SRC.
 _PTX_INCLUDE_PREFIXES = (
@@ -102,6 +103,13 @@ def main() -> int:
     kernel_path = (ROOT / args.kernel).resolve()
     bindings_path = (ROOT / args.bindings).resolve()
     out_path = (ROOT / args.out).resolve()
+
+    # Run compiler checks + emit kernel.cu first
+    if not COMPILER.exists():
+        raise FileNotFoundError(f"compile.py not found: {COMPILER}")
+    ret = subprocess.call([sys.executable, str(COMPILER)])
+    if ret != 0:
+        raise SystemExit(ret)
 
     _build_submission(kernel_path, bindings_path, out_path)
 
