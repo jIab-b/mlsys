@@ -6,3 +6,4 @@ __pycache__/
 trace/
 flash_infer_datasets/
 flashinfer_trace/
+comp_subs/
