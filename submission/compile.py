@@ -100,6 +100,9 @@ class Graph:
     def for_(self, var: str, iters: int, body: List[Node]) -> Node:
         return Node(kind="For", args={"var": var, "iters": str(iters)}, children=body)
 
+    def raw(self, code: str) -> Node:
+        return Node(kind="Raw", args={"code": code})
+
 
 # Minimal op contracts (extend as needed)
 CONTRACTS: Dict[str, OpContract] = {
@@ -216,6 +219,13 @@ def _validate_nodes(nodes: List[Node], g: Graph, bar_state: Dict[str, BarrierSta
             buf_state.update(f1)
             continue
 
+        if node.kind == "Raw":
+            raw = node.args.get("code", "")
+            if raw:
+                for line in raw.splitlines():
+                    lines.append(f"{pad}{line}\n")
+            continue
+
         if node.kind == "For":
             if "iters" not in node.args or "var" not in node.args:
                 raise ValueError("For node requires 'var' and 'iters'")
@@ -257,6 +267,13 @@ def _emit_nodes(nodes: List[Node], indent: int = 2) -> List[str]:
                 lines.extend(_emit_nodes(else_node.children, indent + 2))
                 lines.append(f"{pad}}}\n")
             continue
+        if node.kind == "Raw":
+            raw = node.args.get("code", "")
+            if raw:
+                for line in raw.splitlines():
+                    lines.append(f"{pad}{line}\n")
+            continue
+
         if node.kind == "For":
             var = node.args.get("var", "i")
             iters = node.args.get("iters", "0")
