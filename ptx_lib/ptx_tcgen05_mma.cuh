@@ -14,7 +14,7 @@ struct COLLECTOR_USAGE {
 
 // Block-scaled NVFP4 MMA (smem A/B descriptors, tmem scales)
 template <int CTA_GROUP = 1, const char *collector_usage = COLLECTOR_USAGE::NONE>
-PTX_DEVICE inline void tcgen05_mma_mxf4nvf4_block16(
+PTX_DEVICE void tcgen05_mma_mxf4nvf4_block16(
   int d_tmem,
   uint64_t a_desc,
   uint64_t b_desc,
@@ -38,7 +38,7 @@ PTX_DEVICE inline void tcgen05_mma_mxf4nvf4_block16(
 }
 
 // F16/BF16 MMA, SS (A/B in smem desc), C in tmem
-PTX_DEVICE inline void tcgen05_mma_f16_ss(
+PTX_DEVICE void tcgen05_mma_f16_ss(
   uint32_t tmem_c,
   uint64_t desc_a,
   uint64_t desc_b,
@@ -59,7 +59,7 @@ PTX_DEVICE inline void tcgen05_mma_f16_ss(
 }
 
 // F16/BF16 MMA, TS (A in tmem, B in smem desc), C in tmem
-PTX_DEVICE inline void tcgen05_mma_f16_ts(
+PTX_DEVICE void tcgen05_mma_f16_ts(
   uint32_t tmem_c,
   uint32_t tmem_a,
   uint64_t desc_b,
@@ -80,7 +80,7 @@ PTX_DEVICE inline void tcgen05_mma_f16_ts(
 }
 
 // F16/BF16 MMA, WS (warp-specialized), C in tmem
-PTX_DEVICE inline void tcgen05_mma_ws_f16_ts(
+PTX_DEVICE void tcgen05_mma_ws_f16_ts(
   uint32_t tmem_c,
   uint32_t tmem_a,
   uint64_t desc_b,
@@ -99,7 +99,7 @@ PTX_DEVICE inline void tcgen05_mma_ws_f16_ts(
 }
 
 // Alias used by gemm1 (block-scaled NVFP4 MMA, d_tmem assumed 0)
-PTX_DEVICE inline void tcgen05_mma_nvfp4(
+PTX_DEVICE void tcgen05_mma_nvfp4(
   uint64_t a_desc,
   uint64_t b_desc,
   uint32_t i_desc,

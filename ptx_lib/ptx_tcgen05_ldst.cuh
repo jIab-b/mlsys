@@ -23,7 +23,7 @@ struct NUM {
 };
 
 template <int NUM_REGS, const char *SHAPE, int NUM>
-PTX_DEVICE inline void tcgen05_ld(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld(float *tmp, int row, int col) {
   int addr = (row << 16) | col;
 
   if constexpr (NUM_REGS == 1)
@@ -64,7 +64,7 @@ PTX_DEVICE inline void tcgen05_ld(float *tmp, int row, int col) {
 
 // Explicit tcgen05.ld variants (verbatim from gemm1)
 template <const char *SHAPE, const char *NUM>
-PTX_DEVICE inline void tcgen05_ld_16regs(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16regs(float *tmp, int row, int col) {
   asm volatile("tcgen05.ld.sync.aligned%17%18.b32 "
               "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
               "  %8,  %9, %10, %11, %12, %13, %14, %15}, [%16];"
@@ -74,7 +74,7 @@ PTX_DEVICE inline void tcgen05_ld_16regs(float *tmp, int row, int col) {
 }
 
 template <const char *SHAPE, const char *NUM>
-PTX_DEVICE inline void tcgen05_ld_32regs(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_32regs(float *tmp, int row, int col) {
   asm volatile("tcgen05.ld.sync.aligned%33%34.b32 "
               "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
               "  %8,  %9, %10, %11, %12, %13, %14, %15, "
@@ -88,7 +88,7 @@ PTX_DEVICE inline void tcgen05_ld_32regs(float *tmp, int row, int col) {
 }
 
 template <const char *SHAPE, const char *NUM>
-PTX_DEVICE inline void tcgen05_ld_64regs(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_64regs(float *tmp, int row, int col) {
   asm volatile("tcgen05.ld.sync.aligned%65%66.b32 "
               "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
               "  %8,  %9, %10, %11, %12, %13, %14, %15, "
@@ -110,7 +110,7 @@ PTX_DEVICE inline void tcgen05_ld_64regs(float *tmp, int row, int col) {
 }
 
 template <const char *SHAPE, const char *NUM>
-PTX_DEVICE inline void tcgen05_ld_128regs(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_128regs(float *tmp, int row, int col) {
   asm volatile("tcgen05.ld.sync.aligned%129%130.b32 "
               "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
               "  %8,  %9, %10, %11, %12, %13, %14, %15, "
@@ -149,7 +149,7 @@ PTX_DEVICE inline void tcgen05_ld_128regs(float *tmp, int row, int col) {
 
 // Limited tcgen05.st variants (b32). Use uint32_t registers.
 template <int NUM_REGS, const char *SHAPE, int NUM>
-PTX_DEVICE inline void tcgen05_st(uint32_t const* tmp, int row, int col) {
+PTX_DEVICE void tcgen05_st(uint32_t const* tmp, int row, int col) {
   int addr = (row << 16) | col;
 
   if constexpr (NUM_REGS == 1)
@@ -185,7 +185,7 @@ PTX_DEVICE inline void tcgen05_st(uint32_t const* tmp, int row, int col) {
 }
 
 // Convenience wrappers
-PTX_DEVICE inline void tcgen05_ld_32x32b(float *tmp, int row, int col, int num) {
+PTX_DEVICE void tcgen05_ld_32x32b(float *tmp, int row, int col, int num) {
   if (num == 1)  tcgen05_ld<1,  SHAPE::_32x32b, 1>(tmp, row, col);
   if (num == 2)  tcgen05_ld<2,  SHAPE::_32x32b, 2>(tmp, row, col);
   if (num == 4)  tcgen05_ld<4,  SHAPE::_32x32b, 4>(tmp, row, col);
@@ -194,7 +194,7 @@ PTX_DEVICE inline void tcgen05_ld_32x32b(float *tmp, int row, int col, int num) 
   if (num == 32) tcgen05_ld<32, SHAPE::_32x32b, 32>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x128b(float *tmp, int row, int col, int num) {
+PTX_DEVICE void tcgen05_ld_16x128b(float *tmp, int row, int col, int num) {
   if (num == 1)  tcgen05_ld<1,  SHAPE::_16x128b, 1>(tmp, row, col);
   if (num == 2)  tcgen05_ld<2,  SHAPE::_16x128b, 2>(tmp, row, col);
   if (num == 4)  tcgen05_ld<4,  SHAPE::_16x128b, 4>(tmp, row, col);
@@ -203,7 +203,7 @@ PTX_DEVICE inline void tcgen05_ld_16x128b(float *tmp, int row, int col, int num)
   if (num == 32) tcgen05_ld<32, SHAPE::_16x128b, 32>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x256b(float *tmp, int row, int col, int num) {
+PTX_DEVICE void tcgen05_ld_16x256b(float *tmp, int row, int col, int num) {
   if (num == 1)  tcgen05_ld<1,  SHAPE::_16x256b, 1>(tmp, row, col);
   if (num == 2)  tcgen05_ld<2,  SHAPE::_16x256b, 2>(tmp, row, col);
   if (num == 4)  tcgen05_ld<4,  SHAPE::_16x256b, 4>(tmp, row, col);
@@ -213,38 +213,38 @@ PTX_DEVICE inline void tcgen05_ld_16x256b(float *tmp, int row, int col, int num)
 }
 
 // Named wrappers used by gemm1
-PTX_DEVICE inline void tcgen05_ld_32x32bx32(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_32x32bx32(float *tmp, int row, int col) {
   tcgen05_ld_32regs<SHAPE::_32x32b, NUM::x32>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_32x32bx64(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_32x32bx64(float *tmp, int row, int col) {
   tcgen05_ld_64regs<SHAPE::_32x32b, NUM::x64>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_32x32bx128(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_32x32bx128(float *tmp, int row, int col) {
   tcgen05_ld_128regs<SHAPE::_32x32b, NUM::x128>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x128bx8(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x128bx8(float *tmp, int row, int col) {
   tcgen05_ld_16regs<SHAPE::_16x128b, NUM::x8>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x128bx16(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x128bx16(float *tmp, int row, int col) {
   tcgen05_ld_32regs<SHAPE::_16x128b, NUM::x16>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x128bx32(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x128bx32(float *tmp, int row, int col) {
   tcgen05_ld_64regs<SHAPE::_16x128b, NUM::x32>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x256bx4(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x256bx4(float *tmp, int row, int col) {
   tcgen05_ld_16regs<SHAPE::_16x256b, NUM::x4>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x256bx8(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x256bx8(float *tmp, int row, int col) {
   tcgen05_ld_32regs<SHAPE::_16x256b, NUM::x8>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x256bx16(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x256bx16(float *tmp, int row, int col) {
   tcgen05_ld_64regs<SHAPE::_16x256b, NUM::x16>(tmp, row, col);
 }

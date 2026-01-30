@@ -3,7 +3,6 @@
 
 CUDA_SRC = r'''
 // ----- ptx_common.cuh -----
-#pragma once
 
 #include <stdint.h>
 
@@ -12,25 +11,25 @@ CUDA_SRC = r'''
 #if defined(__CUDA_ARCH__)
 #define PTX_DEVICE __device__ __forceinline__
 
-PTX_DEVICE inline uint32_t ptx_laneid() {
+PTX_DEVICE uint32_t ptx_laneid() {
   uint32_t lane;
   asm volatile("mov.u32 %0, %laneid;" : "=r"(lane));
   return lane;
 }
 
-PTX_DEVICE inline uint32_t ptx_activemask() {
+PTX_DEVICE uint32_t ptx_activemask() {
   uint32_t mask;
   asm volatile("activemask.b32 %0;" : "=r"(mask));
   return mask;
 }
 
-PTX_DEVICE inline bool ptx_elect_one_sync() {
+PTX_DEVICE bool ptx_elect_one_sync() {
   uint32_t mask = ptx_activemask();
   int leader = __ffs(mask) - 1;
   return (int)ptx_laneid() == leader;
 }
 
-PTX_DEVICE inline uint32_t ptx_elect_sync() {
+PTX_DEVICE uint32_t ptx_elect_sync() {
   uint32_t pred = 0;
   asm volatile(
     "{\n\t"
@@ -45,10 +44,12 @@ PTX_DEVICE inline uint32_t ptx_elect_sync() {
 }
 
 #else
-#define PTX_DEVICE inline
+#define PTX_DEVICE __device__ __forceinline__
 
-PTX_DEVICE inline bool ptx_elect_one_sync() { return true; }
-PTX_DEVICE inline uint32_t ptx_elect_sync() { return 1; }
+PTX_DEVICE uint32_t ptx_laneid() { return 0; }
+PTX_DEVICE uint32_t ptx_activemask() { return 0xFFFFFFFF; }
+PTX_DEVICE bool ptx_elect_one_sync() { return true; }
+PTX_DEVICE uint32_t ptx_elect_sync() { return 1; }
 #endif
 
 #ifndef PTX_NO_ELECT
@@ -62,48 +63,34 @@ PTX_DEVICE inline uint32_t ptx_elect_sync() { return 1; }
 #define PTX_ELECT_ONE() do { } while (0)
 #endif
 
-PTX_DEVICE inline void ptx_bar_sync(int bar_id, int count) {
+PTX_DEVICE void ptx_bar_sync(int bar_id, int count) {
   asm volatile("bar.sync %0, %1;" :: "r"(bar_id), "r"(count) : "memory");
 }
 
 // ----- ptx_mbarrier.cuh -----
-#pragma once
 
-#include "ptx_common.cuh"
 
 // mbarrier helpers (CTA scope)
 
-PTX_DEVICE inline void mbarrier_init(int mbar_addr, int count) {
-  PTX_ELECT_ONE();
+// NOTE: Keep gemm1 semantics (no implicit election in wrappers).
+PTX_DEVICE void mbarrier_init(int mbar_addr, int count) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(mbar_addr), "r"(count));
 }
 
 // CTA-scope arrive expect_tx (gemm1 uses CTA scope)
-PTX_DEVICE inline void mbarrier_arrive_expect_tx_cta(int mbar_addr, int size) {
-  PTX_ELECT_ONE();
+PTX_DEVICE void mbarrier_arrive_expect_tx_cta(int mbar_addr, int size) {
   asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
               :: "r"(mbar_addr), "r"(size) : "memory");
 }
 
-PTX_DEVICE inline void mbarrier_arrive_expect_tx(int mbar_addr, int size) {
-  PTX_ELECT_ONE();
+PTX_DEVICE void mbarrier_arrive_expect_tx(int mbar_addr, int size) {
   asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
               :: "r"(mbar_addr), "r"(size) : "memory");
 }
 
-PTX_DEVICE inline void mbarrier_wait(int mbar_addr, int phase) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "WAIT: \n\t"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n\t"
-      "@P1 bra WAIT;\n\t"
-      "}\n\t"
-      :: "r"(mbar_addr), "r"(phase), "r"(0xFFFFFFFF));
-}
-
-// Explicit wait loop with ticks (as in gemm1)
-PTX_DEVICE inline void mbarrier_wait_ticks(int mbar_addr, int phase, uint32_t ticks) {
+PTX_DEVICE void mbarrier_wait(int mbar_addr, int phase) {
+  // gemm1 uses a ticked wait loop and exits when P1 is true.
+  uint32_t ticks = 0x989680;
   asm volatile(
       "{\n\t"
       ".reg .pred P1;\n\t"
@@ -116,7 +103,21 @@ PTX_DEVICE inline void mbarrier_wait_ticks(int mbar_addr, int phase, uint32_t ti
       :: "r"(mbar_addr), "r"(phase), "r"(ticks));
 }
 
-PTX_DEVICE inline void mbarrier_wait_relaxed(int mbar_addr, int phase) {
+// Explicit wait loop with ticks (as in gemm1)
+PTX_DEVICE void mbarrier_wait_ticks(int mbar_addr, int phase, uint32_t ticks) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "LAB_WAIT:\n\t"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+      "@P1 bra.uni DONE;\n\t"
+      "bra.uni LAB_WAIT;\n\t"
+      "DONE:\n\t"
+      "}\n\t"
+      :: "r"(mbar_addr), "r"(phase), "r"(ticks));
+}
+
+PTX_DEVICE void mbarrier_wait_relaxed(int mbar_addr, int phase) {
   asm volatile(
       "{\n\t"
       ".reg .pred P1;\n\t"
@@ -127,34 +128,31 @@ PTX_DEVICE inline void mbarrier_wait_relaxed(int mbar_addr, int phase) {
       :: "r"(mbar_addr), "r"(phase), "r"(0xFFFFFFFF));
 }
 
-PTX_DEVICE inline void mbarrier_fence_init_release() {
-  PTX_ELECT_ONE();
+PTX_DEVICE void mbarrier_fence_init_release() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
 
 // ----- ptx_tcgen05_cp.cuh -----
-#pragma once
 
-#include "ptx_common.cuh"
 
 // tcgen05.cp wrappers (CTA group 1 only for now)
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tcgen05_cp_32x128b_warpx4(int taddr, uint64_t s_desc) {
+PTX_DEVICE void tcgen05_cp_32x128b_warpx4(int taddr, uint64_t s_desc) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   PTX_ELECT_ONE();
   asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;" :: "r"(taddr), "l"(s_desc));
 }
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tcgen05_cp_128x128b(int taddr, uint64_t s_desc) {
+PTX_DEVICE void tcgen05_cp_128x128b(int taddr, uint64_t s_desc) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   PTX_ELECT_ONE();
   asm volatile("tcgen05.cp.cta_group::1.128x128b [%0], %1;" :: "r"(taddr), "l"(s_desc));
 }
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tcgen05_cp_128x256b(int taddr, uint64_t s_desc) {
+PTX_DEVICE void tcgen05_cp_128x256b(int taddr, uint64_t s_desc) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   PTX_ELECT_ONE();
   asm volatile("tcgen05.cp.cta_group::1.128x256b [%0], %1;" :: "r"(taddr), "l"(s_desc));
@@ -162,14 +160,12 @@ PTX_DEVICE inline void tcgen05_cp_128x256b(int taddr, uint64_t s_desc) {
 
 // Alias used by gemm1 (NVFP4 block scaling)
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tcgen05_cp_nvfp4(int taddr, uint64_t s_desc) {
+PTX_DEVICE void tcgen05_cp_nvfp4(int taddr, uint64_t s_desc) {
   tcgen05_cp_32x128b_warpx4<CTA_GROUP>(taddr, s_desc);
 }
 
 // ----- ptx_tcgen05_ldst.cuh -----
-#pragma once
 
-#include "ptx_common.cuh"
 
 // tcgen05.ld / tcgen05.st wrappers
 
@@ -192,7 +188,7 @@ struct NUM {
 };
 
 template <int NUM_REGS, const char *SHAPE, int NUM>
-PTX_DEVICE inline void tcgen05_ld(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld(float *tmp, int row, int col) {
   int addr = (row << 16) | col;
 
   if constexpr (NUM_REGS == 1)
@@ -233,7 +229,7 @@ PTX_DEVICE inline void tcgen05_ld(float *tmp, int row, int col) {
 
 // Explicit tcgen05.ld variants (verbatim from gemm1)
 template <const char *SHAPE, const char *NUM>
-PTX_DEVICE inline void tcgen05_ld_16regs(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16regs(float *tmp, int row, int col) {
   asm volatile("tcgen05.ld.sync.aligned%17%18.b32 "
               "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
               "  %8,  %9, %10, %11, %12, %13, %14, %15}, [%16];"
@@ -243,7 +239,7 @@ PTX_DEVICE inline void tcgen05_ld_16regs(float *tmp, int row, int col) {
 }
 
 template <const char *SHAPE, const char *NUM>
-PTX_DEVICE inline void tcgen05_ld_32regs(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_32regs(float *tmp, int row, int col) {
   asm volatile("tcgen05.ld.sync.aligned%33%34.b32 "
               "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
               "  %8,  %9, %10, %11, %12, %13, %14, %15, "
@@ -257,7 +253,7 @@ PTX_DEVICE inline void tcgen05_ld_32regs(float *tmp, int row, int col) {
 }
 
 template <const char *SHAPE, const char *NUM>
-PTX_DEVICE inline void tcgen05_ld_64regs(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_64regs(float *tmp, int row, int col) {
   asm volatile("tcgen05.ld.sync.aligned%65%66.b32 "
               "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
               "  %8,  %9, %10, %11, %12, %13, %14, %15, "
@@ -279,7 +275,7 @@ PTX_DEVICE inline void tcgen05_ld_64regs(float *tmp, int row, int col) {
 }
 
 template <const char *SHAPE, const char *NUM>
-PTX_DEVICE inline void tcgen05_ld_128regs(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_128regs(float *tmp, int row, int col) {
   asm volatile("tcgen05.ld.sync.aligned%129%130.b32 "
               "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
               "  %8,  %9, %10, %11, %12, %13, %14, %15, "
@@ -318,7 +314,7 @@ PTX_DEVICE inline void tcgen05_ld_128regs(float *tmp, int row, int col) {
 
 // Limited tcgen05.st variants (b32). Use uint32_t registers.
 template <int NUM_REGS, const char *SHAPE, int NUM>
-PTX_DEVICE inline void tcgen05_st(uint32_t const* tmp, int row, int col) {
+PTX_DEVICE void tcgen05_st(uint32_t const* tmp, int row, int col) {
   int addr = (row << 16) | col;
 
   if constexpr (NUM_REGS == 1)
@@ -354,7 +350,7 @@ PTX_DEVICE inline void tcgen05_st(uint32_t const* tmp, int row, int col) {
 }
 
 // Convenience wrappers
-PTX_DEVICE inline void tcgen05_ld_32x32b(float *tmp, int row, int col, int num) {
+PTX_DEVICE void tcgen05_ld_32x32b(float *tmp, int row, int col, int num) {
   if (num == 1)  tcgen05_ld<1,  SHAPE::_32x32b, 1>(tmp, row, col);
   if (num == 2)  tcgen05_ld<2,  SHAPE::_32x32b, 2>(tmp, row, col);
   if (num == 4)  tcgen05_ld<4,  SHAPE::_32x32b, 4>(tmp, row, col);
@@ -363,7 +359,7 @@ PTX_DEVICE inline void tcgen05_ld_32x32b(float *tmp, int row, int col, int num) 
   if (num == 32) tcgen05_ld<32, SHAPE::_32x32b, 32>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x128b(float *tmp, int row, int col, int num) {
+PTX_DEVICE void tcgen05_ld_16x128b(float *tmp, int row, int col, int num) {
   if (num == 1)  tcgen05_ld<1,  SHAPE::_16x128b, 1>(tmp, row, col);
   if (num == 2)  tcgen05_ld<2,  SHAPE::_16x128b, 2>(tmp, row, col);
   if (num == 4)  tcgen05_ld<4,  SHAPE::_16x128b, 4>(tmp, row, col);
@@ -372,7 +368,7 @@ PTX_DEVICE inline void tcgen05_ld_16x128b(float *tmp, int row, int col, int num)
   if (num == 32) tcgen05_ld<32, SHAPE::_16x128b, 32>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x256b(float *tmp, int row, int col, int num) {
+PTX_DEVICE void tcgen05_ld_16x256b(float *tmp, int row, int col, int num) {
   if (num == 1)  tcgen05_ld<1,  SHAPE::_16x256b, 1>(tmp, row, col);
   if (num == 2)  tcgen05_ld<2,  SHAPE::_16x256b, 2>(tmp, row, col);
   if (num == 4)  tcgen05_ld<4,  SHAPE::_16x256b, 4>(tmp, row, col);
@@ -382,46 +378,44 @@ PTX_DEVICE inline void tcgen05_ld_16x256b(float *tmp, int row, int col, int num)
 }
 
 // Named wrappers used by gemm1
-PTX_DEVICE inline void tcgen05_ld_32x32bx32(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_32x32bx32(float *tmp, int row, int col) {
   tcgen05_ld_32regs<SHAPE::_32x32b, NUM::x32>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_32x32bx64(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_32x32bx64(float *tmp, int row, int col) {
   tcgen05_ld_64regs<SHAPE::_32x32b, NUM::x64>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_32x32bx128(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_32x32bx128(float *tmp, int row, int col) {
   tcgen05_ld_128regs<SHAPE::_32x32b, NUM::x128>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x128bx8(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x128bx8(float *tmp, int row, int col) {
   tcgen05_ld_16regs<SHAPE::_16x128b, NUM::x8>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x128bx16(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x128bx16(float *tmp, int row, int col) {
   tcgen05_ld_32regs<SHAPE::_16x128b, NUM::x16>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x128bx32(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x128bx32(float *tmp, int row, int col) {
   tcgen05_ld_64regs<SHAPE::_16x128b, NUM::x32>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x256bx4(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x256bx4(float *tmp, int row, int col) {
   tcgen05_ld_16regs<SHAPE::_16x256b, NUM::x4>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x256bx8(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x256bx8(float *tmp, int row, int col) {
   tcgen05_ld_32regs<SHAPE::_16x256b, NUM::x8>(tmp, row, col);
 }
 
-PTX_DEVICE inline void tcgen05_ld_16x256bx16(float *tmp, int row, int col) {
+PTX_DEVICE void tcgen05_ld_16x256bx16(float *tmp, int row, int col) {
   tcgen05_ld_64regs<SHAPE::_16x256b, NUM::x16>(tmp, row, col);
 }
 
 // ----- ptx_tcgen05_mma.cuh -----
-#pragma once
 
-#include "ptx_common.cuh"
 
 // tcgen05.mma wrappers (CTA group 1 only for now)
 
@@ -435,7 +429,7 @@ struct COLLECTOR_USAGE {
 
 // Block-scaled NVFP4 MMA (smem A/B descriptors, tmem scales)
 template <int CTA_GROUP = 1, const char *collector_usage = COLLECTOR_USAGE::NONE>
-PTX_DEVICE inline void tcgen05_mma_mxf4nvf4_block16(
+PTX_DEVICE void tcgen05_mma_mxf4nvf4_block16(
   int d_tmem,
   uint64_t a_desc,
   uint64_t b_desc,
@@ -459,7 +453,7 @@ PTX_DEVICE inline void tcgen05_mma_mxf4nvf4_block16(
 }
 
 // F16/BF16 MMA, SS (A/B in smem desc), C in tmem
-PTX_DEVICE inline void tcgen05_mma_f16_ss(
+PTX_DEVICE void tcgen05_mma_f16_ss(
   uint32_t tmem_c,
   uint64_t desc_a,
   uint64_t desc_b,
@@ -480,7 +474,7 @@ PTX_DEVICE inline void tcgen05_mma_f16_ss(
 }
 
 // F16/BF16 MMA, TS (A in tmem, B in smem desc), C in tmem
-PTX_DEVICE inline void tcgen05_mma_f16_ts(
+PTX_DEVICE void tcgen05_mma_f16_ts(
   uint32_t tmem_c,
   uint32_t tmem_a,
   uint64_t desc_b,
@@ -501,7 +495,7 @@ PTX_DEVICE inline void tcgen05_mma_f16_ts(
 }
 
 // F16/BF16 MMA, WS (warp-specialized), C in tmem
-PTX_DEVICE inline void tcgen05_mma_ws_f16_ts(
+PTX_DEVICE void tcgen05_mma_ws_f16_ts(
   uint32_t tmem_c,
   uint32_t tmem_a,
   uint64_t desc_b,
@@ -520,7 +514,7 @@ PTX_DEVICE inline void tcgen05_mma_ws_f16_ts(
 }
 
 // Alias used by gemm1 (block-scaled NVFP4 MMA, d_tmem assumed 0)
-PTX_DEVICE inline void tcgen05_mma_nvfp4(
+PTX_DEVICE void tcgen05_mma_nvfp4(
   uint64_t a_desc,
   uint64_t b_desc,
   uint32_t i_desc,
@@ -534,14 +528,12 @@ PTX_DEVICE inline void tcgen05_mma_nvfp4(
 }
 
 // ----- ptx_tcgen05_sync.cuh -----
-#pragma once
 
-#include "ptx_common.cuh"
 
 // tcgen05 commit, wait, fence wrappers (CTA group 1 only for now)
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tcgen05_commit(int mbar_addr) {
+PTX_DEVICE void tcgen05_commit(int mbar_addr) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   PTX_ELECT_ONE();
   asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
@@ -549,7 +541,7 @@ PTX_DEVICE inline void tcgen05_commit(int mbar_addr) {
 }
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tcgen05_commit_mcast(int mbar_addr, uint16_t cta_mask) {
+PTX_DEVICE void tcgen05_commit_mcast(int mbar_addr, uint16_t cta_mask) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   PTX_ELECT_ONE();
   asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;"
@@ -558,44 +550,42 @@ PTX_DEVICE inline void tcgen05_commit_mcast(int mbar_addr, uint16_t cta_mask) {
 
 // tcgen05 tmem allocation / deallocation (CTA group 1 only for now)
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tcgen05_alloc(int smem_addr, int num_cols) {
+PTX_DEVICE void tcgen05_alloc(int smem_addr, int num_cols) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
               :: "r"(smem_addr), "r"(num_cols));
 }
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tcgen05_dealloc(int tmem_addr, int num_cols) {
+PTX_DEVICE void tcgen05_dealloc(int tmem_addr, int num_cols) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
               :: "r"(tmem_addr), "r"(num_cols));
 }
 
-PTX_DEVICE inline void tcgen05_wait_ld() {
+PTX_DEVICE void tcgen05_wait_ld() {
   asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
 
-PTX_DEVICE inline void tcgen05_wait_st() {
+PTX_DEVICE void tcgen05_wait_st() {
   asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
 }
 
-PTX_DEVICE inline void tcgen05_fence_before_thread_sync() {
+PTX_DEVICE void tcgen05_fence_before_thread_sync() {
   asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
 }
 
-PTX_DEVICE inline void tcgen05_fence_after_thread_sync() {
+PTX_DEVICE void tcgen05_fence_after_thread_sync() {
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 }
 
 // ----- ptx_tma.cuh -----
-#pragma once
 
-#include "ptx_common.cuh"
 
 // TMA bulk tensor loads (CTA group 1 only for now)
 
 // Bulk global->shared copy (non-tensor)
-PTX_DEVICE inline void tma_gmem2smem(int dst, const void *src, int size, int mbar_addr, uint64_t cache_policy) {
+PTX_DEVICE void tma_gmem2smem(int dst, const void *src, int size, int mbar_addr, uint64_t cache_policy) {
   PTX_ELECT_ONE();
   asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
               "[%0], [%1], %2, [%3], %4;"
@@ -603,7 +593,7 @@ PTX_DEVICE inline void tma_gmem2smem(int dst, const void *src, int size, int mba
 }
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tma_1d_gmem2smem(int dst, const void *tmap_ptr, int x, int mbar_addr, uint64_t cache_policy) {
+PTX_DEVICE void tma_1d_gmem2smem(int dst, const void *tmap_ptr, int x, int mbar_addr, uint64_t cache_policy) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   PTX_ELECT_ONE();
   asm volatile("cp.async.bulk.tensor.1d.shared::cta.global.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
@@ -613,7 +603,7 @@ PTX_DEVICE inline void tma_1d_gmem2smem(int dst, const void *tmap_ptr, int x, in
 }
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tma_2d_gmem2smem(int dst, const void *tmap_ptr, int x, int y, int mbar_addr, uint64_t cache_policy) {
+PTX_DEVICE void tma_2d_gmem2smem(int dst, const void *tmap_ptr, int x, int y, int mbar_addr, uint64_t cache_policy) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   PTX_ELECT_ONE();
   asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
@@ -623,7 +613,7 @@ PTX_DEVICE inline void tma_2d_gmem2smem(int dst, const void *tmap_ptr, int x, in
 }
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tma_3d_gmem2smem(int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr, uint64_t cache_policy) {
+PTX_DEVICE void tma_3d_gmem2smem(int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr, uint64_t cache_policy) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   PTX_ELECT_ONE();
   asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
@@ -633,7 +623,7 @@ PTX_DEVICE inline void tma_3d_gmem2smem(int dst, const void *tmap_ptr, int x, in
 }
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tma_1d_gmem2smem_mcast(int dst, const void *tmap_ptr, int x, int mbar_addr, int16_t cta_mask, uint64_t cache_policy) {
+PTX_DEVICE void tma_1d_gmem2smem_mcast(int dst, const void *tmap_ptr, int x, int mbar_addr, int16_t cta_mask, uint64_t cache_policy) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   PTX_ELECT_ONE();
   asm volatile("cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::1.L2::cache_hint "
@@ -643,7 +633,7 @@ PTX_DEVICE inline void tma_1d_gmem2smem_mcast(int dst, const void *tmap_ptr, int
 }
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tma_2d_gmem2smem_mcast(int dst, const void *tmap_ptr, int x, int y, int mbar_addr, int16_t cta_mask, uint64_t cache_policy) {
+PTX_DEVICE void tma_2d_gmem2smem_mcast(int dst, const void *tmap_ptr, int x, int y, int mbar_addr, int16_t cta_mask, uint64_t cache_policy) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   PTX_ELECT_ONE();
   asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::1.L2::cache_hint "
@@ -653,7 +643,7 @@ PTX_DEVICE inline void tma_2d_gmem2smem_mcast(int dst, const void *tmap_ptr, int
 }
 
 template <int CTA_GROUP = 1>
-PTX_DEVICE inline void tma_3d_gmem2smem_mcast(int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr, int16_t cta_mask, uint64_t cache_policy) {
+PTX_DEVICE void tma_3d_gmem2smem_mcast(int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr, int16_t cta_mask, uint64_t cache_policy) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
   PTX_ELECT_ONE();
   asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::1.L2::cache_hint "
@@ -745,45 +735,6 @@ uint32_t elect_sync() {
   );
   return pred;
 }
-
-__device__ inline
-void mbarrier_init(int mbar_addr, int count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(mbar_addr), "r"(count));
-}
-
-// https://github.com/NVIDIA/cutlass/blob/v4.2.1/include/cutlass/arch/barrier.h#L408
-__device__
-void mbarrier_wait(int mbar_addr, int phase) {
-  uint32_t ticks = 0x989680;  // this is optional
-  asm volatile(
-    "{\n\t"
-    ".reg .pred P1;\n\t"
-    "LAB_WAIT:\n\t"
-    "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n\t"
-    "@P1 bra.uni DONE;\n\t"
-    "bra.uni LAB_WAIT;\n\t"
-    "DONE:\n\t"
-    "}"
-    :: "r"(mbar_addr), "r"(phase), "r"(ticks)
-  );
-}
-
-__device__ inline
-void tma_gmem2smem(int dst, const void *src, int size, int mbar_addr, uint64_t cache_policy) {
-  asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
-              :: "r"(dst), "l"(src), "r"(size), "r"(mbar_addr), "l"(cache_policy));
-}
-
-__device__ inline
-void tma_3d_gmem2smem(int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr, uint64_t cache_policy) {
-  asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
-              "[%0], [%1, {%2, %3, %4}], [%5], %6;"
-              :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr), "l"(cache_policy)
-              : "memory");
-}
-
-__device__ inline
-
 
 template <
   int K,

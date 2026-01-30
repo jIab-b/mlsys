@@ -31,6 +31,7 @@ _PTX_INCLUDE_PREFIXES = (
     '#include "ptx_lib/',
     '#include "ptx_',
     '#include <ptx_',
+    '#include "ptx_common.cuh"',
 )
 
 
@@ -39,6 +40,8 @@ def _strip_ptx_includes(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
         if any(stripped.startswith(prefix) for prefix in _PTX_INCLUDE_PREFIXES):
+            continue
+        if stripped.startswith("#include") and "ptx_" in stripped and ".cuh" in stripped:
             continue
         lines.append(line)
     return "\n".join(lines)
@@ -109,7 +112,13 @@ def _build_submission_from_graph(out_path: Path) -> None:
     selected_headers = _select_ptx_headers(ptx_headers, [device_src, host_src])
     for header in selected_headers:
         parts.append(f"// ----- {header.name} -----\n")
-        parts.append(_read_text(header))
+        header_text = _strip_ptx_includes(_read_text(header))
+        header_lines = []
+        for line in header_text.splitlines():
+            if line.strip().startswith("#pragma once"):
+                continue
+            header_lines.append(line)
+        parts.append("\n".join(header_lines))
         if not parts[-1].endswith("\n"):
             parts.append("\n")
         parts.append("\n")

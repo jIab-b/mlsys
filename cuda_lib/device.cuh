@@ -81,45 +81,6 @@ uint32_t elect_sync() {
   return pred;
 }
 
-__device__ inline
-void mbarrier_init(int mbar_addr, int count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(mbar_addr), "r"(count));
-}
-
-// https://github.com/NVIDIA/cutlass/blob/v4.2.1/include/cutlass/arch/barrier.h#L408
-__device__
-void mbarrier_wait(int mbar_addr, int phase) {
-  uint32_t ticks = 0x989680;  // this is optional
-  asm volatile(
-    "{\n\t"
-    ".reg .pred P1;\n\t"
-    "LAB_WAIT:\n\t"
-    "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n\t"
-    "@P1 bra.uni DONE;\n\t"
-    "bra.uni LAB_WAIT;\n\t"
-    "DONE:\n\t"
-    "}"
-    :: "r"(mbar_addr), "r"(phase), "r"(ticks)
-  );
-}
-
-__device__ inline
-void tma_gmem2smem(int dst, const void *src, int size, int mbar_addr, uint64_t cache_policy) {
-  asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
-              :: "r"(dst), "l"(src), "r"(size), "r"(mbar_addr), "l"(cache_policy));
-}
-
-__device__ inline
-void tma_3d_gmem2smem(int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr, uint64_t cache_policy) {
-  asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
-              "[%0], [%1, {%2, %3, %4}], [%5], %6;"
-              :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr), "l"(cache_policy)
-              : "memory");
-}
-
-__device__ inline
-
-
 template <
   int K,
   int BLOCK_M,
