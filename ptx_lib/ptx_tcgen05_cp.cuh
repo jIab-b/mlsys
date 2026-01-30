@@ -25,3 +25,8 @@ PTX_DEVICE inline void tcgen05_cp_128x256b(int taddr, uint64_t s_desc) {
   asm volatile("tcgen05.cp.cta_group::1.128x256b [%0], %1;" :: "r"(taddr), "l"(s_desc));
 }
 
+// Alias used by gemm1 (NVFP4 block scaling)
+template <int CTA_GROUP = 1>
+PTX_DEVICE inline void tcgen05_cp_nvfp4(int taddr, uint64_t s_desc) {
+  tcgen05_cp_32x128b_warpx4<CTA_GROUP>(taddr, s_desc);
+}

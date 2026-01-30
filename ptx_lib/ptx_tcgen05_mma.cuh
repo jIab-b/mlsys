@@ -98,3 +98,16 @@ PTX_DEVICE inline void tcgen05_mma_ws_f16_ts(
   );
 }
 
+// Alias used by gemm1 (block-scaled NVFP4 MMA, d_tmem assumed 0)
+PTX_DEVICE inline void tcgen05_mma_nvfp4(
+  uint64_t a_desc,
+  uint64_t b_desc,
+  uint32_t i_desc,
+  int scale_A_tmem,
+  int scale_B_tmem,
+  int enable_input_d
+) {
+  tcgen05_mma_mxf4nvf4_block16<1, COLLECTOR_USAGE::NONE>(
+    0, a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d
+  );
+}

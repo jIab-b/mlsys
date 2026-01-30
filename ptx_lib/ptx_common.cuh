@@ -25,10 +25,25 @@ PTX_DEVICE inline bool ptx_elect_one_sync() {
   return (int)ptx_laneid() == leader;
 }
 
+PTX_DEVICE inline uint32_t ptx_elect_sync() {
+  uint32_t pred = 0;
+  asm volatile(
+    "{\n\t"
+    ".reg .pred %%px;\n\t"
+    "elect.sync _|%%px, %1;\n\t"
+    "@%%px mov.s32 %0, 1;\n\t"
+    "}\n\t"
+    : "+r"(pred)
+    : "r"(0xFFFFFFFF)
+  );
+  return pred;
+}
+
 #else
 #define PTX_DEVICE inline
 
 PTX_DEVICE inline bool ptx_elect_one_sync() { return true; }
+PTX_DEVICE inline uint32_t ptx_elect_sync() { return 1; }
 #endif
 
 #ifndef PTX_NO_ELECT
@@ -41,3 +56,7 @@ PTX_DEVICE inline bool ptx_elect_one_sync() { return true; }
 #else
 #define PTX_ELECT_ONE() do { } while (0)
 #endif
+
+PTX_DEVICE inline void ptx_bar_sync(int bar_id, int count) {
+  asm volatile("bar.sync %0, %1;" :: "r"(bar_id), "r"(count) : "memory");
+}

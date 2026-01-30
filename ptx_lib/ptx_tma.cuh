@@ -4,6 +4,14 @@
 
 // TMA bulk tensor loads (CTA group 1 only for now)
 
+// Bulk global->shared copy (non-tensor)
+PTX_DEVICE inline void tma_gmem2smem(int dst, const void *src, int size, int mbar_addr, uint64_t cache_policy) {
+  PTX_ELECT_ONE();
+  asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+              "[%0], [%1], %2, [%3], %4;"
+              :: "r"(dst), "l"(src), "r"(size), "r"(mbar_addr), "l"(cache_policy));
+}
+
 template <int CTA_GROUP = 1>
 PTX_DEVICE inline void tma_1d_gmem2smem(int dst, const void *tmap_ptr, int x, int mbar_addr, uint64_t cache_policy) {
   static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
@@ -63,4 +71,3 @@ PTX_DEVICE inline void tma_3d_gmem2smem_mcast(int dst, const void *tmap_ptr, int
               :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr), "h"(cta_mask), "l"(cache_policy)
               : "memory");
 }
-
