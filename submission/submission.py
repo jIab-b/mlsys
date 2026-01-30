@@ -9,7 +9,7 @@ CUDA_SRC = r'''
 // Common helpers for PTX inline asm wrappers.
 
 #if defined(__CUDA_ARCH__)
-#define PTX_DEVICE __device__ __forceinline__
+#define PTX_DEVICE __device__ inline
 
 PTX_DEVICE uint32_t ptx_laneid() {
   uint32_t lane;
@@ -44,7 +44,7 @@ PTX_DEVICE uint32_t ptx_elect_sync() {
 }
 
 #else
-#define PTX_DEVICE __device__ __forceinline__
+#define PTX_DEVICE __device__ inline
 
 PTX_DEVICE uint32_t ptx_laneid() { return 0; }
 PTX_DEVICE uint32_t ptx_activemask() { return 0xFFFFFFFF; }

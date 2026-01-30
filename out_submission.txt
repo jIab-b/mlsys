@@ -15,16 +15,16 @@ Running on:
 ## Benchmarks:
 ```
 k: 16384; l: 1; m: 128; n: 7168; seed: 1111
- ⏱ 21.9 ± 0.09 µs
- ⚡ 21.4 µs 🐌 23.8 µs
+ ⏱ 21.9 ± 0.08 µs
+ ⚡ 21.4 µs 🐌 23.7 µs
 
 k: 7168; l: 1; m: 128; n: 4096; seed: 1111
- ⏱ 15.4 ± 0.02 µs
- ⚡ 15.3 µs 🐌 15.4 µs
+ ⏱ 15.4 ± 0.01 µs
+ ⚡ 15.4 µs 🐌 15.4 µs
 
 k: 2048; l: 1; m: 128; n: 7168; seed: 1111
- ⏱ 12.2 ± 0.10 µs
- ⚡ 11.2 µs 🐌 13.4 µs
+ ⏱ 12.3 ± 0.10 µs
+ ⚡ 11.0 µs 🐌 13.6 µs
 ```
 
 ## Program stdout:
@@ -52,71 +52,71 @@ ptxas info    : Compiling entry function '_Z10kernel_v3bILi2304ELi128ELi64ELi256
 ptxas info    : Function properties for _Z10kernel_v3bILi2304ELi128ELi64ELi256ELb1ELi6ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 43.216 ms
+ptxas info    : Compile time = 38.671 ms
 ptxas info    : Compiling entry function '_Z10kernel_v3bILi1536ELi128ELi64ELi256ELb1ELi6ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli' for 'sm_100a'
 ptxas info    : Function properties for _Z10kernel_v3bILi1536ELi128ELi64ELi256ELb1ELi6ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 33.840 ms
+ptxas info    : Compile time = 29.888 ms
 ptxas info    : Compiling entry function '_Z10kernel_v3bILi512ELi128ELi64ELi256ELb1ELi6ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli' for 'sm_100a'
 ptxas info    : Function properties for _Z10kernel_v3bILi512ELi128ELi64ELi256ELb1ELi6ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 38.592 ms
+ptxas info    : Compile time = 32.161 ms
 ptxas info    : Compiling entry function '_Z10kernel_v3bILi256ELi128ELi64ELi256ELb1ELi6ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli' for 'sm_100a'
 ptxas info    : Function properties for _Z10kernel_v3bILi256ELi128ELi64ELi256ELb1ELi6ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 30.376 ms
+ptxas info    : Compile time = 29.377 ms
 ptxas info    : Compiling entry function '_Z10kernel_v3bILi2048ELi128ELi64ELi256ELb1ELi8ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli' for 'sm_100a'
 ptxas info    : Function properties for _Z10kernel_v3bILi2048ELi128ELi64ELi256ELb1ELi8ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 37.591 ms
+ptxas info    : Compile time = 33.187 ms
 ptxas info    : Compiling entry function '_Z10kernel_v3bILi7168ELi64ELi64ELi512ELb1ELi5ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli' for 'sm_100a'
 ptxas info    : Function properties for _Z10kernel_v3bILi7168ELi64ELi64ELi512ELb1ELi5ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 56.027 ms
+ptxas info    : Compile time = 48.242 ms
 ptxas info    : Compiling entry function '_Z10kernel_v3bILi16384ELi128ELi64ELi256ELb1ELi8ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli' for 'sm_100a'
 ptxas info    : Function properties for _Z10kernel_v3bILi16384ELi128ELi64ELi256ELb1ELi8ELb0EEv14CUtensorMap_stS0_PKcS2_P6__halfiiPli
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 46.227 ms
+ptxas info    : Compile time = 40.065 ms
 ptxas info    : Compiling entry function '_Z9kernel_v4ILi2304ELi128ELi64ELi256ELi1ELb1ELi6EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii' for 'sm_100a'
 ptxas info    : Function properties for _Z9kernel_v4ILi2304ELi128ELi64ELi256ELi1ELb1ELi6EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 37.479 ms
+ptxas info    : Compile time = 37.474 ms
 ptxas info    : Compiling entry function '_Z9kernel_v4ILi1536ELi128ELi64ELi256ELi1ELb1ELi6EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii' for 'sm_100a'
 ptxas info    : Function properties for _Z9kernel_v4ILi1536ELi128ELi64ELi256ELi1ELb1ELi6EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 32.197 ms
+ptxas info    : Compile time = 28.974 ms
 ptxas info    : Compiling entry function '_Z9kernel_v4ILi512ELi128ELi64ELi256ELi1ELb1ELi6EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii' for 'sm_100a'
 ptxas info    : Function properties for _Z9kernel_v4ILi512ELi128ELi64ELi256ELi1ELb1ELi6EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 36.348 ms
+ptxas info    : Compile time = 36.105 ms
 ptxas info    : Compiling entry function '_Z9kernel_v4ILi256ELi128ELi64ELi256ELi1ELb1ELi6EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii' for 'sm_100a'
 ptxas info    : Function properties for _Z9kernel_v4ILi256ELi128ELi64ELi256ELi1ELb1ELi6EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 31.026 ms
+ptxas info    : Compile time = 28.686 ms
 ptxas info    : Compiling entry function '_Z9kernel_v4ILi2048ELi128ELi64ELi256ELi1ELb1ELi8EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii' for 'sm_100a'
 ptxas info    : Function properties for _Z9kernel_v4ILi2048ELi128ELi64ELi256ELi1ELb1ELi8EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 33.942 ms
+ptxas info    : Compile time = 31.558 ms
 ptxas info    : Compiling entry function '_Z9kernel_v4ILi7168ELi128ELi64ELi256ELi2ELb0ELi8EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii' for 'sm_100a'
 ptxas info    : Function properties for _Z9kernel_v4ILi7168ELi128ELi64ELi256ELi2ELb0ELi8EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 96 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 68.899 ms
+ptxas info    : Compile time = 64.084 ms
 ptxas info    : Compiling entry function '_Z9kernel_v4ILi16384ELi128ELi128ELi256ELi2ELb0ELi6EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii' for 'sm_100a'
 ptxas info    : Function properties for _Z9kernel_v4ILi16384ELi128ELi128ELi256ELi2ELb0ELi6EEv14CUtensorMap_stS0_PKcS2_P6__halfPfii
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 87 registers, used 2 barriers, 1024 bytes smem
-ptxas info    : Compile time = 45.457 ms
+ptxas info    : Compile time = 43.460 ms
 [3/3] c++ main.o cuda.cuda.o -shared -lcuda -L/opt/conda/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda/lib64 -lcudart -o gemm_all.so
 ```"
