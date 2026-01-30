@@ -8,14 +8,25 @@ from __future__ import annotations
 
 import argparse
 import re
-from dataclasses import dataclass, field
-from enum import Enum, auto
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
 CUDA_LIB = REPO_ROOT / "cuda_lib"
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from graph.core import (  # noqa: E402
+    BarrierState,
+    BufferState,
+    Graph,
+    MemSpace,
+    Node,
+    OpContract,
+)
 
 SECTION_FILES = {
     "device": CUDA_LIB / "device.cuh",
@@ -24,108 +35,6 @@ SECTION_FILES = {
 }
 
 
-class MemSpace(Enum):
-    GMEM = auto()
-    SMEM = auto()
-    TMEM = auto()
-    RMEM = auto()
-
-
-class BarrierState(Enum):
-    UNINIT = auto()
-    INIT = auto()
-    PENDING = auto()
-    ARRIVED = auto()
-    COMPLETE = auto()
-
-
-class BufferState(Enum):
-    EMPTY = auto()
-    FILLING = auto()
-    FULL = auto()
-    CONSUMING = auto()
-
-
-@dataclass
-class Tensor:
-    name: str
-    space: MemSpace
-    shape: Tuple[int, ...]
-    dtype: str
-
-
-@dataclass
-class Barrier:
-    name: str
-    scope: str  # "cta" or "cluster"
-
-
-@dataclass
-class OpContract:
-    name: str
-    issue_scope: str  # "one_thread", "one_warp", "all_warps"
-    pre: Dict[str, BarrierState] = field(default_factory=dict)
-    post: Dict[str, BarrierState] = field(default_factory=dict)
-    buffer_pre: Dict[str, BufferState] = field(default_factory=dict)
-    buffer_post: Dict[str, BufferState] = field(default_factory=dict)
-
-
-@dataclass
-class Node:
-    kind: str
-    args: Dict[str, str] = field(default_factory=dict)
-    children: List["Node"] = field(default_factory=list)
-    meta: Dict[str, str] = field(default_factory=dict)
-
-
-class Graph:
-    def __init__(self) -> None:
-        self.sections: Dict[str, List[Node]] = {"device": [], "host": [], "python": []}
-        self.barriers: Dict[str, Barrier] = {}
-        self.buffers: Dict[str, Tensor] = {}
-        self.default_tmem: Optional[str] = None
-
-    def add_barrier(self, name: str, scope: str = "cta") -> None:
-        self.barriers[name] = Barrier(name=name, scope=scope)
-
-    def add_buffer(self, name: str, space: MemSpace, shape: Tuple[int, ...], dtype: str) -> None:
-        self.buffers[name] = Tensor(name=name, space=space, shape=shape, dtype=dtype)
-        if space == MemSpace.TMEM and self.default_tmem is None:
-            self.default_tmem = name
-
-    def set_default_tmem(self, name: str) -> None:
-        self.default_tmem = name
-
-    def add_node(self, section: str, kind: str, **kwargs: str) -> Node:
-        node = Node(kind=kind, args=kwargs)
-        self.sections[section].append(node)
-        return node
-
-    def add_raw(self, section: str, code: str, meta: Optional[Dict[str, str]] = None) -> Node:
-        node = Node(kind="Raw", args={"code": code}, meta=meta or {})
-        self.sections[section].append(node)
-        return node
-
-    def add_event(self, section: str, op: str) -> Node:
-        node = Node(kind="Event", args={"op": op})
-        self.sections[section].append(node)
-        return node
-
-    def block(self, *nodes: Node) -> Node:
-        return Node(kind="Block", children=list(nodes))
-
-    def if_(self, cond: str, then_nodes: List[Node], else_nodes: Optional[List[Node]] = None) -> Node:
-        node = Node(kind="If", args={"cond": cond})
-        node.children.append(Node(kind="Then", children=then_nodes))
-        if else_nodes is not None:
-            node.children.append(Node(kind="Else", children=else_nodes))
-        return node
-
-    def for_(self, var: str, iters: int, body: List[Node]) -> Node:
-        return Node(kind="For", args={"var": var, "iters": str(iters)}, children=body)
-
-    def raw(self, code: str, meta: Optional[Dict[str, str]] = None) -> Node:
-        return Node(kind="Raw", args={"code": code}, meta=meta or {})
 
 
 # tcgen op contracts only (everything else must be Raw)
@@ -319,7 +228,7 @@ def _validate_nodes(nodes: List[Node], g: Graph, bar_state: Dict[str, BarrierSta
             buf_state.update(f1)
             continue
 
-        if node.kind == "Raw":
+        if node.kind in ("Raw", "LoadInline"):
             # Raw nodes are opaque; tcgen validation happens only on explicit nodes.
             continue
         if node.kind == "Event":
@@ -350,25 +259,79 @@ def validate_graph(g: Graph) -> None:
     _validate_nodes(g.sections.get("device", []), g, bar_state, buf_state)
 
 
-def _emit_nodes(nodes: List[Node], indent: int = 0) -> List[str]:
+def _emit_nodes(
+    nodes: List[Node],
+    indent: int = 0,
+    emit_load_inline: bool = True,
+    marker_state: Optional[List[bool]] = None,
+) -> List[str]:
     lines: List[str] = []
     pad = " " * indent
     for node in nodes:
         if node.kind == "Block":
-            lines.extend(_emit_nodes(node.children, indent))
+            lines.extend(
+                _emit_nodes(
+                    node.children,
+                    indent,
+                    emit_load_inline=emit_load_inline,
+                    marker_state=marker_state,
+                )
+            )
             continue
         if node.kind == "If":
             cond = node.args.get("cond", "/*cond*/")
             lines.append(f"{pad}if ({cond}) {{\n")
             then_node = next((c for c in node.children if c.kind == "Then"), None)
             if then_node:
-                lines.extend(_emit_nodes(then_node.children, indent + 2))
+                lines.extend(
+                    _emit_nodes(
+                        then_node.children,
+                        indent + 2,
+                        emit_load_inline=emit_load_inline,
+                        marker_state=marker_state,
+                    )
+                )
             lines.append(f"{pad}}}\n")
             else_node = next((c for c in node.children if c.kind == "Else"), None)
             if else_node:
                 lines.append(f"{pad}else {{\n")
-                lines.extend(_emit_nodes(else_node.children, indent + 2))
+                lines.extend(
+                    _emit_nodes(
+                        else_node.children,
+                        indent + 2,
+                        emit_load_inline=emit_load_inline,
+                        marker_state=marker_state,
+                    )
+                )
                 lines.append(f"{pad}}}\n")
+            continue
+        if node.kind == "LoadInline":
+            if not emit_load_inline:
+                if marker_state is not None:
+                    if not marker_state[0]:
+                        lines.append(f"{pad}{_LOAD_INLINE_MARKER}\n")
+                        marker_state[0] = True
+                else:
+                    lines.append(f"{pad}{_LOAD_INLINE_MARKER}\n")
+                continue
+            name = node.args.get("name", "module")
+            cuda_src_var = node.args.get("cuda_src_var", "CUDA_SRC")
+            cpp_sources = node.args.get("cpp_sources", "")
+            extra_cuda_cflags = node.args.get("extra_cuda_cflags", [])
+            extra_ldflags = node.args.get("extra_ldflags", [])
+            verbose = node.args.get("verbose", False)
+            is_python_module = node.args.get("is_python_module", False)
+            no_implicit_headers = node.args.get("no_implicit_headers", True)
+            lines.append(f"{pad}load_inline(\n")
+            lines.append(f"{pad}    {name!r},\n")
+            lines.append(f"{pad}    cpp_sources={cpp_sources!r},\n")
+            lines.append(f"{pad}    cuda_sources={cuda_src_var},\n")
+            lines.append(f"{pad}    verbose={verbose},\n")
+            lines.append(f"{pad}    is_python_module={is_python_module},\n")
+            lines.append(f"{pad}    no_implicit_headers={no_implicit_headers},\n")
+            lines.append(f"{pad}    extra_cuda_cflags={extra_cuda_cflags!r},\n")
+            lines.append(f"{pad}    extra_ldflags={extra_ldflags!r},\n")
+            lines.append(f"{pad})\n")
             continue
         if node.kind == "Raw":
             raw = node.args.get("code", "")
@@ -382,11 +345,25 @@ def _emit_nodes(nodes: List[Node], indent: int = 0) -> List[str]:
             var = node.args.get("var", "i")
             iters = node.args.get("iters", "0")
             lines.append(f"{pad}for (int {var} = 0; {var} < {iters}; ++{var}) {{\n")
-            lines.extend(_emit_nodes(node.children, indent + 2))
+            lines.extend(
+                _emit_nodes(
+                    node.children,
+                    indent + 2,
+                    emit_load_inline=emit_load_inline,
+                    marker_state=marker_state,
+                )
+            )
             lines.append(f"{pad}}}\n")
             continue
         if node.kind in ("Then", "Else"):
-            lines.extend(_emit_nodes(node.children, indent))
+            lines.extend(
+                _emit_nodes(
+                    node.children,
+                    indent,
+                    emit_load_inline=emit_load_inline,
+                    marker_state=marker_state,
+                )
+            )
             continue
 
         if "call" in node.args:
@@ -397,9 +374,23 @@ def _emit_nodes(nodes: List[Node], indent: int = 0) -> List[str]:
     return lines
 
 
-def emit_section(nodes: List[Node], out_path: Path) -> None:
+def emit_section(
+    nodes: List[Node],
+    out_path: Path,
+    emit_load_inline: bool = True,
+) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("".join(_emit_nodes(nodes, indent=0)))
+    marker_state = [False] if not emit_load_inline else None
+    out_path.write_text(
+        "".join(
+            _emit_nodes(
+                nodes,
+                indent=0,
+                emit_load_inline=emit_load_inline,
+                marker_state=marker_state,
+            )
+        )
+    )
 
 
 def _format_node(node: Node, indent: int = 0) -> List[str]:
@@ -409,6 +400,9 @@ def _format_node(node: Node, indent: int = 0) -> List[str]:
         line_count = 0 if not code else code.count("\n") + 1
         meta = "" if not node.meta else f" meta={list(node.meta.keys())}"
         lines = [f"{pad}Raw(lines={line_count}){meta}"]
+    elif node.kind == "LoadInline":
+        name = node.args.get("name", "module")
+        lines = [f"{pad}LoadInline(name={name})"]
     elif node.kind == "Event":
         op = node.args.get("op", "")
         lines = [f"{pad}Event({op})"]
@@ -435,6 +429,7 @@ def graph_string(g: Graph) -> str:
 
 
 _TCGEN_CALL_RE = re.compile(r"\b(tcgen05_[A-Za-z0-9_]+)\s*\(")
+_LOAD_INLINE_MARKER = "# @@LOAD_INLINE@@"
 
 
 def _split_device_with_tcgen_events(text: str) -> List[Node]:
@@ -460,6 +455,13 @@ def _split_device_with_tcgen_events(text: str) -> List[Node]:
     return nodes
 
 
+def _split_python_with_load_inline(text: str) -> Tuple[str, str]:
+    if _LOAD_INLINE_MARKER not in text:
+        raise ValueError(f"python.py missing load inline marker: {_LOAD_INLINE_MARKER}")
+    pre, post = text.split(_LOAD_INLINE_MARKER, 1)
+    return pre.rstrip() + "\n", post.lstrip()
+
+
 def build_gemm1_graph() -> Graph:
     g = Graph()
     missing = [name for name, path in SECTION_FILES.items() if not path.exists()]
@@ -471,7 +473,29 @@ def build_gemm1_graph() -> Graph:
     for node in _split_device_with_tcgen_events(device_text):
         g.sections["device"].append(node)
     g.add_raw("host", SECTION_FILES["host"].read_text())
-    g.add_raw("python", SECTION_FILES["python"].read_text())
+    python_text = SECTION_FILES["python"].read_text()
+    pre_py, post_py = _split_python_with_load_inline(python_text)
+    g.add_raw("python", pre_py)
+    g.add_load_inline(
+        "python",
+        name="gemm_all",
+        cuda_src_var="CUDA_SRC",
+        cpp_sources="",
+        verbose=False,
+        is_python_module=False,
+        no_implicit_headers=True,
+        extra_cuda_cflags=[
+            "-O3",
+            "-gencode=arch=compute_100a,code=sm_100a",
+            "--use_fast_math",
+            "--expt-relaxed-constexpr",
+            "--relocatable-device-code=false",
+            "-lineinfo",
+            "-Xptxas=-v",
+        ],
+        extra_ldflags=["-lcuda"],
+    )
+    g.add_raw("python", post_py)
     return g
 
 
@@ -487,7 +511,11 @@ def main() -> int:
         print(graph_string(g))
     if not args.no_emit:
         for section, path in SECTION_FILES.items():
-            emit_section(g.sections.get(section, []), path)
+            emit_section(
+                g.sections.get(section, []),
+                path,
+                emit_load_inline=(section != "python"),
+            )
     return 0
 
 

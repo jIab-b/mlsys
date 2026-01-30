@@ -1509,27 +1509,16 @@ TORCH_LIBRARY(my_module_v3b, m) {
 import torch
 from task import input_t, output_t
 from torch.utils.cpp_extension import load_inline
-
-
 load_inline(
-    "gemm_all",
-    cpp_sources="",
+    'gemm_all',
+    cpp_sources='',
     cuda_sources=CUDA_SRC,
-    verbose=True,
+    verbose=False,
     is_python_module=False,
     no_implicit_headers=True,
-    extra_cuda_cflags=[
-        "-O3",
-        "-gencode=arch=compute_100a,code=sm_100a",
-        "--use_fast_math",
-        "--expt-relaxed-constexpr",
-        "--relocatable-device-code=false",
-        "-lineinfo",
-        "-Xptxas=-v",
-    ],
-    extra_ldflags=["-lcuda"],
+    extra_cuda_cflags=['-O3', '-gencode=arch=compute_100a,code=sm_100a', '--use_fast_math', '--expt-relaxed-constexpr', '--relocatable-device-code=false', '-lineinfo', '-Xptxas=-v'],
+    extra_ldflags=['-lcuda'],
 )
-
 gemm_v4 = torch.ops.my_module_v4.gemm
 gemm_v3b = torch.ops.my_module_v3b.gemm
 
