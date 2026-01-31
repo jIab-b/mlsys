@@ -316,6 +316,12 @@ OP_ARG_SPECS: Dict[str, Dict[str, Any]] = {
 ISSUE_SCOPES = {"one_thread", "one_warp", "all_warps", "host"}
 BARRIER_SCOPES = {"cta", "cluster"}
 
+# Graph assumptions:
+# - B200 shared memory per block limit is 227 KiB; keep a 1 KiB safety margin.
+# - tmem columns are limited to 512 per CTA.
+GRAPH_SMEM_LIMIT_BYTES = 227 * 1024 - 1024
+GRAPH_TMEM_MAX_COLS = 512
+
 
 def _canonical_op_name(kind: str) -> str:
     if kind in OP_ALIASES:
@@ -389,6 +395,8 @@ def _register_buffer(g: Graph, args: Dict[str, Any]) -> None:
     shape = (cols,) if cols is not None else (0,)
     g.add_buffer(str(name), mem, shape, str(args.get("dtype", "opaque")))
     g.buffers[str(name)].meta.update(args)
+    if mem == MemSpace.TMEM and isinstance(cols, int) and cols > GRAPH_TMEM_MAX_COLS:
+        raise ValueError(f"tmem buffer '{name}' cols {cols} > {GRAPH_TMEM_MAX_COLS}")
 
 
 def _register_barrier(g: Graph, args: Dict[str, Any]) -> None:
@@ -405,6 +413,49 @@ def _register_tmap(g: Graph, args: Dict[str, Any]) -> None:
     if not name:
         raise ValueError("cute_tmap requires name=")
     g.add_tmap(str(name), args)
+
+
+def _dtype_size_bytes(dtype: str) -> Optional[int]:
+    key = dtype.lower()
+    if key in {"f16", "half", "fp16"}:
+        return 2
+    if key in {"bf16", "bfloat16"}:
+        return 2
+    if key in {"f32", "float", "fp32"}:
+        return 4
+    if key in {"f64", "double", "fp64"}:
+        return 8
+    if key in {"i8", "int8", "u8", "uint8"}:
+        return 1
+    if key in {"i16", "int16", "u16", "uint16"}:
+        return 2
+    if key in {"i32", "int32", "u32", "uint32", "int"}:
+        return 4
+    if key in {"i64", "int64", "u64", "uint64"}:
+        return 8
+    return None
+
+
+def _estimate_smem_bytes(g: Graph) -> Optional[int]:
+    total = 0
+    for buf in g.buffers.values():
+        if buf.space != MemSpace.SMEM:
+            continue
+        meta = buf.meta
+        explicit = meta.get("bytes") or meta.get("size") or meta.get("smem_bytes")
+        if isinstance(explicit, int):
+            total += explicit
+            continue
+        size = _dtype_size_bytes(buf.dtype)
+        if size is None:
+            return None
+        if not buf.shape or any(not isinstance(dim, int) for dim in buf.shape):
+            return None
+        elems = 1
+        for dim in buf.shape:
+            elems *= dim
+        total += elems * size
+    return total
 
 
 def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
@@ -458,7 +509,7 @@ def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
             when_cond = op_args.pop("when", None)
             op_node = OpNode(op=op_name, args=op_args, loc=loc)
             if when_cond is not None:
-                if_node = Node(kind="If", args={"cond": str(when_cond)})
+                if_node = Node(kind="If", args={"cond": str(when_cond)}, meta={"validate_only": "true"})
                 if_node.children.append(Node(kind="Then", children=[op_node]))
                 events.append(if_node)
             else:
@@ -481,7 +532,8 @@ def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
         elif kind == "kernel":
             args = _parse_kv_tokens(shlex.split(body))
             name = str(args.get("name", "kernel"))
-            events.append(Node(kind="KernelStart", args={"name": name}, loc=loc))
+            args["name"] = name
+            events.append(Node(kind="KernelStart", args=args, loc=loc))
         elif kind == "endkernel":
             events.append(Node(kind="KernelEnd", args={}, loc=loc))
         else:
@@ -594,8 +646,8 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
     if canonical == "tcgen05_alloc":
         cols = op_args.get("cols")
         if isinstance(cols, int):
-            if cols < 32 or cols > 512:
-                raise ValueError(f"{op_name}: cols {cols} out of range [32, 512]")
+            if cols < 32 or cols > GRAPH_TMEM_MAX_COLS:
+                raise ValueError(f"{op_name}: cols {cols} out of range [32, {GRAPH_TMEM_MAX_COLS}]")
             if cols & (cols - 1) != 0:
                 raise ValueError(f"{op_name}: cols {cols} must be power of 2")
             if state.last_alloc_cols is not None and cols > state.last_alloc_cols:
@@ -822,6 +874,17 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
             state.pending_ld = False
             state.cta_group = None
             state.last_alloc_cols = None
+            smem_static = node.args.get("smem_bytes") or node.args.get("smem_static")
+            smem_dynamic = node.args.get("smem_dynamic")
+            total_smem = None
+            if isinstance(smem_static, int) and isinstance(smem_dynamic, int):
+                total_smem = smem_static + smem_dynamic
+            elif isinstance(smem_static, int):
+                total_smem = smem_static
+            if total_smem is not None and total_smem > GRAPH_SMEM_LIMIT_BYTES:
+                raise ValueError(
+                    f"KernelStart: smem {total_smem} > assumed limit {GRAPH_SMEM_LIMIT_BYTES} bytes"
+                )
             continue
         if node.kind == "KernelEnd":
             # ensure tmem is deallocated before leaving kernel
@@ -900,6 +963,9 @@ def _collect_tmaps(nodes: List[Node], g: Graph) -> None:
 
 def validate_graph(g: Graph) -> None:
     _collect_tmaps(g.sections.get("host", []), g)
+    smem_bytes = _estimate_smem_bytes(g)
+    if smem_bytes is not None and smem_bytes > GRAPH_SMEM_LIMIT_BYTES:
+        raise ValueError(f"SMEM usage {smem_bytes} exceeds assumed limit {GRAPH_SMEM_LIMIT_BYTES} bytes")
     state = ValidationState(
         bar_state={name: BarrierState.UNINIT for name in g.barriers},
         buf_state={name: BufferState.EMPTY for name in g.buffers},
@@ -934,6 +1000,8 @@ def _emit_nodes(
             )
             continue
         if node.kind == "If":
+            if node.meta.get("validate_only") == "true":
+                continue
             cond = node.args.get("cond", "/*cond*/")
             lines.append(f"{pad}if ({cond}) {{\n")
             then_node = next((c for c in node.children if c.kind == "Then"), None)

@@ -397,18 +397,6 @@ void kernel_v4(
 }
 
 // @endkernel
-if (WIDTH==128) {
-}
-if (WIDTH==64) {
-}
-if (WIDTH==32) {
-}
-if (BLOCK_N==128) {
-}
-if (BLOCK_N==64) {
-}
-if (BLOCK_N==32) {
-}
 // @chunk name=kernel_v3b
 template <
   int K,
@@ -726,15 +714,3 @@ void kernel_v3b(
 }
 
 // @endkernel
-if (WIDTH==128) {
-}
-if (WIDTH==64) {
-}
-if (WIDTH==32) {
-}
-if (BLOCK_N==128) {
-}
-if (BLOCK_N==64) {
-}
-if (BLOCK_N==32) {
-}
