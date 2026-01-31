@@ -40,6 +40,7 @@ SECTION_FILES = {
 }
 
 _ANNOT_RE = re.compile(r"^\s*(?://|#)\s*@(?P<kind>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<body>.*)$")
+_CHUNK_ASSIGN_RE = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?P<prefix>[rR])?(?P<quote>\"\"\"|''')\s*$")
 _LOAD_INLINE_MARKER = "# @@LOAD_INLINE@@"
 
 # tcgen op contracts only (everything else must be Raw)
@@ -501,6 +502,46 @@ def _parse_kv_tokens(tokens: List[str]) -> Dict[str, Any]:
     return args
 
 
+def _parse_chunked_source(text: str, filename: Path) -> Optional[List[Tuple[str, str, int]]]:
+    """Parse chunked triple-quoted strings into (name, code, start_line)."""
+    lines = text.splitlines()
+    chunks: List[Tuple[str, str, int]] = []
+    i = 0
+    while i < len(lines):
+        m = _ANNOT_RE.match(lines[i])
+        if not m or m.group("kind") != "chunk":
+            i += 1
+            continue
+        body = m.group("body").strip()
+        args = _parse_kv_tokens(shlex.split(body)) if body else {}
+        name = str(args.get("name") or args.get("id") or f"chunk_{len(chunks)}")
+        i += 1
+        while i < len(lines) and lines[i].strip() == "":
+            i += 1
+        if i >= len(lines):
+            raise ValueError(f"{filename}:{i}: @chunk '{name}' missing triple-quoted string")
+        m_assign = _CHUNK_ASSIGN_RE.match(lines[i])
+        if not m_assign:
+            raise ValueError(f"{filename}:{i+1}: expected triple-quoted string after @chunk '{name}'")
+        quote = m_assign.group("quote")
+        i += 1
+        start_line = i + 1
+        content_lines: List[str] = []
+        while i < len(lines):
+            if lines[i].strip() == quote:
+                break
+            content_lines.append(lines[i])
+            i += 1
+        if i >= len(lines):
+            raise ValueError(f"{filename}:{start_line}: unterminated triple-quoted string for chunk '{name}'")
+        chunk_text = "\n".join(content_lines)
+        if chunk_text and not chunk_text.endswith("\n"):
+            chunk_text += "\n"
+        chunks.append((name, chunk_text, start_line))
+        i += 1
+    return chunks or None
+
+
 def _register_buffer(g: Graph, args: Dict[str, Any]) -> None:
     name = args.get("name")
     if not name:
@@ -581,12 +622,20 @@ def _estimate_smem_bytes(g: Graph) -> Optional[int]:
     return total
 
 
-def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
+def _split_with_annotations(
+    text: str,
+    filename: Path,
+    g: Graph,
+    *,
+    line_offset: int = 0,
+    initial_chunk: Optional[str] = None,
+    allow_chunk: bool = True,
+) -> List[Node]:
     nodes: List[Node] = []
     raw_lines: List[str] = []
     events: List[Node] = []
     loop_stack: List[Dict[str, Any]] = []
-    chunk_name: Optional[str] = None
+    chunk_name: Optional[str] = initial_chunk
     pending_op: Optional[OpNode] = None
 
     def flush_chunk() -> None:
@@ -611,16 +660,17 @@ def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
 
         kind = m.group("kind")
         body = m.group("body").strip()
-        loc = SourceLoc(filename=str(filename), line=idx, column=1)
+        loc = SourceLoc(filename=str(filename), line=idx + line_offset, column=1)
 
         if kind == "chunk":
-            flush_chunk()
-            raw_lines.append(line)
-            args = _parse_kv_tokens(shlex.split(body)) if body else {}
-            name = args.get("name") or args.get("id")
-            chunk_name = str(name) if name is not None else None
-            pending_op = None
-            continue
+            if allow_chunk:
+                flush_chunk()
+                raw_lines.append(line)
+                args = _parse_kv_tokens(shlex.split(body)) if body else {}
+                name = args.get("name") or args.get("id")
+                chunk_name = str(name) if name is not None else None
+                pending_op = None
+                continue
 
         # keep annotation line in raw chunk
         raw_lines.append(line)
@@ -1274,11 +1324,42 @@ def _emit_nodes(
     return lines
 
 
+def _iter_raw_nodes(nodes: List[Node]) -> List[Node]:
+    raw_nodes: List[Node] = []
+    for node in nodes:
+        if node.kind == "Raw":
+            raw_nodes.append(node)
+        if node.children:
+            raw_nodes.extend(_iter_raw_nodes(node.children))
+    return raw_nodes
+
+
+def _emit_chunked_section(nodes: List[Node], out_path: Path, prefix: str) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_nodes = _iter_raw_nodes(nodes)
+    parts: List[str] = []
+    for idx, node in enumerate(raw_nodes):
+        name = f"{prefix}_{idx:03d}"
+        var = f"{prefix.upper()}_{idx:03d}"
+        parts.append(f"# @chunk name={name}\n")
+        parts.append(f"{var} = r\"\"\"\n")
+        code = node.args.get("code", "")
+        if code:
+            if not code.endswith("\n"):
+                code += "\n"
+            parts.append(code)
+        parts.append("\"\"\"\n\n")
+    out_path.write_text("".join(parts))
+
+
 def emit_section(
     nodes: List[Node],
     out_path: Path,
     emit_load_inline: bool = True,
 ) -> None:
+    if out_path.name in {"device.cuh", "host.cuh"}:
+        _emit_chunked_section(nodes, out_path, prefix=out_path.stem)
+        return
     out_path.parent.mkdir(parents=True, exist_ok=True)
     marker_state = [False] if not emit_load_inline else None
     out_path.write_text(
@@ -1356,20 +1437,35 @@ def _split_python_with_load_inline(text: str) -> Tuple[str, str]:
     return pre.rstrip() + "\n", post.lstrip()
 
 
+def _load_section_nodes(section: str, path: Path, g: Graph) -> None:
+    text = path.read_text()
+    chunked = _parse_chunked_source(text, path)
+    if chunked:
+        for name, chunk_text, start_line in chunked:
+            for node in _split_with_annotations(
+                chunk_text,
+                path,
+                g,
+                line_offset=start_line - 1,
+                initial_chunk=name,
+                allow_chunk=False,
+            ):
+                g.sections[section].append(node)
+        return
+    for node in _split_with_annotations(text, path, g):
+        g.sections[section].append(node)
+
+
 def build_gemm1_graph() -> Graph:
     g = Graph()
     missing = [name for name, path in SECTION_FILES.items() if not path.exists()]
     if missing:
         raise FileNotFoundError(f"Missing cuda_lib files for gemm1: {missing}")
 
-    device_text = SECTION_FILES["device"].read_text()
-    for node in _split_with_annotations(device_text, SECTION_FILES["device"], g):
-        g.sections["device"].append(node)
+    _load_section_nodes("device", SECTION_FILES["device"], g)
     if not g.buffers:
         g.add_buffer("tmem0", MemSpace.TMEM, (0,), "opaque")
-    host_text = SECTION_FILES["host"].read_text()
-    for node in _split_with_annotations(host_text, SECTION_FILES["host"], g):
-        g.sections["host"].append(node)
+    _load_section_nodes("host", SECTION_FILES["host"], g)
     python_text = SECTION_FILES["python"].read_text()
     pre_py, post_py = _split_python_with_load_inline(python_text)
     for node in _split_with_annotations(pre_py, SECTION_FILES["python"], g):

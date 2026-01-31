@@ -1,4 +1,5 @@
-// @chunk name=host_helpers
+# @chunk name=host_000
+HOST_000 = r"""
 void check_cu(CUresult err) {
   if (err == CUDA_SUCCESS) return;
   const char *error_msg_ptr;
@@ -6,12 +7,18 @@ void check_cu(CUresult err) {
     error_msg_ptr = "unable to get error string";
   TORCH_CHECK(false, "cuTensorMapEncodeTiled error: ", error_msg_ptr);
 }
+"""
 
+# @chunk name=host_001
+HOST_001 = r"""
 void check_cuda(cudaError_t err) {
   if (err == cudaSuccess) return;
   TORCH_CHECK(false, cudaGetErrorString(err));
 }
+"""
 
+# @chunk name=host_002
+HOST_002 = r"""
 void init_AB_tmap(
   CUtensorMap *tmap,
   const char *ptr,
@@ -40,7 +47,10 @@ void init_AB_tmap(
   );
   check_cu(err);
 }
-// @chunk name=gemm_launch_v4
+"""
+
+# @chunk name=host_003
+HOST_003 = r"""
 template <
   int K,
   int BLOCK_M,
@@ -103,7 +113,10 @@ at::Tensor gemm_launch_v4(
   else
     return C_N_MAJOR ? buf : buf.view({N, M, 1}).transpose(0, 1);
 }
-// @chunk name=gemm_v4
+"""
+
+# @chunk name=host_004
+HOST_004 = r"""
 at::Tensor gemm_v4(
   const at::Tensor& A,
   const at::Tensor& B,
@@ -131,12 +144,18 @@ at::Tensor gemm_v4(
 
   return C;
 }
-// @chunk name=register_v4
+"""
+
+# @chunk name=host_005
+HOST_005 = r"""
 TORCH_LIBRARY(my_module_v4, m) {
   m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C, Tensor(b!) buf) -> Tensor");
   m.impl("gemm", &gemm_v4);
 }
-// @chunk name=gemm_launch_v3b
+"""
+
+# @chunk name=host_006
+HOST_006 = r"""
 template <
   int K,
   int BLOCK_M,
@@ -196,7 +215,10 @@ at::Tensor gemm_launch_v3b(
 
   return C_N_MAJOR ? C : C.view({N, M, 1}).transpose(0, 1);
 }
-// @chunk name=gemm_v3b
+"""
+
+# @chunk name=host_007
+HOST_007 = r"""
 at::Tensor gemm_v3b(
   const at::Tensor& A,
   const at::Tensor& B,
@@ -224,8 +246,13 @@ at::Tensor gemm_v3b(
 
   return C;
 }
-// @chunk name=register_v3b
+"""
+
+# @chunk name=host_008
+HOST_008 = r"""
 TORCH_LIBRARY(my_module_v3b, m) {
   m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C) -> Tensor");
   m.impl("gemm", &gemm_v3b);
 }
+"""
+

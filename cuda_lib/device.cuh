@@ -1,10 +1,14 @@
-// @chunk name=device_header
+# @chunk name=device_000
+DEVICE_000 = r"""
 #include <cudaTypedefs.h>
 #include <cuda_fp16.h>
 
 #include <torch/library.h>
 #include <ATen/core/Tensor.h>
+"""
 
+# @chunk name=device_001
+DEVICE_001 = r"""
 constexpr int WARP_SIZE = 32;
 constexpr int MMA_K = 64;  // 32 bytes
 
@@ -23,14 +27,20 @@ enum ProfilerTag {
   WaitEpilogue,
   Epilogue,
 };
+"""
 
+# @chunk name=device_002
+DEVICE_002 = r"""
 __device__ inline
 int64_t globaltimer() {
   int64_t t;
   asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t) :: "memory");
   return t;
 }
+"""
 
+# @chunk name=device_003
+DEVICE_003 = r"""
 struct Profiler {
   int64_t *data_ptr_;
   int sm_id_;
@@ -61,10 +71,16 @@ struct Profiler {
     data_ptr_[0] = cnt_;
   }
 };
+"""
 
+# @chunk name=device_004
+DEVICE_004 = r"""
 __device__ inline
 constexpr uint64_t desc_encode(uint64_t x) { return (x & 0x3'FFFFULL) >> 4ULL; };
+"""
 
+# @chunk name=device_005
+DEVICE_005 = r"""
 // https://github.com/NVIDIA/cutlass/blob/v4.2.1/include/cute/arch/cluster_sm90.hpp#L180
 __device__
 uint32_t elect_sync() {
@@ -80,7 +96,10 @@ uint32_t elect_sync() {
   );
   return pred;
 }
-// @chunk name=kernel_v4
+"""
+
+# @chunk name=device_006
+DEVICE_006 = r"""
 template <
   int K,
   int BLOCK_M,
@@ -147,7 +166,10 @@ void kernel_v4(
   constexpr int SFA_tmem = BLOCK_N;
   constexpr int SFB_tmem = SFA_tmem + 4 * (BLOCK_K / MMA_K);
   // @buffer name=tmem0 space=tmem cols=BLOCK_N*2
+"""
 
+# @chunk name=device_007
+DEVICE_007 = r"""
   if (warp_id == 0 && elect_sync()) {
     // only 1 thread issue
     // @op mbarrier_init bar=tma_mbar count=1 scope=cta
@@ -170,7 +192,10 @@ void kernel_v4(
   __syncthreads();  // visible to all threads
 
   constexpr int num_iters = K / BLOCK_K / SPLIT_K;
+"""
 
+# @chunk name=device_008
+DEVICE_008 = r"""
   // warp-specialization
   if (warp_id == NUM_WARPS - 2 && elect_sync()) {
     // TMA warp
@@ -235,6 +260,10 @@ void kernel_v4(
     }
     // @endloop
   }
+"""
+
+# @chunk name=device_009
+DEVICE_009 = r"""
   else if (warp_id == NUM_WARPS - 1 && elect_sync()) {
     // MMA warp
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instruction-descriptor
@@ -331,6 +360,10 @@ void kernel_v4(
     // @op warp_id=NUM_WARPS-1 lane_id=elect
     tcgen05_commit(mainloop_mbar_addr);
   }
+"""
+
+# @chunk name=device_010
+DEVICE_010 = r"""
   else if (tid < BLOCK_M) {
     // epilogue warps
 
@@ -425,7 +458,10 @@ void kernel_v4(
 }
 
 // @endkernel
-// @chunk name=kernel_v3b
+"""
+
+# @chunk name=device_011
+DEVICE_011 = r"""
 template <
   int K,
   int BLOCK_M,
@@ -494,7 +530,10 @@ void kernel_v3b(
   // - (128, 64) of A -> (128, 4) of SFA -> reshaped as (32, 4', 4) -> 4 tmem columns
   constexpr int SFA_tmem = BLOCK_N;
   constexpr int SFB_tmem = SFA_tmem + 4 * (BLOCK_K / MMA_K);
+"""
 
+# @chunk name=device_012
+DEVICE_012 = r"""
   if (warp_id == 0 && elect_sync()) {
     // only 1 thread issue
     // @op mbarrier_init bar=tma_mbar count=1 scope=cta
@@ -519,7 +558,10 @@ void kernel_v3b(
 
   // TODO: make K constexpr as well
   const int num_iters = K / BLOCK_K;
+"""
 
+# @chunk name=device_013
+DEVICE_013 = r"""
   // warp-specialization
   if (warp_id == NUM_WARPS - 2 && elect_sync()) {
     // TMA warp
@@ -588,6 +630,10 @@ void kernel_v3b(
     }
     // @endloop
   }
+"""
+
+# @chunk name=device_014
+DEVICE_014 = r"""
   else if (warp_id == NUM_WARPS - 1 && elect_sync()) {
     // MMA warp
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instruction-descriptor
@@ -686,6 +732,10 @@ void kernel_v3b(
     // @op warp_id=NUM_WARPS-1 lane_id=elect
     tcgen05_commit(mainloop_mbar_addr);
   }
+"""
+
+# @chunk name=device_015
+DEVICE_015 = r"""
   else if (tid < BLOCK_M) {
     // epilogue warps
 
@@ -770,3 +820,5 @@ void kernel_v3b(
 }
 
 // @endkernel
+"""
+

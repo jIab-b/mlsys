@@ -662,13 +662,11 @@ PTX_DEVICE void tma_3d_gmem2smem_mcast(int dst, const void *tmap_ptr, int x, int
 }
 
 // ----- device.cuh -----
-// @chunk name=device_header
 #include <cudaTypedefs.h>
 #include <cuda_fp16.h>
 
 #include <torch/library.h>
 #include <ATen/core/Tensor.h>
-
 constexpr int WARP_SIZE = 32;
 constexpr int MMA_K = 64;  // 32 bytes
 
@@ -687,14 +685,12 @@ enum ProfilerTag {
   WaitEpilogue,
   Epilogue,
 };
-
 __device__ inline
 int64_t globaltimer() {
   int64_t t;
   asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t) :: "memory");
   return t;
 }
-
 struct Profiler {
   int64_t *data_ptr_;
   int sm_id_;
@@ -725,10 +721,8 @@ struct Profiler {
     data_ptr_[0] = cnt_;
   }
 };
-
 __device__ inline
 constexpr uint64_t desc_encode(uint64_t x) { return (x & 0x3'FFFFULL) >> 4ULL; };
-
 // https://github.com/NVIDIA/cutlass/blob/v4.2.1/include/cute/arch/cluster_sm90.hpp#L180
 __device__
 uint32_t elect_sync() {
@@ -744,7 +738,6 @@ uint32_t elect_sync() {
   );
   return pred;
 }
-// @chunk name=kernel_v4
 template <
   int K,
   int BLOCK_M,
@@ -811,7 +804,6 @@ void kernel_v4(
   constexpr int SFA_tmem = BLOCK_N;
   constexpr int SFB_tmem = SFA_tmem + 4 * (BLOCK_K / MMA_K);
   // @buffer name=tmem0 space=tmem cols=BLOCK_N*2
-
   if (warp_id == 0 && elect_sync()) {
     // only 1 thread issue
     // @op mbarrier_init bar=tma_mbar count=1 scope=cta
@@ -834,7 +826,6 @@ void kernel_v4(
   __syncthreads();  // visible to all threads
 
   constexpr int num_iters = K / BLOCK_K / SPLIT_K;
-
   // warp-specialization
   if (warp_id == NUM_WARPS - 2 && elect_sync()) {
     // TMA warp
@@ -1089,7 +1080,6 @@ void kernel_v4(
 }
 
 // @endkernel
-// @chunk name=kernel_v3b
 template <
   int K,
   int BLOCK_M,
@@ -1158,7 +1148,6 @@ void kernel_v3b(
   // - (128, 64) of A -> (128, 4) of SFA -> reshaped as (32, 4', 4) -> 4 tmem columns
   constexpr int SFA_tmem = BLOCK_N;
   constexpr int SFB_tmem = SFA_tmem + 4 * (BLOCK_K / MMA_K);
-
   if (warp_id == 0 && elect_sync()) {
     // only 1 thread issue
     // @op mbarrier_init bar=tma_mbar count=1 scope=cta
@@ -1183,7 +1172,6 @@ void kernel_v3b(
 
   // TODO: make K constexpr as well
   const int num_iters = K / BLOCK_K;
-
   // warp-specialization
   if (warp_id == NUM_WARPS - 2 && elect_sync()) {
     // TMA warp
@@ -1435,7 +1423,6 @@ void kernel_v3b(
 
 // @endkernel
 // ----- host.cuh -----
-// @chunk name=host_helpers
 void check_cu(CUresult err) {
   if (err == CUDA_SUCCESS) return;
   const char *error_msg_ptr;
@@ -1443,12 +1430,10 @@ void check_cu(CUresult err) {
     error_msg_ptr = "unable to get error string";
   TORCH_CHECK(false, "cuTensorMapEncodeTiled error: ", error_msg_ptr);
 }
-
 void check_cuda(cudaError_t err) {
   if (err == cudaSuccess) return;
   TORCH_CHECK(false, cudaGetErrorString(err));
 }
-
 void init_AB_tmap(
   CUtensorMap *tmap,
   const char *ptr,
@@ -1477,7 +1462,6 @@ void init_AB_tmap(
   );
   check_cu(err);
 }
-// @chunk name=gemm_launch_v4
 template <
   int K,
   int BLOCK_M,
@@ -1540,7 +1524,6 @@ at::Tensor gemm_launch_v4(
   else
     return C_N_MAJOR ? buf : buf.view({N, M, 1}).transpose(0, 1);
 }
-// @chunk name=gemm_v4
 at::Tensor gemm_v4(
   const at::Tensor& A,
   const at::Tensor& B,
@@ -1568,12 +1551,10 @@ at::Tensor gemm_v4(
 
   return C;
 }
-// @chunk name=register_v4
 TORCH_LIBRARY(my_module_v4, m) {
   m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C, Tensor(b!) buf) -> Tensor");
   m.impl("gemm", &gemm_v4);
 }
-// @chunk name=gemm_launch_v3b
 template <
   int K,
   int BLOCK_M,
@@ -1633,7 +1614,6 @@ at::Tensor gemm_launch_v3b(
 
   return C_N_MAJOR ? C : C.view({N, M, 1}).transpose(0, 1);
 }
-// @chunk name=gemm_v3b
 at::Tensor gemm_v3b(
   const at::Tensor& A,
   const at::Tensor& B,
@@ -1661,7 +1641,6 @@ at::Tensor gemm_v3b(
 
   return C;
 }
-// @chunk name=register_v3b
 TORCH_LIBRARY(my_module_v3b, m) {
   m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C) -> Tensor");
   m.impl("gemm", &gemm_v3b);
