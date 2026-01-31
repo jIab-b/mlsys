@@ -63,3 +63,12 @@ PTX_DEVICE void mbarrier_wait_relaxed(int mbar_addr, int phase) {
 PTX_DEVICE void mbarrier_fence_init_release() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
+
+// Cluster barrier helpers (used to synchronize CTAs in a cluster after mbarrier init)
+PTX_DEVICE void barrier_cluster_arrive_relaxed_aligned() {
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+}
+
+PTX_DEVICE void barrier_cluster_wait_acquire_aligned() {
+  asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
