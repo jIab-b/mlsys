@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Tuple, Optional
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
 CUDA_LIB = REPO_ROOT / "cuda_lib"
+PTX_LIB = REPO_ROOT / "ptx_lib"
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -153,6 +154,8 @@ TCGEN_PREFIX_CONTRACTS: Tuple[Tuple[str, str], ...] = (
     ("mbarrier_", "mbarrier_init"),
     ("tma_", "tma_1d_gmem2smem"),
     ("ptx_", "ptx_laneid"),
+    ("barrier_cluster_arrive", "barrier_cluster_arrive"),
+    ("barrier_cluster_wait", "barrier_cluster_wait"),
 )
 
 OP_ALIASES: Dict[str, str] = {
@@ -166,6 +169,99 @@ OP_ALIASES: Dict[str, str] = {
     "tcgen05_ld_16x256bx4": "tcgen05_ld",
     "ptx_bar_sync": "ptx_bar_sync",
 }
+
+
+def _extract_ptx_functions(header_text: str) -> set[str]:
+    names: set[str] = set()
+    for line in header_text.splitlines():
+        if "PTX_DEVICE" not in line and "__device__" not in line:
+            continue
+        m = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def _infer_ptx_base(name: str) -> Optional[str]:
+    if name in CONTRACTS:
+        return name
+    if name.startswith("tcgen05_commit_mcast"):
+        return "tcgen05_commit_mcast"
+    if name.startswith("tcgen05_commit"):
+        return "tcgen05_commit"
+    if name.startswith("tcgen05_wait_ld"):
+        return "tcgen05_wait_ld"
+    if name.startswith("tcgen05_wait_st"):
+        return "tcgen05_wait_st"
+    if name.startswith("tcgen05_wait"):
+        return "tcgen05_wait"
+    if name.startswith("tcgen05_fence_before_thread_sync"):
+        return "tcgen05_fence_before_thread_sync"
+    if name.startswith("tcgen05_fence_after_thread_sync"):
+        return "tcgen05_fence_after_thread_sync"
+    if name.startswith("tcgen05_fence"):
+        return "tcgen05_fence"
+    if name.startswith("tcgen05_alloc"):
+        return "tcgen05_alloc"
+    if name.startswith("tcgen05_dealloc"):
+        return "tcgen05_dealloc"
+    if name.startswith("tcgen05_cp"):
+        return "tcgen05_cp"
+    if name.startswith("tcgen05_mma"):
+        return "tcgen05_mma"
+    if name.startswith("tcgen05_ld"):
+        return "tcgen05_ld"
+    if name.startswith("tcgen05_st"):
+        return "tcgen05_st"
+    if name.startswith("mbarrier_arrive_expect_tx_cta"):
+        return "mbarrier_arrive_expect_tx_cta"
+    if name.startswith("mbarrier_arrive_expect_tx"):
+        return "mbarrier_arrive_expect_tx"
+    if name.startswith("mbarrier_wait_relaxed"):
+        return "mbarrier_wait_relaxed"
+    if name.startswith("mbarrier_wait_ticks"):
+        return "mbarrier_wait_ticks"
+    if name.startswith("mbarrier_wait"):
+        return "mbarrier_wait"
+    if name.startswith("mbarrier_fence_init_release"):
+        return "mbarrier_fence_init_release"
+    if name.startswith("mbarrier_init"):
+        return "mbarrier_init"
+    if name.startswith("barrier_cluster_arrive"):
+        return "barrier_cluster_arrive"
+    if name.startswith("barrier_cluster_wait"):
+        return "barrier_cluster_wait"
+    if name.startswith("tma_"):
+        if name in CONTRACTS:
+            return name
+        if "3d" in name:
+            return "tma_3d_gmem2smem"
+        if "2d" in name:
+            return "tma_2d_gmem2smem"
+        if "1d" in name:
+            return "tma_1d_gmem2smem"
+        return "tma_gmem2smem"
+    if name.startswith("ptx_"):
+        if name in CONTRACTS:
+            return name
+        return "ptx_laneid"
+    return None
+
+
+def _load_ptx_aliases() -> Dict[str, str]:
+    if not PTX_LIB.exists():
+        return {}
+    aliases: Dict[str, str] = {}
+    for header in PTX_LIB.glob("*.cuh"):
+        names = _extract_ptx_functions(header.read_text())
+        for name in names:
+            base = _infer_ptx_base(name)
+            if base and base != name:
+                aliases.setdefault(name, base)
+    return aliases
+
+
+OP_ALIASES.update(_load_ptx_aliases())
 
 OP_ARG_SPECS: Dict[str, Dict[str, Any]] = {
     "tcgen05_alloc": {
@@ -340,6 +436,31 @@ def _resolve_contract(kind: str) -> Optional[OpContract]:
     return CONTRACTS.get(canonical)
 
 
+def _infer_op_metadata(op_name: str, op_args: Dict[str, Any]) -> None:
+    if op_name.startswith("tcgen05_ld_"):
+        m = re.match(r"tcgen05_ld_(?P<shape>\d+x\d+b)x(?P<num>\d+)", op_name)
+        if m:
+            op_args.setdefault("shape", m.group("shape"))
+            op_args.setdefault("num", int(m.group("num")))
+    if op_name.startswith("tcgen05_cp_"):
+        m = re.match(r"tcgen05_cp_(?P<shape>\d+x\d+b)(?:_(?P<tile>warpx\d+))?", op_name)
+        if m:
+            op_args.setdefault("shape", m.group("shape"))
+            tile = m.group("tile")
+            if tile:
+                op_args.setdefault("tile", tile)
+    if op_name.startswith("tcgen05_mma_"):
+        variant = op_name[len("tcgen05_mma_") :]
+        if variant:
+            op_args.setdefault("shape", variant.replace("_", "."))
+    if op_name.startswith("tma_"):
+        if "1d" in op_name:
+            op_args.setdefault("rank", 1)
+        elif "2d" in op_name:
+            op_args.setdefault("rank", 2)
+        elif "3d" in op_name:
+            op_args.setdefault("rank", 3)
+
 @dataclass
 class ValidationState:
     bar_state: Dict[str, Optional[BarrierState]]
@@ -466,9 +587,10 @@ def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
     events: List[Node] = []
     loop_stack: List[Dict[str, Any]] = []
     chunk_name: Optional[str] = None
+    pending_op: Optional[OpNode] = None
 
     def flush_chunk() -> None:
-        nonlocal raw_lines, events, chunk_name
+        nonlocal raw_lines, events, chunk_name, pending_op
         if raw_lines:
             meta = {"chunk": chunk_name} if chunk_name else {}
             nodes.append(Node(kind="Raw", args={"code": "\n".join(raw_lines)}, meta=meta))
@@ -477,12 +599,14 @@ def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
         raw_lines = []
         events = []
         chunk_name = None
+        pending_op = None
 
     lines = text.splitlines()
     for idx, line in enumerate(lines, start=1):
         m = _ANNOT_RE.match(line)
         if not m:
             raw_lines.append(line)
+            pending_op = None
             continue
 
         kind = m.group("kind")
@@ -495,6 +619,7 @@ def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
             args = _parse_kv_tokens(shlex.split(body)) if body else {}
             name = args.get("name") or args.get("id")
             chunk_name = str(name) if name is not None else None
+            pending_op = None
             continue
 
         # keep annotation line in raw chunk
@@ -502,44 +627,62 @@ def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
 
         if kind == "op":
             tokens = shlex.split(body)
-            if not tokens:
-                raise ValueError(f"{filename}:{idx}: @op requires op name")
-            op_name = tokens[0]
-            op_args = _parse_kv_tokens(tokens[1:])
-            if loop_stack:
-                op_args["_loops"] = [dict(entry) for entry in loop_stack]
-            when_cond = op_args.pop("when", None)
-            op_node = OpNode(op=op_name, args=op_args, loc=loc)
-            if when_cond is not None:
-                if_node = Node(kind="If", args={"cond": str(when_cond)}, meta={"validate_only": "true"})
-                if_node.children.append(Node(kind="Then", children=[op_node]))
-                events.append(if_node)
+            if not tokens or (tokens and "=" in tokens[0]):
+                if pending_op is None:
+                    raise ValueError(f"{filename}:{idx}: @op continuation without prior @op")
+                extra_args = _parse_kv_tokens(tokens) if tokens else {}
+                if "when" in extra_args:
+                    raise ValueError(f"{filename}:{idx}: @op continuation cannot introduce 'when'")
+                pending_op.args.setdefault("op_args", {}).update(extra_args)
+                _infer_op_metadata(str(pending_op.args.get("op", "")), pending_op.args.get("op_args", {}))
+                pending_op = None
             else:
-                events.append(op_node)
+                op_name = tokens[0]
+                op_args = _parse_kv_tokens(tokens[1:])
+                if loop_stack:
+                    op_args["_loops"] = [dict(entry) for entry in loop_stack]
+                when_cond = op_args.pop("when", None)
+                _infer_op_metadata(op_name, op_args)
+                op_node = OpNode(op=op_name, args=op_args, loc=loc)
+                op_node.meta["base"] = _canonical_op_name(op_name)
+                if when_cond is not None:
+                    if_node = Node(kind="If", args={"cond": str(when_cond)}, meta={"validate_only": "true"})
+                    if_node.children.append(Node(kind="Then", children=[op_node]))
+                    events.append(if_node)
+                else:
+                    events.append(op_node)
+                pending_op = op_node
         elif kind == "buffer":
             args = _parse_kv_tokens(shlex.split(body))
             _register_buffer(g, args)
+            pending_op = None
         elif kind == "barrier":
             args = _parse_kv_tokens(shlex.split(body))
             _register_barrier(g, args)
+            pending_op = None
         elif kind == "loop":
             args = _parse_kv_tokens(shlex.split(body))
             if "var" not in args:
                 raise ValueError(f"{filename}:{idx}: @loop requires var=")
             loop_stack.append(args)
+            pending_op = None
         elif kind == "endloop":
             if not loop_stack:
                 raise ValueError(f"{filename}:{idx}: @endloop without @loop")
             loop_stack.pop()
+            pending_op = None
         elif kind == "kernel":
             args = _parse_kv_tokens(shlex.split(body))
             name = str(args.get("name", "kernel"))
             args["name"] = name
             events.append(Node(kind="KernelStart", args=args, loc=loc))
+            pending_op = None
         elif kind == "endkernel":
             events.append(Node(kind="KernelEnd", args={}, loc=loc))
+            pending_op = None
         else:
             # Unknown annotation: keep it in Raw, but do not validate
+            pending_op = None
             pass
 
     flush_chunk()
@@ -1165,7 +1308,19 @@ def _format_node(node: Node, indent: int = 0) -> List[str]:
         lines = [f"{pad}Event({op})"]
     elif node.kind == "Op":
         op = node.args.get("op", "")
-        lines = [f"{pad}Op({op})"]
+        base = node.meta.get("base")
+        op_args = node.args.get("op_args", {})
+        detail_bits = []
+        if isinstance(op_args, dict):
+            if "shape" in op_args:
+                detail_bits.append(f"shape={op_args['shape']}")
+            if "num" in op_args:
+                detail_bits.append(f"num={op_args['num']}")
+        detail = f" {' '.join(detail_bits)}" if detail_bits else ""
+        if base and base != op:
+            lines = [f"{pad}Op({op} -> {base}){detail}"]
+        else:
+            lines = [f"{pad}Op({op}){detail}"]
     elif node.kind == "KernelStart":
         name = node.args.get("name", "")
         lines = [f"{pad}KernelStart({name})"]
