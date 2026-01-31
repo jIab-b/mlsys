@@ -321,6 +321,7 @@ BARRIER_SCOPES = {"cta", "cluster"}
 # - tmem columns are limited to 512 per CTA.
 GRAPH_SMEM_LIMIT_BYTES = 227 * 1024 - 1024
 GRAPH_TMEM_MAX_COLS = 512
+CTA_MASK_BITS = 16
 
 
 def _canonical_op_name(kind: str) -> str:
@@ -350,6 +351,7 @@ class ValidationState:
     bar_completed_bytes: Dict[str, Optional[int]] = field(default_factory=dict)
     cluster_init_fenced: Optional[bool] = None
     cluster_sync_done: Optional[bool] = None
+    cluster_ctas: Optional[int] = None
     pending_ld: Optional[bool] = False
     cta_group: Optional[int] = None
     last_alloc_cols: Optional[int] = None
@@ -666,6 +668,10 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
             align = op_args.get(key)
             if isinstance(align, int) and align < 16:
                 raise ValueError(f"{op_name}: {key} {align} must be >= 16")
+    if canonical.startswith("tma_"):
+        size = op_args.get("size")
+        if isinstance(size, int) and size % 16 != 0:
+            raise ValueError(f"{op_name}: size {size} must be multiple of 16")
 
     if canonical in {
         "tma_1d_gmem2smem",
@@ -689,6 +695,18 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
         rank = g.tmaps[tmap].get("rank")
         if isinstance(rank, int) and rank != rank_required:
             raise ValueError(f"{op_name}: tmap '{tmap}' rank {rank} != {rank_required}")
+
+        if canonical.endswith("_mcast"):
+            cta_mask = op_args.get("cta_mask")
+            if isinstance(cta_mask, int):
+                if cta_mask <= 0:
+                    raise ValueError(f"{op_name}: cta_mask must be non-zero")
+                if cta_mask >= (1 << CTA_MASK_BITS):
+                    raise ValueError(f"{op_name}: cta_mask {cta_mask} exceeds {CTA_MASK_BITS} bits")
+                if state.cluster_ctas is not None:
+                    max_mask = (1 << state.cluster_ctas) - 1
+                    if cta_mask & ~max_mask:
+                        raise ValueError(f"{op_name}: cta_mask {cta_mask} outside cluster_ctas={state.cluster_ctas}")
 
     if canonical == "mbarrier_init":
         count = op_args.get("count")
@@ -764,6 +782,9 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
                     state.bar_expected_bytes[bar] = _add_optional(state.bar_expected_bytes.get(bar), size)
                 else:
                     state.bar_expected_bytes[bar] = None
+            completed = state.bar_completed_bytes.get(bar)
+            if isinstance(size, int) and isinstance(completed, int) and completed > size:
+                raise ValueError(f"{op_name}: barrier '{bar}' completed {completed} > expected {size}")
 
     if canonical in (
         "tma_gmem2smem",
@@ -826,6 +847,7 @@ def _clone_state(state: ValidationState) -> ValidationState:
         bar_completed_bytes=dict(state.bar_completed_bytes),
         cluster_init_fenced=state.cluster_init_fenced,
         cluster_sync_done=state.cluster_sync_done,
+        cluster_ctas=state.cluster_ctas,
         pending_ld=state.pending_ld,
         cta_group=state.cta_group,
         last_alloc_cols=state.last_alloc_cols,
@@ -853,6 +875,7 @@ def _merge_states(a: ValidationState, b: ValidationState) -> ValidationState:
         bar_completed_bytes=_merge_dict(a.bar_completed_bytes, b.bar_completed_bytes),
         cluster_init_fenced=_merge_optional(a.cluster_init_fenced, b.cluster_init_fenced),
         cluster_sync_done=_merge_optional(a.cluster_sync_done, b.cluster_sync_done),
+        cluster_ctas=_merge_optional(a.cluster_ctas, b.cluster_ctas),
         pending_ld=_merge_optional(a.pending_ld, b.pending_ld),
         cta_group=_merge_optional(a.cta_group, b.cta_group),
         last_alloc_cols=_merge_optional(a.last_alloc_cols, b.last_alloc_cols),
@@ -871,11 +894,21 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
             state.bar_completed_bytes = {name: None for name in g.barriers}
             state.cluster_init_fenced = False
             state.cluster_sync_done = False
+            state.cluster_ctas = None
             state.pending_ld = False
             state.cta_group = None
             state.last_alloc_cols = None
             smem_static = node.args.get("smem_bytes") or node.args.get("smem_static")
             smem_dynamic = node.args.get("smem_dynamic")
+            cluster_ctas = node.args.get("cluster_ctas")
+            if isinstance(cluster_ctas, int):
+                state.cluster_ctas = cluster_ctas
+            else:
+                dim_x = node.args.get("cluster_dim_x")
+                dim_y = node.args.get("cluster_dim_y")
+                dim_z = node.args.get("cluster_dim_z")
+                if all(isinstance(v, int) for v in (dim_x, dim_y, dim_z)):
+                    state.cluster_ctas = int(dim_x) * int(dim_y) * int(dim_z)
             total_smem = None
             if isinstance(smem_static, int) and isinstance(smem_dynamic, int):
                 total_smem = smem_static + smem_dynamic
@@ -976,6 +1009,7 @@ def validate_graph(g: Graph) -> None:
         bar_completed_bytes={name: None for name in g.barriers},
         cluster_init_fenced=False,
         cluster_sync_done=False,
+        cluster_ctas=None,
     )
     _validate_nodes(g.sections.get("device", []), g, state)
 

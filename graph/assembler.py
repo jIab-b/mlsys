@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
 # ptx_lib lives at repo root (not nested under submission/)
 PTX_LIB = REPO_ROOT / "ptx_lib"
-COMPILER = ROOT / "compile.py"
+COMPILER = ROOT / "compiler.py"
 
 # Strip local ptx_lib includes since we inline headers into CUDA_SRC.
 _PTX_INCLUDE_PREFIXES = (
