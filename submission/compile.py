@@ -10,7 +10,7 @@ import argparse
 import re
 import shlex
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 
@@ -58,55 +58,55 @@ CONTRACTS: Dict[str, OpContract] = {
     ),
     "tcgen05_cp": OpContract(
         name="tcgen05_cp",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
         buffer_pre={"tmem": BufferState.FULL},
     ),
     "tcgen05_mma": OpContract(
         name="tcgen05_mma",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
         buffer_pre={"tmem": BufferState.FULL},
     ),
     "tcgen05_ld": OpContract(
         name="tcgen05_ld",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
         buffer_pre={"tmem": BufferState.FULL},
     ),
     "tcgen05_st": OpContract(
         name="tcgen05_st",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
         buffer_pre={"tmem": BufferState.FULL},
     ),
     "tcgen05_commit": OpContract(
         name="tcgen05_commit",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
     ),
     "tcgen05_commit_mcast": OpContract(
         name="tcgen05_commit_mcast",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
     ),
     "tcgen05_wait": OpContract(
         name="tcgen05_wait",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
     ),
     "tcgen05_wait_ld": OpContract(
         name="tcgen05_wait_ld",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
     ),
     "tcgen05_wait_st": OpContract(
         name="tcgen05_wait_st",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
     ),
     "tcgen05_fence": OpContract(
         name="tcgen05_fence",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
     ),
     "tcgen05_fence_before_thread_sync": OpContract(
         name="tcgen05_fence_before_thread_sync",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
     ),
     "tcgen05_fence_after_thread_sync": OpContract(
         name="tcgen05_fence_after_thread_sync",
-        issue_scope="one_warp",
+        issue_scope="one_thread",
     ),
     # mbarrier
     "mbarrier_init": OpContract(name="mbarrier_init", issue_scope="one_thread"),
@@ -116,6 +116,8 @@ CONTRACTS: Dict[str, OpContract] = {
     "mbarrier_wait_ticks": OpContract(name="mbarrier_wait_ticks", issue_scope="all_warps"),
     "mbarrier_wait_relaxed": OpContract(name="mbarrier_wait_relaxed", issue_scope="all_warps"),
     "mbarrier_fence_init_release": OpContract(name="mbarrier_fence_init_release", issue_scope="one_thread"),
+    "barrier_cluster_arrive": OpContract(name="barrier_cluster_arrive", issue_scope="all_warps"),
+    "barrier_cluster_wait": OpContract(name="barrier_cluster_wait", issue_scope="all_warps"),
     # tma / cp.async bulk
     "tma_gmem2smem": OpContract(name="tma_gmem2smem", issue_scope="one_thread"),
     "tma_1d_gmem2smem": OpContract(name="tma_1d_gmem2smem", issue_scope="one_thread"),
@@ -124,6 +126,10 @@ CONTRACTS: Dict[str, OpContract] = {
     "tma_1d_gmem2smem_mcast": OpContract(name="tma_1d_gmem2smem_mcast", issue_scope="one_thread"),
     "tma_2d_gmem2smem_mcast": OpContract(name="tma_2d_gmem2smem_mcast", issue_scope="one_thread"),
     "tma_3d_gmem2smem_mcast": OpContract(name="tma_3d_gmem2smem_mcast", issue_scope="one_thread"),
+    "cp_async_bulk_prefetch": OpContract(name="cp_async_bulk_prefetch", issue_scope="one_thread"),
+    "cp_async_bulk_prefetch_1d": OpContract(name="cp_async_bulk_prefetch_1d", issue_scope="one_thread"),
+    "cp_async_bulk_prefetch_2d": OpContract(name="cp_async_bulk_prefetch_2d", issue_scope="one_thread"),
+    "cp_async_bulk_prefetch_3d": OpContract(name="cp_async_bulk_prefetch_3d", issue_scope="one_thread"),
     # ptx common helpers
     "ptx_laneid": OpContract(name="ptx_laneid", issue_scope="one_thread"),
     "ptx_activemask": OpContract(name="ptx_activemask", issue_scope="one_thread"),
@@ -207,10 +213,25 @@ OP_ARG_SPECS: Dict[str, Dict[str, Any]] = {
         "ints": {"size"},
         "optional": {"scope"},
     },
+    "mbarrier_arrive_expect_tx_cta": {
+        "required": {"bar", "size"},
+        "ints": {"size"},
+        "optional": {"scope"},
+    },
     "mbarrier_wait": {
         "required": {"bar", "phase"},
         "ints": {"phase"},
         "optional": {"scope"},
+    },
+    "mbarrier_wait_relaxed": {
+        "required": {"bar", "phase"},
+        "ints": {"phase"},
+        "optional": {"scope"},
+    },
+    "mbarrier_wait_ticks": {
+        "required": {"bar", "phase"},
+        "ints": {"phase", "ticks"},
+        "optional": {"scope", "ticks"},
     },
     "tma_gmem2smem": {
         "required": {"bar", "size"},
@@ -218,8 +239,68 @@ OP_ARG_SPECS: Dict[str, Dict[str, Any]] = {
         "optional": {"dst_align", "src_align"},
     },
     "tma_3d_gmem2smem": {
-        "required": {"bar"},
+        "required": {"bar", "tmap"},
         "optional": {"dim"},
+    },
+    "tma_1d_gmem2smem": {
+        "required": {"bar", "tmap"},
+        "optional": {"dim"},
+    },
+    "tma_2d_gmem2smem": {
+        "required": {"bar", "tmap"},
+        "optional": {"dim"},
+    },
+    "tma_1d_gmem2smem_mcast": {
+        "required": {"bar", "tmap", "cta_mask"},
+        "optional": {"dim"},
+        "ints": {"cta_mask"},
+    },
+    "tma_2d_gmem2smem_mcast": {
+        "required": {"bar", "tmap", "cta_mask"},
+        "optional": {"dim"},
+        "ints": {"cta_mask"},
+    },
+    "tma_3d_gmem2smem_mcast": {
+        "required": {"bar", "tmap", "cta_mask"},
+        "optional": {"dim"},
+        "ints": {"cta_mask"},
+    },
+    "tcgen05_commit": {
+        "required": {"bar"},
+        "optional": {"cta_group"},
+    },
+    "tcgen05_commit_mcast": {
+        "required": {"bar", "cta_mask"},
+        "ints": {"cta_mask"},
+        "optional": {"cta_group"},
+    },
+    "barrier_cluster_arrive": {
+        "required": set(),
+        "optional": set(),
+    },
+    "barrier_cluster_wait": {
+        "required": set(),
+        "optional": set(),
+    },
+    "cp_async_bulk_prefetch": {
+        "required": {"addr", "size"},
+        "ints": {"size"},
+        "optional": set(),
+    },
+    "cp_async_bulk_prefetch_1d": {
+        "required": {"tmap", "x"},
+        "ints": {"x"},
+        "optional": set(),
+    },
+    "cp_async_bulk_prefetch_2d": {
+        "required": {"tmap", "x", "y"},
+        "ints": {"x", "y"},
+        "optional": set(),
+    },
+    "cp_async_bulk_prefetch_3d": {
+        "required": {"tmap", "x", "y", "z"},
+        "ints": {"x", "y", "z"},
+        "optional": set(),
     },
     "ptx_bar_sync": {
         "required": {"bar_id", "count"},
@@ -231,6 +312,9 @@ OP_ARG_SPECS: Dict[str, Dict[str, Any]] = {
         "ints": {"rank", "global_height", "global_width", "shared_height", "shared_width"},
     },
 }
+
+ISSUE_SCOPES = {"one_thread", "one_warp", "all_warps", "host"}
+BARRIER_SCOPES = {"cta", "cluster"}
 
 
 def _canonical_op_name(kind: str) -> str:
@@ -251,9 +335,16 @@ def _resolve_contract(kind: str) -> Optional[OpContract]:
 
 @dataclass
 class ValidationState:
-    bar_state: Dict[str, BarrierState]
-    buf_state: Dict[str, BufferState]
-    pending_ld: bool = False
+    bar_state: Dict[str, Optional[BarrierState]]
+    buf_state: Dict[str, Optional[BufferState]]
+    bar_init_count: Dict[str, Optional[int]] = field(default_factory=dict)
+    bar_arrivals: Dict[str, Optional[int]] = field(default_factory=dict)
+    bar_phase: Dict[str, Optional[int]] = field(default_factory=dict)
+    bar_expected_bytes: Dict[str, Optional[int]] = field(default_factory=dict)
+    bar_completed_bytes: Dict[str, Optional[int]] = field(default_factory=dict)
+    cluster_init_fenced: Optional[bool] = None
+    cluster_sync_done: Optional[bool] = None
+    pending_ld: Optional[bool] = False
     cta_group: Optional[int] = None
     last_alloc_cols: Optional[int] = None
 
@@ -309,6 +400,13 @@ def _register_barrier(g: Graph, args: Dict[str, Any]) -> None:
     g.barriers[str(name)].meta.update(args)
 
 
+def _register_tmap(g: Graph, args: Dict[str, Any]) -> None:
+    name = args.get("name")
+    if not name:
+        raise ValueError("cute_tmap requires name=")
+    g.add_tmap(str(name), args)
+
+
 def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
     nodes: List[Node] = []
     raw_lines: List[str] = []
@@ -357,7 +455,14 @@ def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
             op_args = _parse_kv_tokens(tokens[1:])
             if loop_stack:
                 op_args["_loops"] = [dict(entry) for entry in loop_stack]
-            events.append(OpNode(op=op_name, args=op_args, loc=loc))
+            when_cond = op_args.pop("when", None)
+            op_node = OpNode(op=op_name, args=op_args, loc=loc)
+            if when_cond is not None:
+                if_node = Node(kind="If", args={"cond": str(when_cond)})
+                if_node.children.append(Node(kind="Then", children=[op_node]))
+                events.append(if_node)
+            else:
+                events.append(op_node)
         elif kind == "buffer":
             args = _parse_kv_tokens(shlex.split(body))
             _register_buffer(g, args)
@@ -430,6 +535,22 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
 
     _validate_args(canonical, op_args, loc)
 
+    if canonical == "cute_tmap":
+        _register_tmap(g, op_args)
+        return
+
+    scope_val = op_args.get("scope")
+    issue_val = op_args.get("issue") or op_args.get("issue_scope")
+    if issue_val is None and isinstance(scope_val, str) and scope_val in ISSUE_SCOPES:
+        issue_val = scope_val
+    if issue_val is not None and issue_val != c.issue_scope:
+        raise ValueError(f"{op_name}: issue_scope {issue_val} != {c.issue_scope}")
+
+    if isinstance(scope_val, str) and scope_val in BARRIER_SCOPES and "bar" in op_args:
+        bar_name = op_args["bar"]
+        if bar_name in g.barriers and g.barriers[bar_name].scope != scope_val:
+            raise ValueError(f"{op_name}: barrier '{bar_name}' scope {g.barriers[bar_name].scope} != {scope_val}")
+
     # tcgen05 cta_group consistency
     if canonical.startswith("tcgen05_"):
         cta_group = op_args.get("cta_group", 1)
@@ -461,12 +582,12 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
             raise ValueError(f"{op_name}: missing barrier arg '{key}'")
         if bar not in g.barriers:
             raise ValueError(f"{op_name}: unknown barrier '{bar}'")
-        if state.bar_state[bar] != required:
+        if state.bar_state[bar] is not None and state.bar_state[bar] != required:
             raise ValueError(f"{op_name}: barrier {bar} state {state.bar_state[bar]} != {required}")
 
     for key, required in c.buffer_pre.items():
         buf = resolved_bufs[key]
-        if state.buf_state[buf] != required:
+        if state.buf_state[buf] is not None and state.buf_state[buf] != required:
             raise ValueError(f"{op_name}: buffer {buf} state {state.buf_state[buf]} != {required}")
 
     # Extra semantic checks derived from PTX ISA (best-effort for constants)
@@ -494,15 +615,38 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
             if isinstance(align, int) and align < 16:
                 raise ValueError(f"{op_name}: {key} {align} must be >= 16")
 
+    if canonical in {
+        "tma_1d_gmem2smem",
+        "tma_2d_gmem2smem",
+        "tma_3d_gmem2smem",
+        "tma_1d_gmem2smem_mcast",
+        "tma_2d_gmem2smem_mcast",
+        "tma_3d_gmem2smem_mcast",
+    }:
+        tmap = op_args.get("tmap")
+        if tmap not in g.tmaps:
+            raise ValueError(f"{op_name}: unknown tmap '{tmap}'")
+        rank_required = {
+            "tma_1d_gmem2smem": 1,
+            "tma_2d_gmem2smem": 2,
+            "tma_3d_gmem2smem": 3,
+            "tma_1d_gmem2smem_mcast": 1,
+            "tma_2d_gmem2smem_mcast": 2,
+            "tma_3d_gmem2smem_mcast": 3,
+        }[canonical]
+        rank = g.tmaps[tmap].get("rank")
+        if isinstance(rank, int) and rank != rank_required:
+            raise ValueError(f"{op_name}: tmap '{tmap}' rank {rank} != {rank_required}")
+
     if canonical == "mbarrier_init":
         count = op_args.get("count")
         if isinstance(count, int) and count <= 0:
             raise ValueError(f"{op_name}: count must be > 0")
-    if canonical == "mbarrier_wait":
+    if canonical in ("mbarrier_wait", "mbarrier_wait_relaxed", "mbarrier_wait_ticks"):
         phase = op_args.get("phase")
         if isinstance(phase, int) and phase not in (0, 1):
             raise ValueError(f"{op_name}: phase {phase} must be 0 or 1")
-    if canonical == "mbarrier_arrive_expect_tx":
+    if canonical in ("mbarrier_arrive_expect_tx", "mbarrier_arrive_expect_tx_cta"):
         size = op_args.get("size")
         if isinstance(size, int) and size % 16 != 0:
             raise ValueError(f"{op_name}: size {size} must be multiple of 16")
@@ -510,15 +654,105 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
     if canonical == "tcgen05_ld":
         state.pending_ld = True
     if canonical == "tcgen05_wait_ld":
-        if not state.pending_ld:
+        if state.pending_ld is False:
             raise ValueError(f"{op_name}: wait_ld without prior ld")
-        state.pending_ld = False
+        if state.pending_ld is True:
+            state.pending_ld = False
+        else:
+            state.pending_ld = None
+
+    if canonical == "mbarrier_fence_init_release":
+        state.cluster_init_fenced = True
+    if canonical == "barrier_cluster_wait":
+        state.cluster_sync_done = True
+
+    if "bar" in op_args:
+        bar = op_args["bar"]
+        if bar in g.barriers and g.barriers[bar].scope == "cluster":
+            if state.cluster_init_fenced is False:
+                raise ValueError(f"{op_name}: cluster barrier '{bar}' used before fence.mbarrier_init.release.cluster")
+            if state.cluster_sync_done is False:
+                raise ValueError(f"{op_name}: cluster barrier '{bar}' used before barrier.cluster.wait")
+
+    def _add_optional(cur: Optional[int], delta: int) -> Optional[int]:
+        if cur is None:
+            return None
+        return cur + delta
 
     # minimal barrier state transitions
     if canonical == "mbarrier_init":
         bar = op_args.get("bar")
         if bar in state.bar_state:
             state.bar_state[bar] = BarrierState.INIT
+            count = op_args.get("count")
+            if isinstance(count, int):
+                prev = state.bar_init_count.get(bar)
+                if prev is not None and prev != count:
+                    raise ValueError(f"{op_name}: barrier '{bar}' count {count} != {prev}")
+                state.bar_init_count[bar] = count
+            else:
+                state.bar_init_count[bar] = None
+            state.bar_phase[bar] = 0
+            state.bar_arrivals[bar] = 0
+            state.bar_expected_bytes[bar] = 0
+            state.bar_completed_bytes[bar] = 0
+
+    if canonical in ("mbarrier_arrive_expect_tx", "mbarrier_arrive_expect_tx_cta", "tcgen05_commit", "tcgen05_commit_mcast"):
+        bar = op_args.get("bar")
+        if bar in state.bar_arrivals:
+            state.bar_arrivals[bar] = _add_optional(state.bar_arrivals.get(bar), 1)
+            count = state.bar_init_count.get(bar)
+            arrivals = state.bar_arrivals.get(bar)
+            if isinstance(count, int) and isinstance(arrivals, int) and arrivals > count:
+                raise ValueError(f"{op_name}: barrier '{bar}' arrivals {arrivals} > count {count}")
+        if canonical in ("mbarrier_arrive_expect_tx", "mbarrier_arrive_expect_tx_cta"):
+            size = op_args.get("size")
+            if bar in state.bar_expected_bytes:
+                if isinstance(size, int):
+                    state.bar_expected_bytes[bar] = _add_optional(state.bar_expected_bytes.get(bar), size)
+                else:
+                    state.bar_expected_bytes[bar] = None
+
+    if canonical in (
+        "tma_gmem2smem",
+        "tma_1d_gmem2smem",
+        "tma_2d_gmem2smem",
+        "tma_3d_gmem2smem",
+        "tma_1d_gmem2smem_mcast",
+        "tma_2d_gmem2smem_mcast",
+        "tma_3d_gmem2smem_mcast",
+    ):
+        bar = op_args.get("bar")
+        if bar in state.bar_completed_bytes:
+            size = op_args.get("size")
+            if isinstance(size, int):
+                state.bar_completed_bytes[bar] = _add_optional(state.bar_completed_bytes.get(bar), size)
+            else:
+                state.bar_completed_bytes[bar] = None
+
+    if canonical in ("mbarrier_wait", "mbarrier_wait_relaxed", "mbarrier_wait_ticks"):
+        bar = op_args.get("bar")
+        phase = op_args.get("phase")
+        if bar in state.bar_phase:
+            bar_phase = state.bar_phase.get(bar)
+            if isinstance(phase, int) and bar_phase is not None and phase != bar_phase:
+                raise ValueError(f"{op_name}: barrier '{bar}' phase {phase} != {bar_phase}")
+            if bar_phase is None and isinstance(phase, int):
+                state.bar_phase[bar] = phase
+        count = state.bar_init_count.get(bar)
+        arrivals = state.bar_arrivals.get(bar)
+        if isinstance(count, int) and isinstance(arrivals, int) and arrivals > count:
+            raise ValueError(f"{op_name}: barrier '{bar}' arrivals {arrivals} > count {count}")
+        expected = state.bar_expected_bytes.get(bar)
+        completed = state.bar_completed_bytes.get(bar)
+        if isinstance(expected, int) and isinstance(completed, int) and completed > expected:
+            raise ValueError(f"{op_name}: barrier '{bar}' completed {completed} > expected {expected}")
+        if bar in state.bar_arrivals:
+            state.bar_arrivals[bar] = 0
+            state.bar_expected_bytes[bar] = 0
+            state.bar_completed_bytes[bar] = 0
+        if bar in state.bar_phase and isinstance(state.bar_phase[bar], int):
+            state.bar_phase[bar] = 1 - int(state.bar_phase[bar])
 
     for key, new_state in c.post.items():
         bar = op_args[key]
@@ -533,19 +767,43 @@ def _clone_state(state: ValidationState) -> ValidationState:
     return ValidationState(
         bar_state=dict(state.bar_state),
         buf_state=dict(state.buf_state),
+        bar_init_count=dict(state.bar_init_count),
+        bar_arrivals=dict(state.bar_arrivals),
+        bar_phase=dict(state.bar_phase),
+        bar_expected_bytes=dict(state.bar_expected_bytes),
+        bar_completed_bytes=dict(state.bar_completed_bytes),
+        cluster_init_fenced=state.cluster_init_fenced,
+        cluster_sync_done=state.cluster_sync_done,
         pending_ld=state.pending_ld,
         cta_group=state.cta_group,
         last_alloc_cols=state.last_alloc_cols,
     )
 
+def _merge_optional(a: Optional[Any], b: Optional[Any]) -> Optional[Any]:
+    return a if a == b else None
 
-def _state_equal(a: ValidationState, b: ValidationState) -> bool:
-    return (
-        a.bar_state == b.bar_state
-        and a.buf_state == b.buf_state
-        and a.pending_ld == b.pending_ld
-        and a.cta_group == b.cta_group
-        and a.last_alloc_cols == b.last_alloc_cols
+
+def _merge_dict(a: Dict[str, Optional[Any]], b: Dict[str, Optional[Any]]) -> Dict[str, Optional[Any]]:
+    merged: Dict[str, Optional[Any]] = {}
+    for key in set(a.keys()) | set(b.keys()):
+        merged[key] = _merge_optional(a.get(key), b.get(key))
+    return merged
+
+
+def _merge_states(a: ValidationState, b: ValidationState) -> ValidationState:
+    return ValidationState(
+        bar_state=_merge_dict(a.bar_state, b.bar_state),
+        buf_state=_merge_dict(a.buf_state, b.buf_state),
+        bar_init_count=_merge_dict(a.bar_init_count, b.bar_init_count),
+        bar_arrivals=_merge_dict(a.bar_arrivals, b.bar_arrivals),
+        bar_phase=_merge_dict(a.bar_phase, b.bar_phase),
+        bar_expected_bytes=_merge_dict(a.bar_expected_bytes, b.bar_expected_bytes),
+        bar_completed_bytes=_merge_dict(a.bar_completed_bytes, b.bar_completed_bytes),
+        cluster_init_fenced=_merge_optional(a.cluster_init_fenced, b.cluster_init_fenced),
+        cluster_sync_done=_merge_optional(a.cluster_sync_done, b.cluster_sync_done),
+        pending_ld=_merge_optional(a.pending_ld, b.pending_ld),
+        cta_group=_merge_optional(a.cta_group, b.cta_group),
+        last_alloc_cols=_merge_optional(a.last_alloc_cols, b.last_alloc_cols),
     )
 
 
@@ -554,6 +812,13 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
         if node.kind == "KernelStart":
             state.bar_state = {name: BarrierState.UNINIT for name in g.barriers}
             state.buf_state = {name: BufferState.EMPTY for name in g.buffers}
+            state.bar_init_count = {name: None for name in g.barriers}
+            state.bar_arrivals = {name: None for name in g.barriers}
+            state.bar_phase = {name: None for name in g.barriers}
+            state.bar_expected_bytes = {name: None for name in g.barriers}
+            state.bar_completed_bytes = {name: None for name in g.barriers}
+            state.cluster_init_fenced = False
+            state.cluster_sync_done = False
             state.pending_ld = False
             state.cta_group = None
             state.last_alloc_cols = None
@@ -561,9 +826,9 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
         if node.kind == "KernelEnd":
             # ensure tmem is deallocated before leaving kernel
             for buf, st in state.buf_state.items():
-                if st != BufferState.EMPTY:
+                if st is not None and st != BufferState.EMPTY:
                     raise ValueError(f"Kernel end: buffer {buf} not deallocated ({st})")
-            if state.pending_ld:
+            if state.pending_ld is True:
                 raise ValueError("Kernel end: pending tcgen05.ld without wait_ld")
             continue
 
@@ -585,14 +850,19 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
             if else_node:
                 _validate_nodes(else_node.children, g, s2)
 
-            if not _state_equal(s1, s2):
-                raise ValueError("If branches end in different states; cannot reconcile")
-
-            state.bar_state = s1.bar_state
-            state.buf_state = s1.buf_state
-            state.pending_ld = s1.pending_ld
-            state.cta_group = s1.cta_group
-            state.last_alloc_cols = s1.last_alloc_cols
+            merged = _merge_states(s1, s2)
+            state.bar_state = merged.bar_state
+            state.buf_state = merged.buf_state
+            state.bar_init_count = merged.bar_init_count
+            state.bar_arrivals = merged.bar_arrivals
+            state.bar_phase = merged.bar_phase
+            state.bar_expected_bytes = merged.bar_expected_bytes
+            state.bar_completed_bytes = merged.bar_completed_bytes
+            state.cluster_init_fenced = merged.cluster_init_fenced
+            state.cluster_sync_done = merged.cluster_sync_done
+            state.pending_ld = merged.pending_ld
+            state.cta_group = merged.cta_group
+            state.last_alloc_cols = merged.last_alloc_cols
             continue
 
         if node.kind in ("Raw", "LoadInline"):
@@ -617,10 +887,29 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
         _validate_op(node, g, state)
 
 
+def _collect_tmaps(nodes: List[Node], g: Graph) -> None:
+    for node in nodes:
+        if node.kind in ("Op", "Event"):
+            op_name, op_args, _ = _get_op_info(node)
+            canonical = _canonical_op_name(op_name)
+            if canonical == "cute_tmap":
+                _register_tmap(g, op_args)
+        if node.children:
+            _collect_tmaps(node.children, g)
+
+
 def validate_graph(g: Graph) -> None:
+    _collect_tmaps(g.sections.get("host", []), g)
     state = ValidationState(
         bar_state={name: BarrierState.UNINIT for name in g.barriers},
         buf_state={name: BufferState.EMPTY for name in g.buffers},
+        bar_init_count={name: None for name in g.barriers},
+        bar_arrivals={name: None for name in g.barriers},
+        bar_phase={name: None for name in g.barriers},
+        bar_expected_bytes={name: None for name in g.barriers},
+        bar_completed_bytes={name: None for name in g.barriers},
+        cluster_init_fenced=False,
+        cluster_sync_done=False,
     )
     _validate_nodes(g.sections.get("device", []), g, state)
 
@@ -794,6 +1083,7 @@ def graph_string(g: Graph) -> str:
     lines.append("Graph:")
     lines.append(f"  buffers: {list(g.buffers.keys())}")
     lines.append(f"  barriers: {list(g.barriers.keys())}")
+    lines.append(f"  tmaps: {list(g.tmaps.keys())}")
     lines.append(f"  default_tmem: {g.default_tmem}")
     for section, nodes in g.sections.items():
         lines.append(f"  section:{section} nodes={len(nodes)}")

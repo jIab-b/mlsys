@@ -74,6 +74,7 @@ class Graph:
         self.sections: Dict[str, List[Node]] = {"device": [], "host": [], "python": []}
         self.barriers: Dict[str, Barrier] = {}
         self.buffers: Dict[str, Tensor] = {}
+        self.tmaps: Dict[str, Dict[str, Any]] = {}
         self.default_tmem: Optional[str] = None
 
     def add_barrier(self, name: str, scope: str = "cta") -> None:
@@ -93,6 +94,15 @@ class Graph:
         self.buffers[name] = Tensor(name=name, space=space, shape=shape, dtype=dtype)
         if space == MemSpace.TMEM and self.default_tmem is None:
             self.default_tmem = name
+
+    def add_tmap(self, name: str, meta: Dict[str, Any]) -> None:
+        if name in self.tmaps:
+            existing = self.tmaps[name]
+            if existing.get("rank") != meta.get("rank"):
+                raise ValueError(f"TensorMap '{name}' rank mismatch: {existing.get('rank')} vs {meta.get('rank')}")
+            existing.update(meta)
+            return
+        self.tmaps[name] = dict(meta)
 
     def set_default_tmem(self, name: str) -> None:
         self.default_tmem = name

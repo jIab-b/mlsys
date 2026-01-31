@@ -132,6 +132,15 @@ PTX_DEVICE void mbarrier_fence_init_release() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
 
+// Cluster barrier helpers (used to synchronize CTAs in a cluster after mbarrier init)
+PTX_DEVICE void barrier_cluster_arrive_relaxed_aligned() {
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+}
+
+PTX_DEVICE void barrier_cluster_wait_acquire_aligned() {
+  asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
+
 // ----- ptx_tcgen05_cp.cuh -----
 
 
@@ -843,9 +852,9 @@ void kernel_v4(
 
       // issue TMA
       const int off_k = SPLIT_K == 1 ? iter_k * BLOCK_K : (iter_k * SPLIT_K + bid_k) * BLOCK_K;
-      // @op tma_3d_gmem2smem bar=tma_mbar
+      // @op tma_3d_gmem2smem bar=tma_mbar tmap=A_tmap
       tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 256, mbar_addr, cache_A);
-      // @op tma_3d_gmem2smem bar=tma_mbar
+      // @op tma_3d_gmem2smem bar=tma_mbar tmap=B_tmap
       tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 256, mbar_addr, cache_B);
 
       // layout of SFA is [M/128, rest_k, 32, 4, 4]
@@ -930,9 +939,9 @@ void kernel_v4(
       for (int k = 0; k < BLOCK_K / MMA_K; k++) {
         uint64_t sfa_desc = SFA_desc + (uint64_t)k * (512ULL >> 4ULL);  // 4 columns, 512 bytes of 128x4 / 32x4x4
         uint64_t sfb_desc = SFB_desc + (uint64_t)k * (512ULL >> 4ULL);
-        // @op tcgen05_cp tmem=tmem0 cta_group=1
+        // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
         tcgen05_cp_nvfp4(SFA_tmem + k * 4, sfa_desc);
-        // @op tcgen05_cp tmem=tmem0 cta_group=1
+        // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
         tcgen05_cp_nvfp4(SFB_tmem + k * 4, sfb_desc);
       }
       // @endloop
@@ -953,7 +962,7 @@ void kernel_v4(
           const int scale_B_tmem = SFB_tmem + k_sf * 4 + (bid_n % (128 / BLOCK_N)) * (BLOCK_N / 32);
 
           const int enable_input_d = (k1 == 0 && k2 == 0) ? iter_k : 1;
-          // @op tcgen05_mma tmem=tmem0 cta_group=1
+          // @op tcgen05_mma tmem=tmem0 cta_group=1 issue=one_thread
           tcgen05_mma_nvfp4(a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d);
         }
         // @endloop
@@ -1165,9 +1174,9 @@ void kernel_v3b(
 
       // issue TMA
       const int off_k = iter_k * BLOCK_K;
-      // @op tma_3d_gmem2smem bar=tma_mbar
+      // @op tma_3d_gmem2smem bar=tma_mbar tmap=A_tmap
       tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 256, mbar_addr, cache_A);
-      // @op tma_3d_gmem2smem bar=tma_mbar
+      // @op tma_3d_gmem2smem bar=tma_mbar tmap=B_tmap
       tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 256, mbar_addr, cache_B);
 
       // layout of SFA is [M/128, rest_k, 32, 4, 4]
@@ -1256,9 +1265,9 @@ void kernel_v3b(
       for (int k = 0; k < BLOCK_K / MMA_K; k++) {
         uint64_t sfa_desc = SFA_desc + (uint64_t)k * (512ULL >> 4ULL);  // 4 columns, 512 bytes of 128x4 / 32x4x4
         uint64_t sfb_desc = SFB_desc + (uint64_t)k * (512ULL >> 4ULL);
-        // @op tcgen05_cp tmem=tmem0 cta_group=1
+        // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
         tcgen05_cp_nvfp4(SFA_tmem + k * 4, sfa_desc);
-        // @op tcgen05_cp tmem=tmem0 cta_group=1
+        // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
         tcgen05_cp_nvfp4(SFB_tmem + k * 4, sfb_desc);
       }
       // @endloop
@@ -1279,7 +1288,7 @@ void kernel_v3b(
           const int scale_B_tmem = SFB_tmem + k_sf * 4 + (bid_n % (128 / BLOCK_N)) * (BLOCK_N / 32);
 
           const int enable_input_d = (k1 == 0 && k2 == 0) ? iter_k : 1;
-          // @op tcgen05_mma tmem=tmem0 cta_group=1
+          // @op tcgen05_mma tmem=tmem0 cta_group=1 issue=one_thread
           tcgen05_mma_nvfp4(a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d);
         }
         // @endloop
@@ -1314,11 +1323,11 @@ void kernel_v3b(
 
       for (int n = 0; n < BLOCK_N / WIDTH; n++) {
         float tmp[WIDTH];  // if WIDTH=128, we are using 128 registers here
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==128
         if constexpr (WIDTH == 128) tcgen05_ld_32x32bx128(tmp, warp_id * 32, n * WIDTH);
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==64
         if constexpr (WIDTH == 64) tcgen05_ld_32x32bx64(tmp, warp_id * 32, n * WIDTH);
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==32
         if constexpr (WIDTH == 32) tcgen05_ld_32x32bx32(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_wait_ld
         tcgen05_wait_ld();
