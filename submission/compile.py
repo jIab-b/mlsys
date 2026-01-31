@@ -130,6 +130,8 @@ CONTRACTS: Dict[str, OpContract] = {
     "ptx_elect_one_sync": OpContract(name="ptx_elect_one_sync", issue_scope="one_thread"),
     "ptx_elect_sync": OpContract(name="ptx_elect_sync", issue_scope="one_thread"),
     "ptx_bar_sync": OpContract(name="ptx_bar_sync", issue_scope="all_warps"),
+    # host-side metadata ops
+    "cute_tmap": OpContract(name="cute_tmap", issue_scope="host"),
 }
 
 TCGEN_PREFIX_CONTRACTS: Tuple[Tuple[str, str], ...] = (
@@ -223,6 +225,11 @@ OP_ARG_SPECS: Dict[str, Dict[str, Any]] = {
         "required": {"bar_id", "count"},
         "ints": {"bar_id", "count"},
     },
+    "cute_tmap": {
+        "required": {"name"},
+        "optional": {"rank", "global_height", "global_width", "shared_height", "shared_width"},
+        "ints": {"rank", "global_height", "global_width", "shared_height", "shared_width"},
+    },
 }
 
 
@@ -305,6 +312,7 @@ def _register_barrier(g: Graph, args: Dict[str, Any]) -> None:
 def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
     nodes: List[Node] = []
     raw_lines: List[str] = []
+    loop_stack: List[Dict[str, Any]] = []
     lines = text.splitlines()
     for idx, line in enumerate(lines, start=1):
         m = _ANNOT_RE.match(line)
@@ -322,6 +330,8 @@ def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
                     raise ValueError(f"{filename}:{idx}: @op requires op name")
                 op_name = tokens[0]
                 op_args = _parse_kv_tokens(tokens[1:])
+                if loop_stack:
+                    op_args["_loops"] = [dict(entry) for entry in loop_stack]
                 nodes.append(OpNode(op=op_name, args=op_args, loc=loc))
             elif kind == "buffer":
                 args = _parse_kv_tokens(shlex.split(body))
@@ -329,6 +339,15 @@ def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
             elif kind == "barrier":
                 args = _parse_kv_tokens(shlex.split(body))
                 _register_barrier(g, args)
+            elif kind == "loop":
+                args = _parse_kv_tokens(shlex.split(body))
+                if "var" not in args:
+                    raise ValueError(f"{filename}:{idx}: @loop requires var=")
+                loop_stack.append(args)
+            elif kind == "endloop":
+                if not loop_stack:
+                    raise ValueError(f"{filename}:{idx}: @endloop without @loop")
+                loop_stack.pop()
             elif kind == "kernel":
                 args = _parse_kv_tokens(shlex.split(body))
                 name = str(args.get("name", "kernel"))
@@ -342,6 +361,8 @@ def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
         raw_lines.append(line)
     if raw_lines:
         nodes.append(Node(kind="Raw", args={"code": "\n".join(raw_lines)}))
+    if loop_stack:
+        raise ValueError(f"{filename}: unterminated @loop annotations")
     return nodes
 
 
@@ -776,7 +797,9 @@ def build_gemm1_graph() -> Graph:
         g.sections["device"].append(node)
     if not g.buffers:
         g.add_buffer("tmem0", MemSpace.TMEM, (0,), "opaque")
-    g.add_raw("host", SECTION_FILES["host"].read_text())
+    host_text = SECTION_FILES["host"].read_text()
+    for node in _split_with_annotations(host_text, SECTION_FILES["host"], g):
+        g.sections["host"].append(node)
     python_text = SECTION_FILES["python"].read_text()
     pre_py, post_py = _split_python_with_load_inline(python_text)
     g.add_raw("python", pre_py)

@@ -79,7 +79,9 @@ at::Tensor gemm_launch_v4(
   }
 
   CUtensorMap A_tmap, B_tmap;
+  // @op cute_tmap name=A_tmap rank=3
   init_AB_tmap(&A_tmap, A_ptr, new_M, K, BLOCK_M, BLOCK_K);
+  // @op cute_tmap name=B_tmap rank=3
   init_AB_tmap(&B_tmap, B_ptr, new_N, K, BLOCK_N, BLOCK_K);
 
   dim3 grid(SPLIT_K, (new_M / BLOCK_M) * (new_N / BLOCK_N));
@@ -171,7 +173,9 @@ at::Tensor gemm_launch_v3b(
   }
 
   CUtensorMap A_tmap, B_tmap;
+  // @op cute_tmap name=A_tmap rank=3
   init_AB_tmap(&A_tmap, A_ptr, new_M, K, BLOCK_M, BLOCK_K);
+  // @op cute_tmap name=B_tmap rank=3
   init_AB_tmap(&B_tmap, B_ptr, new_N, K, BLOCK_N, BLOCK_K);
 
   int grid = (new_M / BLOCK_M) * (new_N / BLOCK_N);

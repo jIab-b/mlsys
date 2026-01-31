@@ -140,16 +140,12 @@ void kernel_v4(
   // @barrier name=tma_mbar scope=cta count=NUM_STAGES
   // @barrier name=mma_mbar scope=cta count=NUM_STAGES
   // @barrier name=mainloop_mbar scope=cta count=1
-  // @barrier name=tma_mbar scope=cta count=NUM_STAGES
-  // @barrier name=mma_mbar scope=cta count=NUM_STAGES
-  // @barrier name=mainloop_mbar scope=cta count=1
 
   // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-4x
   // each MMA consumes:
   // - (128, 64) of A -> (128, 4) of SFA -> reshaped as (32, 4', 4) -> 4 tmem columns
   constexpr int SFA_tmem = BLOCK_N;
   constexpr int SFB_tmem = SFA_tmem + 4 * (BLOCK_K / MMA_K);
-  // @buffer name=tmem0 space=tmem cols=BLOCK_N*2
   // @buffer name=tmem0 space=tmem cols=BLOCK_N*2
 
   if (warp_id == 0 && elect_sync()) {
@@ -217,6 +213,7 @@ void kernel_v4(
     for (int iter_k = 0; iter_k < NUM_STAGES; iter_k++)
       issue_tma(iter_k, iter_k);
 
+    // @loop var=iter_k iters=num_iters start=NUM_STAGES
     for (int iter_k = NUM_STAGES; iter_k < num_iters; iter_k++) {
       // wait MMA
       const int stage_id = iter_k % NUM_STAGES;
@@ -226,6 +223,7 @@ void kernel_v4(
 
       issue_tma(iter_k, stage_id);
     }
+    // @endloop
   }
   else if (warp_id == NUM_WARPS - 1 && elect_sync()) {
     // MMA warp
@@ -239,6 +237,7 @@ void kernel_v4(
                               | ((uint32_t)MMA_M >> 7U << 27U)
                               ;
 
+    // @loop var=iter_k iters=num_iters
     for (int iter_k = 0; iter_k < num_iters; iter_k++) {
       // wait TMA
       const int stage_id = iter_k % NUM_STAGES;
@@ -272,6 +271,7 @@ void kernel_v4(
       const uint64_t SFA_desc = SF_desc + ((uint64_t)SFA_smem >> 4ULL);
       const uint64_t SFB_desc = SF_desc + ((uint64_t)SFB_smem >> 4ULL);
 
+      // @loop var=k iters=BLOCK_K/MMA_K
       for (int k = 0; k < BLOCK_K / MMA_K; k++) {
         uint64_t sfa_desc = SFA_desc + (uint64_t)k * (512ULL >> 4ULL);  // 4 columns, 512 bytes of 128x4 / 32x4x4
         uint64_t sfb_desc = SFB_desc + (uint64_t)k * (512ULL >> 4ULL);
@@ -280,12 +280,15 @@ void kernel_v4(
         // @op tcgen05_cp tmem=tmem0 cta_group=1
         tcgen05_cp_nvfp4(SFB_tmem + k * 4, sfb_desc);
       }
+      // @endloop
 
       // k1 selects the (BLOCK_M, 256) tile.
       // k2 selects the (BLOCK_M, 64) tile, whose rows are swizzled.
       // NOTE: this doesn't work with BLOCK_N=32, since apparently tcgen05.mma requires SFB_tmem
       // to have 2-column (8-byte) alignment (looks like not documented).
-      for (int k1 = 0; k1 < BLOCK_K / 256; k1++)
+      // @loop var=k1 iters=BLOCK_K/256
+      for (int k1 = 0; k1 < BLOCK_K / 256; k1++) {
+        // @loop var=k2 iters=256/MMA_K
         for (int k2 = 0; k2 < 256 / MMA_K; k2++) {
           uint64_t a_desc = make_desc_AB(A_smem + k1 * BLOCK_M * 128 + k2 * 32);
           uint64_t b_desc = make_desc_AB(B_smem + k1 * BLOCK_N * 128 + k2 * 32);
@@ -298,11 +301,15 @@ void kernel_v4(
           // @op tcgen05_mma tmem=tmem0 cta_group=1
           tcgen05_mma_nvfp4(a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d);
         }
+        // @endloop
+      }
+      // @endloop
 
       // signal MMA done
       // @op tcgen05_commit bar=mma_mbar cta_group=1
       tcgen05_commit(mma_mbar_addr + stage_id * 8);
     }
+    // @endloop
 
     // signal mainloop done
     // @op tcgen05_commit bar=mainloop_mbar cta_group=1
@@ -321,6 +328,7 @@ void kernel_v4(
       // C is M-major
       constexpr int WIDTH = std::min(BLOCK_N, 64);  // using 128 might be slower
 
+      // @loop var=n iters=BLOCK_N/WIDTH
       for (int n = 0; n < BLOCK_N / WIDTH; n++) {
         float tmp[WIDTH];  // if WIDTH=128, we are using 128 registers here
         // @op tcgen05_ld tmem=tmem0 cta_group=1
@@ -342,9 +350,11 @@ void kernel_v4(
             atomicAdd(buf_ptr + row * M + col, tmp[i]);
         }
       }
+      // @endloop
     };
     auto epilogue_N_major = [&]() {
       // C is N-major
+      // @loop var=m iters=32/16
       for (int m = 0; m < 32 / 16; m++) {
         float tmp[BLOCK_N / 2];
         // @op tcgen05_ld tmem=tmem0 cta_group=1
@@ -369,6 +379,7 @@ void kernel_v4(
           }
         }
       }
+      // @endloop
     };
 
     if constexpr (C_N_MAJOR)
@@ -526,6 +537,7 @@ void kernel_v3b(
     for (int iter_k = 0; iter_k < NUM_STAGES; iter_k++)
       issue_tma(iter_k, iter_k);
 
+    // @loop var=iter_k iters=num_iters start=NUM_STAGES
     for (int iter_k = NUM_STAGES; iter_k < num_iters; iter_k++) {
       // wait MMA
       if constexpr (DO_PROFILE) profiler.start(ProfilerTag::WaitMMA);
@@ -537,6 +549,7 @@ void kernel_v3b(
 
       issue_tma(iter_k, stage_id);
     }
+    // @endloop
   }
   else if (warp_id == NUM_WARPS - 1 && elect_sync()) {
     // MMA warp
@@ -548,6 +561,7 @@ void kernel_v3b(
                               | ((uint32_t)128 >> 7U << 27U)  // MMA_M
                               ;
 
+    // @loop var=iter_k iters=num_iters
     for (int iter_k = 0; iter_k < num_iters; iter_k++) {
       // wait TMA
       if constexpr (DO_PROFILE) profiler.start(ProfilerTag::WaitTMA);
@@ -584,6 +598,7 @@ void kernel_v3b(
       const uint64_t SFA_desc = SF_desc + ((uint64_t)SFA_smem >> 4ULL);
       const uint64_t SFB_desc = SF_desc + ((uint64_t)SFB_smem >> 4ULL);
 
+      // @loop var=k iters=BLOCK_K/MMA_K
       for (int k = 0; k < BLOCK_K / MMA_K; k++) {
         uint64_t sfa_desc = SFA_desc + (uint64_t)k * (512ULL >> 4ULL);  // 4 columns, 512 bytes of 128x4 / 32x4x4
         uint64_t sfb_desc = SFB_desc + (uint64_t)k * (512ULL >> 4ULL);
@@ -592,12 +607,15 @@ void kernel_v3b(
         // @op tcgen05_cp tmem=tmem0 cta_group=1
         tcgen05_cp_nvfp4(SFB_tmem + k * 4, sfb_desc);
       }
+      // @endloop
 
       // k1 selects the (BLOCK_M, 256) tile.
       // k2 selects the (BLOCK_M, 64) tile, whose rows are swizzled.
       // NOTE: this doesn't work with BLOCK_N=32, since apparently tcgen05.mma requires SFB_tmem
       // to have 2-column (8-byte) alignment (looks like not documented).
-      for (int k1 = 0; k1 < BLOCK_K / 256; k1++)
+      // @loop var=k1 iters=BLOCK_K/256
+      for (int k1 = 0; k1 < BLOCK_K / 256; k1++) {
+        // @loop var=k2 iters=256/MMA_K
         for (int k2 = 0; k2 < 256 / MMA_K; k2++) {
           uint64_t a_desc = make_desc_AB(A_smem + k1 * BLOCK_M * 128 + k2 * 32);
           uint64_t b_desc = make_desc_AB(B_smem + k1 * BLOCK_N * 128 + k2 * 32);
@@ -610,12 +628,16 @@ void kernel_v3b(
           // @op tcgen05_mma tmem=tmem0 cta_group=1
           tcgen05_mma_nvfp4(a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d);
         }
+        // @endloop
+      }
+      // @endloop
 
       // signal MMA done
       // @op tcgen05_commit bar=mma_mbar cta_group=1
       tcgen05_commit(mma_mbar_addr + stage_id * 8);
       if constexpr (DO_PROFILE) profiler.stop();
     }
+    // @endloop
 
     // signal mainloop done
     // @op tcgen05_commit bar=mainloop_mbar cta_group=1
