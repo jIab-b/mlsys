@@ -653,7 +653,7 @@ PTX_DEVICE void tma_3d_gmem2smem_mcast(int dst, const void *tmap_ptr, int x, int
 }
 
 // ----- device.cuh -----
-
+// @chunk name=device_header
 #include <cudaTypedefs.h>
 #include <cuda_fp16.h>
 
@@ -735,7 +735,7 @@ uint32_t elect_sync() {
   );
   return pred;
 }
-
+// @chunk name=kernel_v4
 template <
   int K,
   int BLOCK_M,
@@ -1052,8 +1052,7 @@ void kernel_v4(
 }
 
 // @endkernel
-
-
+// @chunk name=kernel_v3b
 template <
   int K,
   int BLOCK_M,
@@ -1371,6 +1370,7 @@ void kernel_v3b(
 
 // @endkernel
 // ----- host.cuh -----
+// @chunk name=host_helpers
 void check_cu(CUresult err) {
   if (err == CUDA_SUCCESS) return;
   const char *error_msg_ptr;
@@ -1412,7 +1412,7 @@ void init_AB_tmap(
   );
   check_cu(err);
 }
-
+// @chunk name=gemm_launch_v4
 template <
   int K,
   int BLOCK_M,
@@ -1473,7 +1473,7 @@ at::Tensor gemm_launch_v4(
   else
     return C_N_MAJOR ? buf : buf.view({N, M, 1}).transpose(0, 1);
 }
-
+// @chunk name=gemm_v4
 at::Tensor gemm_v4(
   const at::Tensor& A,
   const at::Tensor& B,
@@ -1501,12 +1501,12 @@ at::Tensor gemm_v4(
 
   return C;
 }
-
+// @chunk name=register_v4
 TORCH_LIBRARY(my_module_v4, m) {
   m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C, Tensor(b!) buf) -> Tensor");
   m.impl("gemm", &gemm_v4);
 }
-
+// @chunk name=gemm_launch_v3b
 template <
   int K,
   int BLOCK_M,
@@ -1564,7 +1564,7 @@ at::Tensor gemm_launch_v3b(
 
   return C_N_MAJOR ? C : C.view({N, M, 1}).transpose(0, 1);
 }
-
+// @chunk name=gemm_v3b
 at::Tensor gemm_v3b(
   const at::Tensor& A,
   const at::Tensor& B,
@@ -1592,16 +1592,16 @@ at::Tensor gemm_v3b(
 
   return C;
 }
-
+// @chunk name=register_v3b
 TORCH_LIBRARY(my_module_v3b, m) {
   m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C) -> Tensor");
   m.impl("gemm", &gemm_v3b);
 }
 '''
 
+# @chunk name=python_header
 #!POPCORN leaderboard nvfp4_gemm
 #!POPCORN gpu NVIDIA
-
 import torch
 from task import input_t, output_t
 from torch.utils.cpp_extension import load_inline
@@ -1615,21 +1615,20 @@ load_inline(
     extra_cuda_cflags=['-O3', '-gencode=arch=compute_100a,code=sm_100a', '--use_fast_math', '--expt-relaxed-constexpr', '--relocatable-device-code=false', '-lineinfo', '-Xptxas=-v'],
     extra_ldflags=['-lcuda'],
 )
+# @chunk name=python_bindings
 gemm_v4 = torch.ops.my_module_v4.gemm
 gemm_v3b = torch.ops.my_module_v3b.gemm
 
 start = 0
 BIG_BUFFER = torch.zeros(int(1e10), dtype=torch.float, device="cuda")
-
-
+# @chunk name=python_alloc
 def allocate(c: torch.Tensor):
     global start
     end = start + c.numel()
     buf = BIG_BUFFER[start:end].as_strided(c.shape, c.stride())
     start = end
     return buf
-
-
+# @chunk name=python_kernel
 def custom_kernel(data: input_t) -> output_t:
     K = data[0].shape[1] * 2
     if K == 16384 or K == 7168:

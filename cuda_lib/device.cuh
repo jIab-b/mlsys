@@ -1,4 +1,4 @@
-
+// @chunk name=device_header
 #include <cudaTypedefs.h>
 #include <cuda_fp16.h>
 
@@ -80,7 +80,7 @@ uint32_t elect_sync() {
   );
   return pred;
 }
-
+// @chunk name=kernel_v4
 template <
   int K,
   int BLOCK_M,
@@ -397,8 +397,7 @@ void kernel_v4(
 }
 
 // @endkernel
-
-
+// @chunk name=kernel_v3b
 template <
   int K,
   int BLOCK_M,

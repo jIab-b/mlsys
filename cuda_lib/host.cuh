@@ -1,3 +1,4 @@
+// @chunk name=host_helpers
 void check_cu(CUresult err) {
   if (err == CUDA_SUCCESS) return;
   const char *error_msg_ptr;
@@ -39,7 +40,7 @@ void init_AB_tmap(
   );
   check_cu(err);
 }
-
+// @chunk name=gemm_launch_v4
 template <
   int K,
   int BLOCK_M,
@@ -100,7 +101,7 @@ at::Tensor gemm_launch_v4(
   else
     return C_N_MAJOR ? buf : buf.view({N, M, 1}).transpose(0, 1);
 }
-
+// @chunk name=gemm_v4
 at::Tensor gemm_v4(
   const at::Tensor& A,
   const at::Tensor& B,
@@ -128,12 +129,12 @@ at::Tensor gemm_v4(
 
   return C;
 }
-
+// @chunk name=register_v4
 TORCH_LIBRARY(my_module_v4, m) {
   m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C, Tensor(b!) buf) -> Tensor");
   m.impl("gemm", &gemm_v4);
 }
-
+// @chunk name=gemm_launch_v3b
 template <
   int K,
   int BLOCK_M,
@@ -191,7 +192,7 @@ at::Tensor gemm_launch_v3b(
 
   return C_N_MAJOR ? C : C.view({N, M, 1}).transpose(0, 1);
 }
-
+// @chunk name=gemm_v3b
 at::Tensor gemm_v3b(
   const at::Tensor& A,
   const at::Tensor& B,
@@ -219,7 +220,7 @@ at::Tensor gemm_v3b(
 
   return C;
 }
-
+// @chunk name=register_v3b
 TORCH_LIBRARY(my_module_v3b, m) {
   m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C) -> Tensor");
   m.impl("gemm", &gemm_v3b);

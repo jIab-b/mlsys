@@ -38,7 +38,7 @@ SECTION_FILES = {
     "python": CUDA_LIB / "python.py",
 }
 
-_ANNOT_RE = re.compile(r"^\s*//\s*@(?P<kind>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<body>.*)$")
+_ANNOT_RE = re.compile(r"^\s*(?://|#)\s*@(?P<kind>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<body>.*)$")
 _LOAD_INLINE_MARKER = "# @@LOAD_INLINE@@"
 
 # tcgen op contracts only (everything else must be Raw)
@@ -312,55 +312,78 @@ def _register_barrier(g: Graph, args: Dict[str, Any]) -> None:
 def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
     nodes: List[Node] = []
     raw_lines: List[str] = []
+    events: List[Node] = []
     loop_stack: List[Dict[str, Any]] = []
+    chunk_name: Optional[str] = None
+
+    def flush_chunk() -> None:
+        nonlocal raw_lines, events, chunk_name
+        if raw_lines:
+            meta = {"chunk": chunk_name} if chunk_name else {}
+            nodes.append(Node(kind="Raw", args={"code": "\n".join(raw_lines)}, meta=meta))
+        if events:
+            nodes.extend(events)
+        raw_lines = []
+        events = []
+        chunk_name = None
+
     lines = text.splitlines()
     for idx, line in enumerate(lines, start=1):
         m = _ANNOT_RE.match(line)
-        if m:
+        if not m:
             raw_lines.append(line)
-            if raw_lines:
-                nodes.append(Node(kind="Raw", args={"code": "\n".join(raw_lines)}))
-                raw_lines = []
-            kind = m.group("kind")
-            body = m.group("body").strip()
-            loc = SourceLoc(filename=str(filename), line=idx, column=1)
-            if kind == "op":
-                tokens = shlex.split(body)
-                if not tokens:
-                    raise ValueError(f"{filename}:{idx}: @op requires op name")
-                op_name = tokens[0]
-                op_args = _parse_kv_tokens(tokens[1:])
-                if loop_stack:
-                    op_args["_loops"] = [dict(entry) for entry in loop_stack]
-                nodes.append(OpNode(op=op_name, args=op_args, loc=loc))
-            elif kind == "buffer":
-                args = _parse_kv_tokens(shlex.split(body))
-                _register_buffer(g, args)
-            elif kind == "barrier":
-                args = _parse_kv_tokens(shlex.split(body))
-                _register_barrier(g, args)
-            elif kind == "loop":
-                args = _parse_kv_tokens(shlex.split(body))
-                if "var" not in args:
-                    raise ValueError(f"{filename}:{idx}: @loop requires var=")
-                loop_stack.append(args)
-            elif kind == "endloop":
-                if not loop_stack:
-                    raise ValueError(f"{filename}:{idx}: @endloop without @loop")
-                loop_stack.pop()
-            elif kind == "kernel":
-                args = _parse_kv_tokens(shlex.split(body))
-                name = str(args.get("name", "kernel"))
-                nodes.append(Node(kind="KernelStart", args={"name": name}, loc=loc))
-            elif kind == "endkernel":
-                nodes.append(Node(kind="KernelEnd", args={}, loc=loc))
-            else:
-                # Unknown annotation: keep it in Raw, but do not validate
-                pass
             continue
+
+        kind = m.group("kind")
+        body = m.group("body").strip()
+        loc = SourceLoc(filename=str(filename), line=idx, column=1)
+
+        if kind == "chunk":
+            flush_chunk()
+            raw_lines.append(line)
+            args = _parse_kv_tokens(shlex.split(body)) if body else {}
+            name = args.get("name") or args.get("id")
+            chunk_name = str(name) if name is not None else None
+            continue
+
+        # keep annotation line in raw chunk
         raw_lines.append(line)
-    if raw_lines:
-        nodes.append(Node(kind="Raw", args={"code": "\n".join(raw_lines)}))
+
+        if kind == "op":
+            tokens = shlex.split(body)
+            if not tokens:
+                raise ValueError(f"{filename}:{idx}: @op requires op name")
+            op_name = tokens[0]
+            op_args = _parse_kv_tokens(tokens[1:])
+            if loop_stack:
+                op_args["_loops"] = [dict(entry) for entry in loop_stack]
+            events.append(OpNode(op=op_name, args=op_args, loc=loc))
+        elif kind == "buffer":
+            args = _parse_kv_tokens(shlex.split(body))
+            _register_buffer(g, args)
+        elif kind == "barrier":
+            args = _parse_kv_tokens(shlex.split(body))
+            _register_barrier(g, args)
+        elif kind == "loop":
+            args = _parse_kv_tokens(shlex.split(body))
+            if "var" not in args:
+                raise ValueError(f"{filename}:{idx}: @loop requires var=")
+            loop_stack.append(args)
+        elif kind == "endloop":
+            if not loop_stack:
+                raise ValueError(f"{filename}:{idx}: @endloop without @loop")
+            loop_stack.pop()
+        elif kind == "kernel":
+            args = _parse_kv_tokens(shlex.split(body))
+            name = str(args.get("name", "kernel"))
+            events.append(Node(kind="KernelStart", args={"name": name}, loc=loc))
+        elif kind == "endkernel":
+            events.append(Node(kind="KernelEnd", args={}, loc=loc))
+        else:
+            # Unknown annotation: keep it in Raw, but do not validate
+            pass
+
+    flush_chunk()
     if loop_stack:
         raise ValueError(f"{filename}: unterminated @loop annotations")
     return nodes
@@ -802,7 +825,8 @@ def build_gemm1_graph() -> Graph:
         g.sections["host"].append(node)
     python_text = SECTION_FILES["python"].read_text()
     pre_py, post_py = _split_python_with_load_inline(python_text)
-    g.add_raw("python", pre_py)
+    for node in _split_with_annotations(pre_py, SECTION_FILES["python"], g):
+        g.sections["python"].append(node)
     g.add_load_inline(
         "python",
         name="gemm_all",
@@ -822,7 +846,8 @@ def build_gemm1_graph() -> Graph:
         ],
         extra_ldflags=["-lcuda"],
     )
-    g.add_raw("python", post_py)
+    for node in _split_with_annotations(post_py, SECTION_FILES["python"], g):
+        g.sections["python"].append(node)
     return g
 
 
