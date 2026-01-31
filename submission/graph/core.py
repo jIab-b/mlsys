@@ -31,14 +31,16 @@ class BufferState(Enum):
 class Tensor:
     name: str
     space: MemSpace
-    shape: Tuple[int, ...]
+    shape: Tuple[Any, ...]
     dtype: str
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class Barrier:
     name: str
     scope: str  # "cta" or "cluster"
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -57,6 +59,14 @@ class Node:
     args: Dict[str, Any] = field(default_factory=dict)
     children: List["Node"] = field(default_factory=list)
     meta: Dict[str, str] = field(default_factory=dict)
+    loc: Optional["SourceLoc"] = None
+
+
+@dataclass
+class SourceLoc:
+    filename: str
+    line: int
+    column: int = 1
 
 
 class Graph:
@@ -67,9 +77,19 @@ class Graph:
         self.default_tmem: Optional[str] = None
 
     def add_barrier(self, name: str, scope: str = "cta") -> None:
+        if name in self.barriers:
+            existing = self.barriers[name]
+            if existing.scope != scope:
+                raise ValueError(f"Barrier '{name}' scope mismatch: {existing.scope} vs {scope}")
+            return
         self.barriers[name] = Barrier(name=name, scope=scope)
 
-    def add_buffer(self, name: str, space: MemSpace, shape: Tuple[int, ...], dtype: str) -> None:
+    def add_buffer(self, name: str, space: MemSpace, shape: Tuple[Any, ...], dtype: str) -> None:
+        if name in self.buffers:
+            existing = self.buffers[name]
+            if existing.space != space or existing.dtype != dtype:
+                raise ValueError(f"Buffer '{name}' mismatch: {existing.space}/{existing.dtype} vs {space}/{dtype}")
+            return
         self.buffers[name] = Tensor(name=name, space=space, shape=shape, dtype=dtype)
         if space == MemSpace.TMEM and self.default_tmem is None:
             self.default_tmem = name

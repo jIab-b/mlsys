@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
@@ -26,7 +28,9 @@ from graph.core import (  # noqa: E402
     MemSpace,
     Node,
     OpContract,
+    SourceLoc,
 )
+from graph.nodes.op import OpNode  # noqa: E402
 
 SECTION_FILES = {
     "device": CUDA_LIB / "device.cuh",
@@ -34,8 +38,8 @@ SECTION_FILES = {
     "python": CUDA_LIB / "python.py",
 }
 
-
-
+_ANNOT_RE = re.compile(r"^\s*//\s*@(?P<kind>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<body>.*)$")
+_LOAD_INLINE_MARKER = "# @@LOAD_INLINE@@"
 
 # tcgen op contracts only (everything else must be Raw)
 CONTRACTS: Dict[str, OpContract] = {
@@ -143,22 +147,208 @@ TCGEN_PREFIX_CONTRACTS: Tuple[Tuple[str, str], ...] = (
     ("ptx_", "ptx_laneid"),
 )
 
+OP_ALIASES: Dict[str, str] = {
+    "tcgen05_cp_nvfp4": "tcgen05_cp",
+    "tcgen05_mma_nvfp4": "tcgen05_mma",
+    "tcgen05_ld_32x32bx128": "tcgen05_ld",
+    "tcgen05_ld_32x32bx64": "tcgen05_ld",
+    "tcgen05_ld_32x32bx32": "tcgen05_ld",
+    "tcgen05_ld_16x256bx16": "tcgen05_ld",
+    "tcgen05_ld_16x256bx8": "tcgen05_ld",
+    "tcgen05_ld_16x256bx4": "tcgen05_ld",
+    "ptx_bar_sync": "ptx_bar_sync",
+}
+
+OP_ARG_SPECS: Dict[str, Dict[str, Any]] = {
+    "tcgen05_alloc": {
+        "required": {"tmem", "cols"},
+        "ints": {"cols"},
+        "optional": {"cta_group", "scope"},
+    },
+    "tcgen05_dealloc": {
+        "required": {"tmem", "cols"},
+        "ints": {"cols"},
+        "optional": {"cta_group", "scope"},
+    },
+    "tcgen05_cp": {
+        "required": {"tmem"},
+        "optional": {"cta_group", "tmem_offset", "cols"},
+        "ints": {"tmem_offset", "cols"},
+    },
+    "tcgen05_mma": {
+        "required": {"tmem"},
+        "optional": {"cta_group"},
+    },
+    "tcgen05_ld": {
+        "required": {"tmem"},
+        "optional": {"cta_group"},
+    },
+    "tcgen05_wait_ld": {
+        "required": set(),
+        "optional": set(),
+    },
+    "tcgen05_commit": {
+        "required": {"bar"},
+        "optional": {"cta_group"},
+    },
+    "tcgen05_fence_after_thread_sync": {
+        "required": set(),
+        "optional": set(),
+    },
+    "mbarrier_init": {
+        "required": {"bar", "count"},
+        "ints": {"count"},
+        "optional": {"scope"},
+    },
+    "mbarrier_arrive_expect_tx": {
+        "required": {"bar", "size"},
+        "ints": {"size"},
+        "optional": {"scope"},
+    },
+    "mbarrier_wait": {
+        "required": {"bar", "phase"},
+        "ints": {"phase"},
+        "optional": {"scope"},
+    },
+    "tma_gmem2smem": {
+        "required": {"bar", "size"},
+        "ints": {"size"},
+        "optional": {"dst_align", "src_align"},
+    },
+    "tma_3d_gmem2smem": {
+        "required": {"bar"},
+        "optional": {"dim"},
+    },
+    "ptx_bar_sync": {
+        "required": {"bar_id", "count"},
+        "ints": {"bar_id", "count"},
+    },
+}
+
+
+def _canonical_op_name(kind: str) -> str:
+    if kind in OP_ALIASES:
+        return OP_ALIASES[kind]
+    if kind in CONTRACTS:
+        return kind
+    for prefix, name in TCGEN_PREFIX_CONTRACTS:
+        if kind.startswith(prefix):
+            return name
+    return kind
+
 
 def _resolve_contract(kind: str) -> Optional[OpContract]:
-    if kind in CONTRACTS:
-        return CONTRACTS[kind]
-    if kind.startswith("tcgen05_"):
-        for prefix, name in TCGEN_PREFIX_CONTRACTS:
-            if kind.startswith(prefix):
-                return CONTRACTS[name]
-    return None
+    canonical = _canonical_op_name(kind)
+    return CONTRACTS.get(canonical)
 
 
-def _copy_state(bar_state: Dict[str, BarrierState], buf_state: Dict[str, BufferState]):
-    return dict(bar_state), dict(buf_state)
+@dataclass
+class ValidationState:
+    bar_state: Dict[str, BarrierState]
+    buf_state: Dict[str, BufferState]
+    pending_ld: bool = False
+    cta_group: Optional[int] = None
+    last_alloc_cols: Optional[int] = None
+
+
+def _parse_value(raw: str) -> Any:
+    if raw.startswith(("'", '"')) and raw.endswith(("'", '"')) and len(raw) >= 2:
+        return raw[1:-1]
+    lowered = raw.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if re.fullmatch(r"0x[0-9a-fA-F]+", raw):
+        return int(raw, 16)
+    if re.fullmatch(r"-?\d+", raw):
+        return int(raw)
+    return raw
+
+
+def _parse_kv_tokens(tokens: List[str]) -> Dict[str, Any]:
+    args: Dict[str, Any] = {}
+    for tok in tokens:
+        if "=" not in tok:
+            raise ValueError(f"Invalid annotation token (expected key=value): {tok}")
+        key, value = tok.split("=", 1)
+        args[key] = _parse_value(value)
+    return args
+
+
+def _register_buffer(g: Graph, args: Dict[str, Any]) -> None:
+    name = args.get("name")
+    if not name:
+        raise ValueError("@buffer requires name=")
+    space = str(args.get("space", "tmem")).lower()
+    if space == "tmem":
+        mem = MemSpace.TMEM
+    elif space == "smem":
+        mem = MemSpace.SMEM
+    elif space == "gmem":
+        mem = MemSpace.GMEM
+    else:
+        mem = MemSpace.RMEM
+    cols = args.get("cols")
+    shape = (cols,) if cols is not None else (0,)
+    g.add_buffer(str(name), mem, shape, str(args.get("dtype", "opaque")))
+    g.buffers[str(name)].meta.update(args)
+
+
+def _register_barrier(g: Graph, args: Dict[str, Any]) -> None:
+    name = args.get("name")
+    if not name:
+        raise ValueError("@barrier requires name=")
+    scope = str(args.get("scope", "cta"))
+    g.add_barrier(str(name), scope=scope)
+    g.barriers[str(name)].meta.update(args)
+
+
+def _split_with_annotations(text: str, filename: Path, g: Graph) -> List[Node]:
+    nodes: List[Node] = []
+    raw_lines: List[str] = []
+    lines = text.splitlines()
+    for idx, line in enumerate(lines, start=1):
+        m = _ANNOT_RE.match(line)
+        if m:
+            raw_lines.append(line)
+            if raw_lines:
+                nodes.append(Node(kind="Raw", args={"code": "\n".join(raw_lines)}))
+                raw_lines = []
+            kind = m.group("kind")
+            body = m.group("body").strip()
+            loc = SourceLoc(filename=str(filename), line=idx, column=1)
+            if kind == "op":
+                tokens = shlex.split(body)
+                if not tokens:
+                    raise ValueError(f"{filename}:{idx}: @op requires op name")
+                op_name = tokens[0]
+                op_args = _parse_kv_tokens(tokens[1:])
+                nodes.append(OpNode(op=op_name, args=op_args, loc=loc))
+            elif kind == "buffer":
+                args = _parse_kv_tokens(shlex.split(body))
+                _register_buffer(g, args)
+            elif kind == "barrier":
+                args = _parse_kv_tokens(shlex.split(body))
+                _register_barrier(g, args)
+            elif kind == "kernel":
+                args = _parse_kv_tokens(shlex.split(body))
+                name = str(args.get("name", "kernel"))
+                nodes.append(Node(kind="KernelStart", args={"name": name}, loc=loc))
+            elif kind == "endkernel":
+                nodes.append(Node(kind="KernelEnd", args={}, loc=loc))
+            else:
+                # Unknown annotation: keep it in Raw, but do not validate
+                pass
+            continue
+        raw_lines.append(line)
+    if raw_lines:
+        nodes.append(Node(kind="Raw", args={"code": "\n".join(raw_lines)}))
+    return nodes
 
 
 def _resolve_buffer_arg(op: Node, key: str, g: Graph) -> str:
+    op_args = op.args.get("op_args") if op.kind == "Op" else None
+    if op_args is not None and key in op_args:
+        return op_args[key]
     if key in op.args:
         return op.args[key]
     if key == "tmem" and g.default_tmem is not None:
@@ -166,45 +356,175 @@ def _resolve_buffer_arg(op: Node, key: str, g: Graph) -> str:
     raise ValueError(f"{op.kind}: missing buffer arg '{key}'")
 
 
-def _validate_op(op: Node, g: Graph, bar_state: Dict[str, BarrierState], buf_state: Dict[str, BufferState]) -> None:
-    c = _resolve_contract(op.kind)
+def _get_op_info(op: Node) -> Tuple[str, Dict[str, Any], Optional[SourceLoc]]:
+    if op.kind == "Op":
+        return str(op.args.get("op", "")), dict(op.args.get("op_args", {})), op.loc
+    if op.kind == "Event":
+        return str(op.args.get("op", "")), {}, op.loc
+    return op.kind, dict(op.args), op.loc
+
+
+def _validate_args(op_name: str, args: Dict[str, Any], loc: Optional[SourceLoc]) -> None:
+    spec = OP_ARG_SPECS.get(op_name)
+    if not spec:
+        return
+    required = spec.get("required", set())
+    missing = [k for k in required if k not in args]
+    if missing:
+        loc_str = f"{loc.filename}:{loc.line}: " if loc else ""
+        raise ValueError(f"{loc_str}{op_name}: missing args {missing}")
+
+
+def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
+    op_name, op_args, loc = _get_op_info(op)
+    if not op_name:
+        raise ValueError("Op node missing name")
+    canonical = _canonical_op_name(op_name)
+    c = _resolve_contract(canonical)
     if c is None:
-        raise ValueError(f"Unknown op: {op.kind}")
+        raise ValueError(f"Unknown op: {op_name}")
+
+    _validate_args(canonical, op_args, loc)
+
+    # tcgen05 cta_group consistency
+    if canonical.startswith("tcgen05_"):
+        cta_group = op_args.get("cta_group", 1)
+        if isinstance(cta_group, int) and cta_group not in (1, 2):
+            raise ValueError(f"{op_name}: invalid cta_group {cta_group}")
+        if state.cta_group is None:
+            state.cta_group = cta_group if isinstance(cta_group, int) else None
+        elif isinstance(cta_group, int) and state.cta_group is not None and cta_group != state.cta_group:
+            raise ValueError(f"{op_name}: cta_group {cta_group} != {state.cta_group}")
 
     resolved_bufs: Dict[str, str] = {}
     for key in list(c.buffer_pre.keys()) + list(c.buffer_post.keys()):
         buf_name = _resolve_buffer_arg(op, key, g)
         if buf_name not in g.buffers:
-            raise ValueError(f"{op.kind}: unknown buffer '{buf_name}'")
+            raise ValueError(f"{op_name}: unknown buffer '{buf_name}'")
         resolved_bufs[key] = buf_name
 
-    for key, required in c.pre.items():
-        bar = op.args.get(key)
-        if bar is None:
-            raise ValueError(f"{op.kind}: missing barrier arg '{key}'")
+    # barrier presence checks (annotation-driven)
+    if "bar" in op_args:
+        bar = op_args["bar"]
         if bar not in g.barriers:
-            raise ValueError(f"{op.kind}: unknown barrier '{bar}'")
-        if bar_state[bar] != required:
-            raise ValueError(f"{op.kind}: barrier {bar} state {bar_state[bar]} != {required}")
+            raise ValueError(f"{op_name}: unknown barrier '{bar}'")
+        if canonical != "mbarrier_init" and state.bar_state.get(bar) == BarrierState.UNINIT:
+            raise ValueError(f"{op_name}: barrier '{bar}' used before init")
+
+    for key, required in c.pre.items():
+        bar = op_args.get(key)
+        if bar is None:
+            raise ValueError(f"{op_name}: missing barrier arg '{key}'")
+        if bar not in g.barriers:
+            raise ValueError(f"{op_name}: unknown barrier '{bar}'")
+        if state.bar_state[bar] != required:
+            raise ValueError(f"{op_name}: barrier {bar} state {state.bar_state[bar]} != {required}")
 
     for key, required in c.buffer_pre.items():
         buf = resolved_bufs[key]
-        if buf_state[buf] != required:
-            raise ValueError(f"{op.kind}: buffer {buf} state {buf_state[buf]} != {required}")
+        if state.buf_state[buf] != required:
+            raise ValueError(f"{op_name}: buffer {buf} state {state.buf_state[buf]} != {required}")
+
+    # Extra semantic checks derived from PTX ISA (best-effort for constants)
+    if canonical == "tcgen05_alloc":
+        cols = op_args.get("cols")
+        if isinstance(cols, int):
+            if cols < 32 or cols > 512:
+                raise ValueError(f"{op_name}: cols {cols} out of range [32, 512]")
+            if cols & (cols - 1) != 0:
+                raise ValueError(f"{op_name}: cols {cols} must be power of 2")
+            if state.last_alloc_cols is not None and cols > state.last_alloc_cols:
+                raise ValueError(f"{op_name}: cols increased from {state.last_alloc_cols} to {cols}")
+            state.last_alloc_cols = cols
+    if canonical == "tcgen05_dealloc":
+        cols = op_args.get("cols")
+        if isinstance(cols, int) and state.last_alloc_cols is not None and cols != state.last_alloc_cols:
+            raise ValueError(f"{op_name}: cols {cols} != last alloc {state.last_alloc_cols}")
+
+    if canonical == "tma_gmem2smem":
+        size = op_args.get("size")
+        if isinstance(size, int) and size % 16 != 0:
+            raise ValueError(f"{op_name}: size {size} must be multiple of 16")
+        for key in ("dst_align", "src_align"):
+            align = op_args.get(key)
+            if isinstance(align, int) and align < 16:
+                raise ValueError(f"{op_name}: {key} {align} must be >= 16")
+
+    if canonical == "mbarrier_init":
+        count = op_args.get("count")
+        if isinstance(count, int) and count <= 0:
+            raise ValueError(f"{op_name}: count must be > 0")
+    if canonical == "mbarrier_wait":
+        phase = op_args.get("phase")
+        if isinstance(phase, int) and phase not in (0, 1):
+            raise ValueError(f"{op_name}: phase {phase} must be 0 or 1")
+    if canonical == "mbarrier_arrive_expect_tx":
+        size = op_args.get("size")
+        if isinstance(size, int) and size % 16 != 0:
+            raise ValueError(f"{op_name}: size {size} must be multiple of 16")
+
+    if canonical == "tcgen05_ld":
+        state.pending_ld = True
+    if canonical == "tcgen05_wait_ld":
+        if not state.pending_ld:
+            raise ValueError(f"{op_name}: wait_ld without prior ld")
+        state.pending_ld = False
+
+    # minimal barrier state transitions
+    if canonical == "mbarrier_init":
+        bar = op_args.get("bar")
+        if bar in state.bar_state:
+            state.bar_state[bar] = BarrierState.INIT
 
     for key, new_state in c.post.items():
-        bar = op.args[key]
-        bar_state[bar] = new_state
+        bar = op_args[key]
+        state.bar_state[bar] = new_state
 
     for key, new_state in c.buffer_post.items():
         buf = resolved_bufs[key]
-        buf_state[buf] = new_state
+        state.buf_state[buf] = new_state
 
 
-def _validate_nodes(nodes: List[Node], g: Graph, bar_state: Dict[str, BarrierState], buf_state: Dict[str, BufferState]) -> None:
+def _clone_state(state: ValidationState) -> ValidationState:
+    return ValidationState(
+        bar_state=dict(state.bar_state),
+        buf_state=dict(state.buf_state),
+        pending_ld=state.pending_ld,
+        cta_group=state.cta_group,
+        last_alloc_cols=state.last_alloc_cols,
+    )
+
+
+def _state_equal(a: ValidationState, b: ValidationState) -> bool:
+    return (
+        a.bar_state == b.bar_state
+        and a.buf_state == b.buf_state
+        and a.pending_ld == b.pending_ld
+        and a.cta_group == b.cta_group
+        and a.last_alloc_cols == b.last_alloc_cols
+    )
+
+
+def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None:
     for node in nodes:
+        if node.kind == "KernelStart":
+            state.bar_state = {name: BarrierState.UNINIT for name in g.barriers}
+            state.buf_state = {name: BufferState.EMPTY for name in g.buffers}
+            state.pending_ld = False
+            state.cta_group = None
+            state.last_alloc_cols = None
+            continue
+        if node.kind == "KernelEnd":
+            # ensure tmem is deallocated before leaving kernel
+            for buf, st in state.buf_state.items():
+                if st != BufferState.EMPTY:
+                    raise ValueError(f"Kernel end: buffer {buf} not deallocated ({st})")
+            if state.pending_ld:
+                raise ValueError("Kernel end: pending tcgen05.ld without wait_ld")
+            continue
+
         if node.kind == "Block":
-            _validate_nodes(node.children, g, bar_state, buf_state)
+            _validate_nodes(node.children, g, state)
             continue
 
         if node.kind == "If":
@@ -213,29 +533,29 @@ def _validate_nodes(nodes: List[Node], g: Graph, bar_state: Dict[str, BarrierSta
             then_node = next((c for c in node.children if c.kind == "Then"), None)
             else_node = next((c for c in node.children if c.kind == "Else"), None)
 
-            b1, f1 = _copy_state(bar_state, buf_state)
+            s1 = _clone_state(state)
             if then_node:
-                _validate_nodes(then_node.children, g, b1, f1)
+                _validate_nodes(then_node.children, g, s1)
 
-            b2, f2 = _copy_state(bar_state, buf_state)
+            s2 = _clone_state(state)
             if else_node:
-                _validate_nodes(else_node.children, g, b2, f2)
+                _validate_nodes(else_node.children, g, s2)
 
-            if b1 != b2 or f1 != f2:
+            if not _state_equal(s1, s2):
                 raise ValueError("If branches end in different states; cannot reconcile")
 
-            bar_state.update(b1)
-            buf_state.update(f1)
+            state.bar_state = s1.bar_state
+            state.buf_state = s1.buf_state
+            state.pending_ld = s1.pending_ld
+            state.cta_group = s1.cta_group
+            state.last_alloc_cols = s1.last_alloc_cols
             continue
 
         if node.kind in ("Raw", "LoadInline"):
-            # Raw nodes are opaque; tcgen validation happens only on explicit nodes.
+            # Raw nodes are opaque; validation happens only on annotated ops.
             continue
-        if node.kind == "Event":
-            op = node.args.get("op", "")
-            if not op:
-                raise ValueError("Event node missing 'op'")
-            _validate_op(Node(kind=op, args={}), g, bar_state, buf_state)
+        if node.kind in ("Op", "Event"):
+            _validate_op(node, g, state)
             continue
 
         if node.kind == "For":
@@ -243,20 +563,22 @@ def _validate_nodes(nodes: List[Node], g: Graph, bar_state: Dict[str, BarrierSta
                 raise ValueError("For node requires 'var' and 'iters'")
             iters = int(node.args["iters"])
             for _ in range(iters):
-                _validate_nodes(node.children, g, bar_state, buf_state)
+                _validate_nodes(node.children, g, state)
             continue
 
         if node.kind in ("Then", "Else"):
-            _validate_nodes(node.children, g, bar_state, buf_state)
+            _validate_nodes(node.children, g, state)
             continue
 
-        _validate_op(node, g, bar_state, buf_state)
+        _validate_op(node, g, state)
 
 
 def validate_graph(g: Graph) -> None:
-    bar_state = {name: BarrierState.UNINIT for name in g.barriers}
-    buf_state = {name: BufferState.EMPTY for name in g.buffers}
-    _validate_nodes(g.sections.get("device", []), g, bar_state, buf_state)
+    state = ValidationState(
+        bar_state={name: BarrierState.UNINIT for name in g.barriers},
+        buf_state={name: BufferState.EMPTY for name in g.buffers},
+    )
+    _validate_nodes(g.sections.get("device", []), g, state)
 
 
 def _emit_nodes(
@@ -338,7 +660,7 @@ def _emit_nodes(
             if raw:
                 lines.append(raw.rstrip("\n") + "\n")
             continue
-        if node.kind == "Event":
+        if node.kind in ("Event", "Op", "KernelStart", "KernelEnd"):
             continue
 
         if node.kind == "For":
@@ -406,6 +728,14 @@ def _format_node(node: Node, indent: int = 0) -> List[str]:
     elif node.kind == "Event":
         op = node.args.get("op", "")
         lines = [f"{pad}Event({op})"]
+    elif node.kind == "Op":
+        op = node.args.get("op", "")
+        lines = [f"{pad}Op({op})"]
+    elif node.kind == "KernelStart":
+        name = node.args.get("name", "")
+        lines = [f"{pad}KernelStart({name})"]
+    elif node.kind == "KernelEnd":
+        lines = [f"{pad}KernelEnd"]
     else:
         args = f" {node.args}" if node.args else ""
         meta = "" if not node.meta else f" meta={list(node.meta.keys())}"
@@ -428,33 +758,6 @@ def graph_string(g: Graph) -> str:
     return "\n".join(lines)
 
 
-_TCGEN_CALL_RE = re.compile(r"\b(tcgen05_[A-Za-z0-9_]+)\s*\(")
-_LOAD_INLINE_MARKER = "# @@LOAD_INLINE@@"
-
-
-def _split_device_with_tcgen_events(text: str) -> List[Node]:
-    nodes: List[Node] = []
-    raw_lines: List[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("//"):
-            raw_lines.append(line)
-            continue
-        line_no_comment = line.split("//", 1)[0]
-        matches = _TCGEN_CALL_RE.findall(line_no_comment)
-        raw_lines.append(line)
-        if matches:
-            raw = "\n".join(raw_lines)
-            if raw:
-                nodes.append(Node(kind="Raw", args={"code": raw}))
-            raw_lines = []
-            for op in matches:
-                nodes.append(Node(kind="Event", args={"op": op}))
-    if raw_lines:
-        nodes.append(Node(kind="Raw", args={"code": "\n".join(raw_lines)}))
-    return nodes
-
-
 def _split_python_with_load_inline(text: str) -> Tuple[str, str]:
     if _LOAD_INLINE_MARKER not in text:
         raise ValueError(f"python.py missing load inline marker: {_LOAD_INLINE_MARKER}")
@@ -468,10 +771,11 @@ def build_gemm1_graph() -> Graph:
     if missing:
         raise FileNotFoundError(f"Missing cuda_lib files for gemm1: {missing}")
 
-    g.add_buffer("tmem0", MemSpace.TMEM, (0,), "opaque")
     device_text = SECTION_FILES["device"].read_text()
-    for node in _split_device_with_tcgen_events(device_text):
+    for node in _split_with_annotations(device_text, SECTION_FILES["device"], g):
         g.sections["device"].append(node)
+    if not g.buffers:
+        g.add_buffer("tmem0", MemSpace.TMEM, (0,), "opaque")
     g.add_raw("host", SECTION_FILES["host"].read_text())
     python_text = SECTION_FILES["python"].read_text()
     pre_py, post_py = _split_python_with_load_inline(python_text)

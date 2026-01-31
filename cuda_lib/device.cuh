@@ -90,6 +90,7 @@ template <
   bool C_N_MAJOR,
   int NUM_STAGES
 >
+// @kernel name=kernel_v4
 __global__
 __launch_bounds__(BLOCK_M + 2 * WARP_SIZE)
 void kernel_v4(
@@ -136,15 +137,26 @@ void kernel_v4(
   const int tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mbars));
   const int mma_mbar_addr = tma_mbar_addr + NUM_STAGES * 8;
   const int mainloop_mbar_addr = mma_mbar_addr + NUM_STAGES * 8;
+  // @barrier name=tma_mbar scope=cta count=NUM_STAGES
+  // @barrier name=mma_mbar scope=cta count=NUM_STAGES
+  // @barrier name=mainloop_mbar scope=cta count=1
+  // @barrier name=tma_mbar scope=cta count=NUM_STAGES
+  // @barrier name=mma_mbar scope=cta count=NUM_STAGES
+  // @barrier name=mainloop_mbar scope=cta count=1
 
   // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-4x
   // each MMA consumes:
   // - (128, 64) of A -> (128, 4) of SFA -> reshaped as (32, 4', 4) -> 4 tmem columns
   constexpr int SFA_tmem = BLOCK_N;
   constexpr int SFB_tmem = SFA_tmem + 4 * (BLOCK_K / MMA_K);
+  // @buffer name=tmem0 space=tmem cols=BLOCK_N*2
+  // @buffer name=tmem0 space=tmem cols=BLOCK_N*2
 
   if (warp_id == 0 && elect_sync()) {
     // only 1 thread issue
+    // @op mbarrier_init bar=tma_mbar count=1 scope=cta
+    // @op mbarrier_init bar=mma_mbar count=1 scope=cta
+    // @op mbarrier_init bar=mainloop_mbar count=1 scope=cta
     for (int i = 0; i < NUM_STAGES * 2 + 1; i++)
       mbarrier_init(tma_mbar_addr + i * 8, 1);
     asm volatile("fence.mbarrier_init.release.cluster;");  // visible to async proxy
@@ -152,6 +164,7 @@ void kernel_v4(
   else if (warp_id == 1) {
     // allocate tmem
     // tmem address should be 0, don't bother storing and reading it.
+    // @op tcgen05_alloc tmem=tmem0 cols=BLOCK_N*2 cta_group=1 scope=one_warp
     tcgen05_alloc(smem, BLOCK_N * 2);
   }
   __syncthreads();  // visible to all threads
@@ -179,7 +192,9 @@ void kernel_v4(
 
       // issue TMA
       const int off_k = SPLIT_K == 1 ? iter_k * BLOCK_K : (iter_k * SPLIT_K + bid_k) * BLOCK_K;
+      // @op tma_3d_gmem2smem bar=tma_mbar
       tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 256, mbar_addr, cache_A);
+      // @op tma_3d_gmem2smem bar=tma_mbar
       tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 256, mbar_addr, cache_B);
 
       // layout of SFA is [M/128, rest_k, 32, 4, 4]
@@ -187,10 +202,13 @@ void kernel_v4(
       const int rest_k = K / 16 / 4;
       const char *SFA_src = SFA_ptr + ((off_m / 128) * rest_k + off_k / (16 * 4)) * 512;  // 512 = 32x4x4
       const char *SFB_src = SFB_ptr + ((off_n / 128) * rest_k + off_k / (16 * 4)) * 512;
+      // @op tma_gmem2smem bar=tma_mbar size=SFA_size dst_align=16 src_align=16
       tma_gmem2smem(SFA_smem, SFA_src, SFA_size, mbar_addr, cache_A);
+      // @op tma_gmem2smem bar=tma_mbar size=SFB_size dst_align=16 src_align=16
       tma_gmem2smem(SFB_smem, SFB_src, SFB_size, mbar_addr, cache_B);
 
       // signal TMA done
+      // @op mbarrier_arrive_expect_tx bar=tma_mbar size=STAGE_SIZE
       asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
                   :: "r"(mbar_addr), "r"(STAGE_SIZE) : "memory");
     };
@@ -203,6 +221,7 @@ void kernel_v4(
       // wait MMA
       const int stage_id = iter_k % NUM_STAGES;
       const int mma_phase = (iter_k / NUM_STAGES - 1) % 2;
+      // @op mbarrier_wait bar=mma_mbar phase=mma_phase
       mbarrier_wait(mma_mbar_addr + stage_id * 8, mma_phase);
 
       issue_tma(iter_k, stage_id);
@@ -224,6 +243,7 @@ void kernel_v4(
       // wait TMA
       const int stage_id = iter_k % NUM_STAGES;
       const int tma_phase = (iter_k / NUM_STAGES) % 2;
+      // @op mbarrier_wait bar=tma_mbar phase=tma_phase
       mbarrier_wait(tma_mbar_addr + stage_id * 8, tma_phase);
 
       const int A_smem = smem + stage_id * STAGE_SIZE;
@@ -255,7 +275,9 @@ void kernel_v4(
       for (int k = 0; k < BLOCK_K / MMA_K; k++) {
         uint64_t sfa_desc = SFA_desc + (uint64_t)k * (512ULL >> 4ULL);  // 4 columns, 512 bytes of 128x4 / 32x4x4
         uint64_t sfb_desc = SFB_desc + (uint64_t)k * (512ULL >> 4ULL);
+        // @op tcgen05_cp tmem=tmem0 cta_group=1
         tcgen05_cp_nvfp4(SFA_tmem + k * 4, sfa_desc);
+        // @op tcgen05_cp tmem=tmem0 cta_group=1
         tcgen05_cp_nvfp4(SFB_tmem + k * 4, sfb_desc);
       }
 
@@ -273,21 +295,26 @@ void kernel_v4(
           const int scale_B_tmem = SFB_tmem + k_sf * 4 + (bid_n % (128 / BLOCK_N)) * (BLOCK_N / 32);
 
           const int enable_input_d = (k1 == 0 && k2 == 0) ? iter_k : 1;
+          // @op tcgen05_mma tmem=tmem0 cta_group=1
           tcgen05_mma_nvfp4(a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d);
         }
 
       // signal MMA done
+      // @op tcgen05_commit bar=mma_mbar cta_group=1
       tcgen05_commit(mma_mbar_addr + stage_id * 8);
     }
 
     // signal mainloop done
+    // @op tcgen05_commit bar=mainloop_mbar cta_group=1
     tcgen05_commit(mainloop_mbar_addr);
   }
   else if (tid < BLOCK_M) {
     // epilogue warps
 
     // wait mainloop
+    // @op mbarrier_wait bar=mainloop_mbar phase=0
     mbarrier_wait(mainloop_mbar_addr, 0);
+    // @op tcgen05_fence_after_thread_sync
     tcgen05_fence_after_thread_sync();
 
     auto epilogue_M_major = [&]() {
@@ -296,9 +323,13 @@ void kernel_v4(
 
       for (int n = 0; n < BLOCK_N / WIDTH; n++) {
         float tmp[WIDTH];  // if WIDTH=128, we are using 128 registers here
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (WIDTH == 128) tcgen05_ld_32x32bx128(tmp, warp_id * 32, n * WIDTH);
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (WIDTH == 64) tcgen05_ld_32x32bx64(tmp, warp_id * 32, n * WIDTH);
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (WIDTH == 32) tcgen05_ld_32x32bx32(tmp, warp_id * 32, n * WIDTH);
+        // @op tcgen05_wait_ld
         tcgen05_wait_ld();
 
         for (int i = 0; i < WIDTH; i++) {
@@ -316,9 +347,13 @@ void kernel_v4(
       // C is N-major
       for (int m = 0; m < 32 / 16; m++) {
         float tmp[BLOCK_N / 2];
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (BLOCK_N == 128) tcgen05_ld_16x256bx16(tmp, warp_id * 32 + m * 16, 0);
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (BLOCK_N == 64) tcgen05_ld_16x256bx8(tmp, warp_id * 32 + m * 16, 0);
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (BLOCK_N == 32) tcgen05_ld_16x256bx4(tmp, warp_id * 32 + m * 16, 0);
+        // @op tcgen05_wait_ld
         tcgen05_wait_ld();
 
         for (int i = 0; i < BLOCK_N / 8; i++) {
@@ -341,12 +376,16 @@ void kernel_v4(
     else
       epilogue_M_major();
 
+    // @op ptx_bar_sync bar_id=1 count=BLOCK_M
     asm volatile("bar.sync 1, %0;" :: "r"(BLOCK_M) : "memory");  // everyone is done with tmem
     if (warp_id == 0)  // deallocate tmem. tmem address should be 0.
+      // @op tcgen05_dealloc tmem=tmem0 cols=BLOCK_N*2 cta_group=1 scope=one_warp
       tcgen05_dealloc(0, BLOCK_N * 2);
 
   }
 }
+
+// @endkernel
 
 
 template <
@@ -358,6 +397,7 @@ template <
   int NUM_STAGES,
   bool DO_PROFILE
 >
+// @kernel name=kernel_v3b
 __global__
 __launch_bounds__(BLOCK_M + 2 * WARP_SIZE)
 void kernel_v3b(
@@ -419,6 +459,9 @@ void kernel_v3b(
 
   if (warp_id == 0 && elect_sync()) {
     // only 1 thread issue
+    // @op mbarrier_init bar=tma_mbar count=1 scope=cta
+    // @op mbarrier_init bar=mma_mbar count=1 scope=cta
+    // @op mbarrier_init bar=mainloop_mbar count=1 scope=cta
     for (int i = 0; i < NUM_STAGES * 2 + 1; i++)
       mbarrier_init(tma_mbar_addr + i * 8, 1);
     asm volatile("fence.mbarrier_init.release.cluster;");  // visible to async proxy
@@ -426,6 +469,7 @@ void kernel_v3b(
   else if (warp_id == 1) {
     // allocate tmem
     // tmem address should be 0, don't bother storing and reading it.
+    // @op tcgen05_alloc tmem=tmem0 cols=BLOCK_N*2 cta_group=1 scope=one_warp
     tcgen05_alloc(smem, BLOCK_N * 2);
   }
   __syncthreads();  // visible to all threads
@@ -456,7 +500,9 @@ void kernel_v3b(
 
       // issue TMA
       const int off_k = iter_k * BLOCK_K;
+      // @op tma_3d_gmem2smem bar=tma_mbar
       tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 256, mbar_addr, cache_A);
+      // @op tma_3d_gmem2smem bar=tma_mbar
       tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 256, mbar_addr, cache_B);
 
       // layout of SFA is [M/128, rest_k, 32, 4, 4]
@@ -464,10 +510,13 @@ void kernel_v3b(
       const int rest_k = K / 16 / 4;
       const char *SFA_src = SFA_ptr + ((off_m / 128) * rest_k + off_k / (16 * 4)) * 512;  // 512 = 32x4x4
       const char *SFB_src = SFB_ptr + ((off_n / 128) * rest_k + off_k / (16 * 4)) * 512;
+      // @op tma_gmem2smem bar=tma_mbar size=SFA_size dst_align=16 src_align=16
       tma_gmem2smem(SFA_smem, SFA_src, SFA_size, mbar_addr, cache_A);
+      // @op tma_gmem2smem bar=tma_mbar size=SFB_size dst_align=16 src_align=16
       tma_gmem2smem(SFB_smem, SFB_src, SFB_size, mbar_addr, cache_B);
 
       // signal TMA done
+      // @op mbarrier_arrive_expect_tx bar=tma_mbar size=STAGE_SIZE
       asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
                   :: "r"(mbar_addr), "r"(STAGE_SIZE) : "memory");
       if constexpr (DO_PROFILE) profiler.stop();
@@ -482,6 +531,7 @@ void kernel_v3b(
       if constexpr (DO_PROFILE) profiler.start(ProfilerTag::WaitMMA);
       const int stage_id = iter_k % NUM_STAGES;
       const int mma_phase = (iter_k / NUM_STAGES - 1) % 2;
+      // @op mbarrier_wait bar=mma_mbar phase=mma_phase
       mbarrier_wait(mma_mbar_addr + stage_id * 8, mma_phase);
       if constexpr (DO_PROFILE) profiler.stop();
 
@@ -503,6 +553,7 @@ void kernel_v3b(
       if constexpr (DO_PROFILE) profiler.start(ProfilerTag::WaitTMA);
       const int stage_id = iter_k % NUM_STAGES;
       const int tma_phase = (iter_k / NUM_STAGES) % 2;
+      // @op mbarrier_wait bar=tma_mbar phase=tma_phase
       mbarrier_wait(tma_mbar_addr + stage_id * 8, tma_phase);
       if constexpr (DO_PROFILE) profiler.stop();
 
@@ -536,7 +587,9 @@ void kernel_v3b(
       for (int k = 0; k < BLOCK_K / MMA_K; k++) {
         uint64_t sfa_desc = SFA_desc + (uint64_t)k * (512ULL >> 4ULL);  // 4 columns, 512 bytes of 128x4 / 32x4x4
         uint64_t sfb_desc = SFB_desc + (uint64_t)k * (512ULL >> 4ULL);
+        // @op tcgen05_cp tmem=tmem0 cta_group=1
         tcgen05_cp_nvfp4(SFA_tmem + k * 4, sfa_desc);
+        // @op tcgen05_cp tmem=tmem0 cta_group=1
         tcgen05_cp_nvfp4(SFB_tmem + k * 4, sfb_desc);
       }
 
@@ -554,15 +607,18 @@ void kernel_v3b(
           const int scale_B_tmem = SFB_tmem + k_sf * 4 + (bid_n % (128 / BLOCK_N)) * (BLOCK_N / 32);
 
           const int enable_input_d = (k1 == 0 && k2 == 0) ? iter_k : 1;
+          // @op tcgen05_mma tmem=tmem0 cta_group=1
           tcgen05_mma_nvfp4(a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d);
         }
 
       // signal MMA done
+      // @op tcgen05_commit bar=mma_mbar cta_group=1
       tcgen05_commit(mma_mbar_addr + stage_id * 8);
       if constexpr (DO_PROFILE) profiler.stop();
     }
 
     // signal mainloop done
+    // @op tcgen05_commit bar=mainloop_mbar cta_group=1
     tcgen05_commit(mainloop_mbar_addr);
   }
   else if (tid < BLOCK_M) {
@@ -570,7 +626,9 @@ void kernel_v3b(
 
     // wait mainloop
     if constexpr (DO_PROFILE) if (elect_sync()) profiler.start(ProfilerTag::WaitMainloop);
+    // @op mbarrier_wait bar=mainloop_mbar phase=0
     mbarrier_wait(mainloop_mbar_addr, 0);
+    // @op tcgen05_fence_after_thread_sync
     tcgen05_fence_after_thread_sync();
     if constexpr (DO_PROFILE) if (elect_sync()) profiler.stop();
 
@@ -580,9 +638,13 @@ void kernel_v3b(
 
       for (int n = 0; n < BLOCK_N / WIDTH; n++) {
         float tmp[WIDTH];  // if WIDTH=128, we are using 128 registers here
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (WIDTH == 128) tcgen05_ld_32x32bx128(tmp, warp_id * 32, n * WIDTH);
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (WIDTH == 64) tcgen05_ld_32x32bx64(tmp, warp_id * 32, n * WIDTH);
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (WIDTH == 32) tcgen05_ld_32x32bx32(tmp, warp_id * 32, n * WIDTH);
+        // @op tcgen05_wait_ld
         tcgen05_wait_ld();
 
         for (int i = 0; i < WIDTH; i++)
@@ -593,9 +655,13 @@ void kernel_v3b(
       // C is N-major
       for (int m = 0; m < 32 / 16; m++) {
         float tmp[BLOCK_N / 2];
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (BLOCK_N == 128) tcgen05_ld_16x256bx16(tmp, warp_id * 32 + m * 16, 0);
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (BLOCK_N == 64) tcgen05_ld_16x256bx8(tmp, warp_id * 32 + m * 16, 0);
+        // @op tcgen05_ld tmem=tmem0 cta_group=1
         if constexpr (BLOCK_N == 32) tcgen05_ld_16x256bx4(tmp, warp_id * 32 + m * 16, 0);
+        // @op tcgen05_wait_ld
         tcgen05_wait_ld();
 
         for (int i = 0; i < BLOCK_N / 8; i++) {
@@ -614,8 +680,10 @@ void kernel_v3b(
     else
       epilogue_M_major();
 
+    // @op ptx_bar_sync bar_id=1 count=BLOCK_M
     asm volatile("bar.sync 1, %0;" :: "r"(BLOCK_M) : "memory");  // everyone is done with tmem
     if (warp_id == 0)  // deallocate tmem. tmem address should be 0.
+      // @op tcgen05_dealloc tmem=tmem0 cols=BLOCK_N*2 cta_group=1 scope=one_warp
       tcgen05_dealloc(0, BLOCK_N * 2);
 
     if constexpr (DO_PROFILE) if (elect_sync()) profiler.stop();
@@ -623,3 +691,5 @@ void kernel_v3b(
 
   if constexpr (DO_PROFILE) if (elect_sync()) profiler.flush();
 }
+
+// @endkernel

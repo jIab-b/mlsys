@@ -8,5 +8,6 @@ from .core import (  # noqa: F401
     MemSpace,
     Node,
     OpContract,
+    SourceLoc,
     Tensor,
 )

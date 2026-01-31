@@ -7,3 +7,8 @@ trace/
 flash_infer_datasets/
 flashinfer_trace/
 comp_subs/
+flashinfer-bench/
+FlashMLA/
+cutlass/
+ThunderKittens/
+ptx_mcp/
