@@ -5,7 +5,7 @@ import sys
 import subprocess
 from pathlib import Path
 
-from app import app, sync_sglang, run_eval, run_ref_test
+from app import app, sync_sglang, run_eval, run_kernel_test
 from format import format_result
 
 EVAL_ROOT = Path(__file__).parent.parent  # eval_suite/
@@ -28,8 +28,75 @@ TASKS = {
 for name, info in REFS.items():
     TASKS[name] = f"definitions/{info['op_type']}/{name}"
 
+CHECK = "\u2705"
+CROSS = "\u274c"
+STOPWATCH = "\u23f1"
+ZAP = "\u26a1"
+SNAIL = "\U0001F40C"
+MICRO = "\u00b5"
+
+
 def _log(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def _format_kernel_result(result: dict, name: str, mode: str) -> None:
+    """Format kernel test/bench result like eval_test."""
+    system = result.get("system", {})
+    gpu = system.get("gpu", "Unknown")
+    returncode = result.get("returncode", -1)
+    success = returncode == 0
+
+    print(f"\"**Modal {CHECK if success else CROSS} {'success' if success else 'failure'}**")
+    print(f"> {CHECK if success else CROSS} {'Benchmark' if mode == 'bench' else 'Test'} {'passed' if success else 'failed'}")
+    print()
+    print("Running on:")
+    print(f"* GPU: `{gpu}`")
+    print(f"* Torch: `{system.get('torch', 'Unknown')}`")
+    print()
+
+    if mode == "bench" and "benchmarks" in result:
+        print("## Benchmarks:")
+        print("```")
+        for bench in result["benchmarks"]:
+            print(f"{bench.get('name', 'unknown')}")
+            mean = bench.get("mean_us", 0)
+            std = bench.get("std_us", 0)
+            best = bench.get("best_us", 0)
+            worst = bench.get("worst_us", 0)
+            print(f" {STOPWATCH} {mean:.1f} \u00b1 {std:.2f} {MICRO}s")
+            print(f" {ZAP} {best:.1f} {MICRO}s {SNAIL} {worst:.1f} {MICRO}s")
+            if bench.get("flashinfer_us"):
+                speedup = bench["flashinfer_us"] / mean if mean > 0 else 0
+                print(f" vs FlashInfer: {bench['flashinfer_us']:.1f} {MICRO}s ({speedup:.2f}x)")
+            print()
+        print("```")
+    elif mode == "test" and "tests" in result:
+        print("## Tests:")
+        print("```")
+        for test in result["tests"]:
+            status = test.get("status", "unknown")
+            print(f"{test.get('name', 'unknown')}")
+            if status == "pass":
+                print(f" {CHECK} pass")
+            else:
+                print(f" {CROSS} {test.get('error', 'failed')}")
+            print()
+        print("```")
+
+    # Show stdout/stderr
+    stdout = result.get("stdout", "")
+    stderr = result.get("stderr", "")
+    if stdout or stderr:
+        print("## Program output:")
+        print("```")
+        if stdout:
+            print(stdout.rstrip())
+        if stderr:
+            print("--- stderr ---")
+            print(stderr.rstrip())
+        print("```")
+    print("\"")
 
 def _strip_eval_subcommand(argv: list[str]) -> list[str]:
     if argv and argv[0] == "eval":
@@ -183,9 +250,14 @@ def main():
         help="List all available tasks and exit",
     )
     parser.add_argument(
-        "--ref-test",
+        "--test",
         action="store_true",
-        help="Run a reference test file directly (tests against FlashInfer)",
+        help="Run kernel test file (correctness check against FlashInfer)",
+    )
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="Run kernel benchmark (timing against FlashInfer)",
     )
     args = parser.parse_args(_strip_eval_subcommand(sys.argv[1:]))
 
@@ -196,30 +268,23 @@ def main():
             print(f"  {name}")
         return
 
-    # Handle --ref-test
-    if args.ref_test:
+    # Handle --test or --bench
+    if args.test or args.bench:
         if not args.submission:
-            parser.error("submission (reference file) is required for --ref-test")
-        ref_file = Path(args.submission)
-        if not ref_file.exists():
-            ref_file = PROJECT_ROOT / args.submission
-        if not ref_file.exists():
-            raise FileNotFoundError(f"Reference file not found: {args.submission}")
+            parser.error("submission file is required for --test/--bench")
+        kernel_file = Path(args.submission)
+        if not kernel_file.exists():
+            kernel_file = PROJECT_ROOT / args.submission
+        if not kernel_file.exists():
+            raise FileNotFoundError(f"Kernel file not found: {args.submission}")
 
-        _log(f"Running reference test {ref_file.name} on Modal...")
-        ref_code = ref_file.read_text()
+        mode = "bench" if args.bench else "test"
+        _log(f"Running kernel {mode} {kernel_file.name} on Modal...")
+        kernel_code = kernel_file.read_text()
         with app.run():
-            result = run_ref_test.remote(ref_code, ref_file.stem)
+            result = run_kernel_test.remote(kernel_code, kernel_file.stem, mode)
 
-        print(f"\n{'='*60}")
-        print(f"Reference test: {ref_file.stem}")
-        print(f"GPU: {result.get('system', {}).get('gpu', 'Unknown')}")
-        print(f"Return code: {result.get('returncode', 'Unknown')}")
-        print(f"{'='*60}")
-        print(result.get("stdout", ""))
-        if result.get("stderr"):
-            print("--- stderr ---")
-            print(result.get("stderr", ""))
+        _format_kernel_result(result, kernel_file.stem, mode)
         return
 
     # Handle sync-only mode (no GPU needed)

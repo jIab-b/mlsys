@@ -369,30 +369,186 @@ def run_eval(
     gpu=_gpu_type(),
     timeout=600,
 )
-def run_ref_test(ref_code: str, ref_name: str) -> dict:
-    """Run a reference test file directly (calls main() or test_correctness())."""
-    import sys
+def run_kernel_test(kernel_code: str, kernel_name: str, mode: str = "test") -> dict:
+    """Run a kernel file for testing or benchmarking against FlashInfer.
 
-    work = Path("/tmp/ref_test")
+    mode: "test" runs test_correctness(), "bench" runs benchmark()
+    """
+    import sys
+    import importlib.util
+    import time
+    import torch
+
+    work = Path("/tmp/kernel_test")
     work.mkdir(parents=True, exist_ok=True)
 
-    ref_file = work / f"{ref_name}.py"
-    ref_file.write_text(ref_code)
+    kernel_file = work / f"{kernel_name}.py"
+    kernel_file.write_text(kernel_code)
 
-    proc = subprocess.Popen(
-        [sys.executable, str(ref_file)],
-        cwd=str(work),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    stdout, stderr = proc.communicate()
+    # Load the module
+    spec = importlib.util.spec_from_file_location(kernel_name, kernel_file)
+    module = importlib.util.module_from_spec(spec)
 
-    return {
-        "stdout": stdout.decode(errors="replace"),
-        "stderr": stderr.decode(errors="replace"),
-        "returncode": proc.returncode,
+    result = {
         "system": _system_info(),
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
     }
+
+    try:
+        spec.loader.exec_module(module)
+
+        if mode == "bench":
+            # Run benchmark
+            import inspect
+            benchmarks = []
+            generate_fn = getattr(module, "generate_random_inputs", None)
+            run_fn = getattr(module, "run", None)
+
+            if not generate_fn or not run_fn:
+                result["returncode"] = 1
+                result["stderr"] = "Missing generate_random_inputs() or run() function"
+                return result
+
+            # Auto-detect required params from generate_random_inputs signature
+            sig = inspect.signature(generate_fn)
+            params = list(sig.parameters.keys())
+
+            # Build configs based on what params are needed
+            if "max_seq_len" in params:
+                # Attention-style kernel (MLA, GQA, etc.)
+                configs = [
+                    {"batch_size": 1, "max_seq_len": 64, "name": "batch=1,seq=64"},
+                    {"batch_size": 8, "max_seq_len": 128, "name": "batch=8,seq=128"},
+                    {"batch_size": 32, "max_seq_len": 256, "name": "batch=32,seq=256"},
+                ]
+            elif "with_residual" in params:
+                # RMSNorm-style kernel
+                configs = [
+                    {"batch_size": 1, "name": "batch=1"},
+                    {"batch_size": 8, "name": "batch=8"},
+                    {"batch_size": 32, "name": "batch=32"},
+                ]
+            else:
+                # Generic fallback
+                configs = [
+                    {"batch_size": 1, "name": "batch=1"},
+                    {"batch_size": 8, "name": "batch=8"},
+                    {"batch_size": 32, "name": "batch=32"},
+                ]
+
+            # Get run() signature to filter inputs
+            run_sig = inspect.signature(run_fn)
+            run_params = set(run_sig.parameters.keys())
+
+            for cfg in configs:
+                try:
+                    # Only pass params that generate_fn accepts
+                    valid_cfg = {k: v for k, v in cfg.items() if k in params}
+                    inputs = generate_fn(**valid_cfg)
+
+                    # Filter inputs to only what run() accepts
+                    if isinstance(inputs, dict):
+                        run_inputs = {k: v for k, v in inputs.items() if k in run_params}
+                    else:
+                        run_inputs = inputs
+
+                    # Warmup
+                    for _ in range(10):
+                        if isinstance(run_inputs, dict):
+                            run_fn(**run_inputs)
+                        else:
+                            run_fn(*run_inputs)
+                    torch.cuda.synchronize()
+
+                    # Benchmark
+                    times = []
+                    for _ in range(100):
+                        torch.cuda.synchronize()
+                        start = time.perf_counter()
+                        if isinstance(run_inputs, dict):
+                            run_fn(**run_inputs)
+                        else:
+                            run_fn(*run_inputs)
+                        torch.cuda.synchronize()
+                        times.append((time.perf_counter() - start) * 1e6)
+
+                    import statistics
+                    benchmarks.append({
+                        "name": cfg["name"],
+                        "mean_us": statistics.mean(times),
+                        "std_us": statistics.stdev(times) if len(times) > 1 else 0,
+                        "best_us": min(times),
+                        "worst_us": max(times),
+                    })
+                except Exception as e:
+                    benchmarks.append({
+                        "name": cfg["name"],
+                        "error": str(e),
+                    })
+
+            result["benchmarks"] = benchmarks
+
+        else:  # mode == "test"
+            # Run test_correctness or main
+            test_fn = getattr(module, "test_correctness", None)
+            main_fn = getattr(module, "main", None)
+
+            tests = []
+            if test_fn:
+                # Run single test
+                try:
+                    passed = test_fn()
+                    tests.append({
+                        "name": "test_correctness",
+                        "status": "pass" if passed else "fail",
+                    })
+                except Exception as e:
+                    tests.append({
+                        "name": "test_correctness",
+                        "status": "fail",
+                        "error": str(e),
+                    })
+                    result["returncode"] = 1
+            elif main_fn:
+                # Run main and capture output
+                import io
+                import contextlib
+
+                stdout_capture = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(stdout_capture):
+                        main_fn()
+                    result["stdout"] = stdout_capture.getvalue()
+                    # Parse output for pass/fail
+                    output = result["stdout"]
+                    if "All tests passed" in output or "PASSED" in output:
+                        tests.append({"name": "main", "status": "pass"})
+                    elif "FAILED" in output or "failed" in output.lower():
+                        tests.append({"name": "main", "status": "fail"})
+                        result["returncode"] = 1
+                    else:
+                        tests.append({"name": "main", "status": "pass"})
+                except Exception as e:
+                    tests.append({
+                        "name": "main",
+                        "status": "fail",
+                        "error": str(e),
+                    })
+                    result["returncode"] = 1
+            else:
+                result["returncode"] = 1
+                result["stderr"] = "No test_correctness() or main() function found"
+
+            result["tests"] = tests
+
+    except Exception as e:
+        import traceback
+        result["returncode"] = 1
+        result["stderr"] = traceback.format_exc()
+
+    return result
 
 
 # --- Shell helpers ---

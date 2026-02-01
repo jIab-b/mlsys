@@ -388,6 +388,23 @@ GRAPH_SMEM_LIMIT_BYTES = 227 * 1024 - 1024
 GRAPH_TMEM_MAX_COLS = 512
 CTA_MASK_BITS = 16
 
+# tcgen05 descriptor / shape constraints (from PTX ISA docs).
+TCGEN05_SWIZZLE_VALID = {"none", "32b", "64b", "128b", "128b32a"}
+TCGEN05_SWIZZLE_ALIGN_BYTES = {"32b": 256, "64b": 512, "128b": 1024, "128b32a": 1024}
+TCGEN05_NUM_VALUES = {1, 2, 4, 8, 16, 32, 64, 128}
+TCGEN05_LD_SHAPES = {"16x64b", "16x128b", "16x256b", "32x32b", "16x32bx2"}
+TCGEN05_CP_SHAPE_TILE = {
+    ("32x128b", "warpx4"),
+    ("128x128b", None),
+    ("128x256b", None),
+}
+TCGEN05_MMA_SHAPES = {
+    "mxf4nvf4.block16",
+    "f16.ss",
+    "f16.ts",
+    "ws.f16.ts",
+}
+
 # Descriptor validation: baseline LUT for known-good (sbo, lbo) pairs.
 # Key: (op, shape, tile, swizzle, major). None is a wildcard.
 TCGEN_DESC_SBO_LBO_LUT: Dict[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], set[tuple[int, int]]] = {

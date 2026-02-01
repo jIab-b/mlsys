@@ -11,6 +11,12 @@ from static_validator import (
     GRAPH_TMEM_MAX_COLS,
     ISSUE_SCOPES,
     OP_ARG_SPECS,
+    TCGEN05_CP_SHAPE_TILE,
+    TCGEN05_LD_SHAPES,
+    TCGEN05_MMA_SHAPES,
+    TCGEN05_NUM_VALUES,
+    TCGEN05_SWIZZLE_ALIGN_BYTES,
+    TCGEN05_SWIZZLE_VALID,
     TCGEN_DESC_SBO_LBO_LUT,
     _canonical_op_name,
     _resolve_contract,
@@ -30,6 +36,8 @@ class ValidationState:
     cluster_sync_done: Optional[bool] = None
     cluster_ctas: Optional[int] = None
     pending_ld: Optional[bool] = False
+    pending_st: Optional[bool] = False
+    pending_tcgen_commit: Optional[bool] = False
     cta_group: Optional[int] = None
     last_alloc_cols: Optional[int] = None
 
@@ -151,6 +159,8 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
         v = v.replace("swizzle", "").replace("_", "").replace("-", "")
         if v in {"none", "noswizzle", "0"}:
             return "none"
+        if "128" in v and ("32a" in v or "atomic" in v):
+            return "128b32a"
         if v in {"32b", "32"}:
             return "32b"
         if v in {"64b", "64"}:
@@ -198,6 +208,10 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
                 raise ValueError(f"{op_name}: descriptor '{desc_name}' buffer '{buf_name}' not in smem")
             buf_swizzle = _norm_swizzle(buf.meta.get("swizzle"))
             desc_swizzle = _norm_swizzle(desc.meta.get("swizzle"))
+            if desc_swizzle and desc_swizzle not in TCGEN05_SWIZZLE_VALID:
+                raise ValueError(f"{op_name}: descriptor '{desc_name}' swizzle {desc_swizzle} invalid")
+            if buf_swizzle and buf_swizzle not in TCGEN05_SWIZZLE_VALID:
+                raise ValueError(f"{op_name}: buffer '{buf_name}' swizzle {buf_swizzle} invalid")
             if desc_swizzle and buf_swizzle and desc_swizzle != buf_swizzle:
                 raise ValueError(
                     f"{op_name}: descriptor '{desc_name}' swizzle {desc_swizzle} != buffer '{buf_name}' swizzle {buf_swizzle}"
@@ -208,6 +222,16 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
                 raise ValueError(
                     f"{op_name}: descriptor '{desc_name}' major {desc_major} != buffer '{buf_name}' major {buf_major}"
                 )
+            effective_swizzle = desc_swizzle or buf_swizzle
+            if effective_swizzle in TCGEN05_SWIZZLE_ALIGN_BYTES:
+                sbo = desc.meta.get("sbo")
+                if isinstance(sbo, int):
+                    align = TCGEN05_SWIZZLE_ALIGN_BYTES[effective_swizzle]
+                    if sbo % align != 0:
+                        # PTX ISA: swizzle pattern start alignment depends on swizzle mode.
+                        raise ValueError(
+                            f"{op_name}: descriptor '{desc_name}' sbo {sbo} not aligned to {align} bytes for swizzle {effective_swizzle}"
+                        )
         for key in ("sbo", "lbo", "stride", "leading"):
             if key not in desc.meta:
                 continue
@@ -221,6 +245,12 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
                     raise ValueError(f"{op_name}: descriptor '{desc_name}' {key}={val} out of 14-bit range")
 
     if canonical == "tcgen05_cp":
+        shape = op_args.get("shape")
+        tile = op_args.get("tile")
+        if isinstance(shape, str):
+            if (shape, tile) not in TCGEN05_CP_SHAPE_TILE:
+                raise ValueError(f"{op_name}: shape/tile {(shape, tile)} not in {sorted(TCGEN05_CP_SHAPE_TILE)}")
+        state.pending_tcgen_commit = True
         desc_name = op_args.get("desc")
         if desc_name is not None:
             desc = g.descriptors.get(str(desc_name))
@@ -239,6 +269,10 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
             if buf_name not in g.buffers:
                 raise ValueError(f"{op_name}: unknown smem_buf '{buf_name}'")
     if canonical == "tcgen05_mma":
+        shape = op_args.get("shape")
+        if isinstance(shape, str) and shape not in TCGEN05_MMA_SHAPES:
+            raise ValueError(f"{op_name}: shape {shape} not in {sorted(TCGEN05_MMA_SHAPES)}")
+        state.pending_tcgen_commit = True
         desc_a = op_args.get("desc_a")
         desc_b = op_args.get("desc_b")
         if desc_a is not None:
@@ -328,7 +362,21 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
             raise ValueError(f"{op_name}: size {size} must be multiple of 16")
 
     if canonical == "tcgen05_ld":
+        shape = op_args.get("shape")
+        num = op_args.get("num")
+        if isinstance(shape, str) and shape not in TCGEN05_LD_SHAPES:
+            raise ValueError(f"{op_name}: shape {shape} not in {sorted(TCGEN05_LD_SHAPES)}")
+        if isinstance(num, int) and num not in TCGEN05_NUM_VALUES:
+            raise ValueError(f"{op_name}: num {num} not in {sorted(TCGEN05_NUM_VALUES)}")
         state.pending_ld = True
+    if canonical == "tcgen05_st":
+        shape = op_args.get("shape")
+        num = op_args.get("num")
+        if isinstance(shape, str) and shape not in TCGEN05_LD_SHAPES:
+            raise ValueError(f"{op_name}: shape {shape} not in {sorted(TCGEN05_LD_SHAPES)}")
+        if isinstance(num, int) and num not in TCGEN05_NUM_VALUES:
+            raise ValueError(f"{op_name}: num {num} not in {sorted(TCGEN05_NUM_VALUES)}")
+        state.pending_st = True
     if canonical == "tcgen05_wait_ld":
         if state.pending_ld is False:
             raise ValueError(f"{op_name}: wait_ld without prior ld")
@@ -336,6 +384,21 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
             state.pending_ld = False
         else:
             state.pending_ld = None
+    if canonical == "tcgen05_wait_st":
+        if state.pending_st is False:
+            raise ValueError(f"{op_name}: wait_st without prior st")
+        if state.pending_st is True:
+            state.pending_st = False
+        else:
+            state.pending_st = None
+    if canonical == "tcgen05_wait":
+        if state.pending_ld is False and state.pending_st is False:
+            raise ValueError(f"{op_name}: wait without prior ld/st")
+        state.pending_ld = False if state.pending_ld is True else state.pending_ld
+        state.pending_st = False if state.pending_st is True else state.pending_st
+    if canonical in ("tcgen05_commit", "tcgen05_commit_mcast"):
+        if state.pending_tcgen_commit is False:
+            raise ValueError(f"{op_name}: commit without prior tcgen05 cp/mma")
 
     if canonical == "mbarrier_fence_init_release":
         state.cluster_init_fenced = True
@@ -455,6 +518,8 @@ def _clone_state(state: ValidationState) -> ValidationState:
         cluster_sync_done=state.cluster_sync_done,
         cluster_ctas=state.cluster_ctas,
         pending_ld=state.pending_ld,
+        pending_st=state.pending_st,
+        pending_tcgen_commit=state.pending_tcgen_commit,
         cta_group=state.cta_group,
         last_alloc_cols=state.last_alloc_cols,
     )
@@ -484,6 +549,8 @@ def _merge_states(a: ValidationState, b: ValidationState) -> ValidationState:
         cluster_sync_done=_merge_optional(a.cluster_sync_done, b.cluster_sync_done),
         cluster_ctas=_merge_optional(a.cluster_ctas, b.cluster_ctas),
         pending_ld=_merge_optional(a.pending_ld, b.pending_ld),
+        pending_st=_merge_optional(a.pending_st, b.pending_st),
+        pending_tcgen_commit=_merge_optional(a.pending_tcgen_commit, b.pending_tcgen_commit),
         cta_group=_merge_optional(a.cta_group, b.cta_group),
         last_alloc_cols=_merge_optional(a.last_alloc_cols, b.last_alloc_cols),
     )
@@ -503,6 +570,8 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
             state.cluster_sync_done = False
             state.cluster_ctas = None
             state.pending_ld = False
+            state.pending_st = False
+            state.pending_tcgen_commit = False
             state.cta_group = None
             state.last_alloc_cols = None
             smem_static = node.args.get("smem_bytes") or node.args.get("smem_static")
@@ -533,6 +602,8 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
                     raise ValueError(f"Kernel end: buffer {buf} not deallocated ({st})")
             if state.pending_ld is True:
                 raise ValueError("Kernel end: pending tcgen05.ld without wait_ld")
+            if state.pending_st is True:
+                raise ValueError("Kernel end: pending tcgen05.st without wait_st")
             continue
 
         if node.kind == "Block":
@@ -564,6 +635,8 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
             state.cluster_init_fenced = merged.cluster_init_fenced
             state.cluster_sync_done = merged.cluster_sync_done
             state.pending_ld = merged.pending_ld
+            state.pending_st = merged.pending_st
+            state.pending_tcgen_commit = merged.pending_tcgen_commit
             state.cta_group = merged.cta_group
             state.last_alloc_cols = merged.last_alloc_cols
             continue
