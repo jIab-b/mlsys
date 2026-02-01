@@ -19,6 +19,7 @@ def _format_node(node: Node, indent: int = 0) -> List[str]:
         op = node.args.get("op", "")
         base = node.meta.get("base")
         op_args = node.args.get("op_args", {})
+        node_type = node.__class__.__name__
         detail_bits = []
         if isinstance(op_args, dict):
             if "shape" in op_args:
@@ -26,10 +27,11 @@ def _format_node(node: Node, indent: int = 0) -> List[str]:
             if "num" in op_args:
                 detail_bits.append(f"num={op_args['num']}")
         detail = f" {' '.join(detail_bits)}" if detail_bits else ""
+        type_detail = f" type={node_type}" if node_type not in {"OpNode"} else ""
         if base and base != op:
-            lines = [f"{pad}Op({op} -> {base}){detail}"]
+            lines = [f"{pad}Op({op} -> {base}){detail}{type_detail}"]
         else:
-            lines = [f"{pad}Op({op}){detail}"]
+            lines = [f"{pad}Op({op}){detail}{type_detail}"]
     elif node.kind == "KernelStart":
         name = node.args.get("name", "")
         lines = [f"{pad}KernelStart({name})"]

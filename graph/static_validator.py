@@ -388,6 +388,13 @@ GRAPH_SMEM_LIMIT_BYTES = 227 * 1024 - 1024
 GRAPH_TMEM_MAX_COLS = 512
 CTA_MASK_BITS = 16
 
+# Descriptor validation: baseline LUT for known-good (sbo, lbo) pairs.
+# Key: (op, shape, tile, swizzle, major). None is a wildcard.
+TCGEN_DESC_SBO_LBO_LUT: Dict[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], set[tuple[int, int]]] = {
+    ("tcgen05_cp", "32x128b", "warpx4", "none", "K"): {(128, 1)},
+    ("tcgen05_mma", "mxf4nvf4.block16", None, "128b", "K"): {(1024, 1)},
+}
+
 
 def _canonical_op_name(kind: str) -> str:
     if kind in OP_ALIASES:

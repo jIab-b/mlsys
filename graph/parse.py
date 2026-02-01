@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from constants import LOAD_INLINE_MARKER
 from graph.core import Graph, MemSpace, Node, SourceLoc
 from graph.nodes.op import OpNode
-from ops.tcgen05 import select_tcgen_op
-from specs import GRAPH_TMEM_MAX_COLS, _canonical_op_name, _infer_op_metadata
+from ops import select_op
+from static_validator import GRAPH_TMEM_MAX_COLS, _canonical_op_name, _infer_op_metadata
 
 _ANNOT_RE = re.compile(r"^\s*(?://|#)\s*@(?P<kind>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<body>.*)$")
 _CHUNK_ASSIGN_RE = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?P<prefix>[rR])?(?P<quote>\"\"\"|''')\s*$")
@@ -21,6 +21,9 @@ def _parse_value(raw: str) -> Any:
     lowered = raw.lower()
     if lowered in {"true", "false"}:
         return lowered == "true"
+    mul = re.fullmatch(r"(-?\d+)\s*\*\s*(-?\d+)", raw)
+    if mul:
+        return int(mul.group(1)) * int(mul.group(2))
     if re.fullmatch(r"0x[0-9a-fA-F]+", raw):
         return int(raw, 16)
     if re.fullmatch(r"-?\d+", raw):
@@ -186,6 +189,11 @@ def _split_with_annotations(
                     raise ValueError(f"{filename}:{idx}: @op continuation cannot introduce 'when'")
                 pending_op.args.setdefault("op_args", {}).update(extra_args)
                 _infer_op_metadata(str(pending_op.args.get("op", "")), pending_op.args.get("op_args", {}))
+                op_name = str(pending_op.args.get("op", ""))
+                op_args = pending_op.args.get("op_args", {})
+                op_cls = select_op(op_name, op_args)
+                if op_cls is not None and not isinstance(pending_op, op_cls):
+                    pending_op.__class__ = op_cls
                 pending_op = None
             else:
                 op_name = tokens[0]
@@ -194,9 +202,9 @@ def _split_with_annotations(
                     op_args["_loops"] = [dict(entry) for entry in loop_stack]
                 when_cond = op_args.pop("when", None)
                 _infer_op_metadata(op_name, op_args)
-                tcgen_cls = select_tcgen_op(op_name, op_args)
-                if tcgen_cls is not None:
-                    op_node = tcgen_cls(op=op_name, args=op_args, loc=loc)
+                op_cls = select_op(op_name, op_args)
+                if op_cls is not None:
+                    op_node = op_cls(op=op_name, args=op_args, loc=loc)
                 else:
                     op_node = OpNode(op=op_name, args=op_args, loc=loc)
                 op_node.meta["base"] = _canonical_op_name(op_name)

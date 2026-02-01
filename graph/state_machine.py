@@ -4,13 +4,14 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from graph.core import BarrierState, BufferState, Graph, MemSpace, Node, SourceLoc
-from specs import (
+from static_validator import (
     BARRIER_SCOPES,
     CTA_MASK_BITS,
     GRAPH_SMEM_LIMIT_BYTES,
     GRAPH_TMEM_MAX_COLS,
     ISSUE_SCOPES,
     OP_ARG_SPECS,
+    TCGEN_DESC_SBO_LBO_LUT,
     _canonical_op_name,
     _resolve_contract,
 )
@@ -158,6 +159,28 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
             return "128b"
         return v
 
+    def _lookup_desc_lut(
+        op_base: Optional[str],
+        shape: Optional[str],
+        tile: Optional[str],
+        swizzle: Optional[str],
+        major: Optional[str],
+    ) -> Optional[set[tuple[int, int]]]:
+        for key, allowed in TCGEN_DESC_SBO_LBO_LUT.items():
+            k_op, k_shape, k_tile, k_swizzle, k_major = key
+            if k_op is not None and k_op != op_base:
+                continue
+            if k_shape is not None and k_shape != shape:
+                continue
+            if k_tile is not None and k_tile != tile:
+                continue
+            if k_swizzle is not None and k_swizzle != swizzle:
+                continue
+            if k_major is not None and k_major != major:
+                continue
+            return allowed
+        return None
+
     def _validate_desc_ref(desc_name: str, buf_hint: Optional[str] = None) -> None:
         if desc_name not in g.descriptors:
             raise ValueError(f"{op_name}: unknown descriptor '{desc_name}'")
@@ -200,7 +223,17 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
     if canonical == "tcgen05_cp":
         desc_name = op_args.get("desc")
         if desc_name is not None:
+            desc = g.descriptors.get(str(desc_name))
+            swizzle = _norm_swizzle(desc.meta.get("swizzle")) if desc else None
+            major = str(desc.meta.get("major")).upper() if desc and desc.meta.get("major") else None
+            allowed = _lookup_desc_lut("tcgen05_cp", op_args.get("shape"), op_args.get("tile"), swizzle, major)
             _validate_desc_ref(str(desc_name), buf_hint=op_args.get("smem_buf"))
+            if allowed is not None:
+                if not isinstance(desc.meta.get("sbo"), int) or not isinstance(desc.meta.get("lbo"), int):
+                    raise ValueError(f"{op_name}: descriptor '{desc_name}' requires numeric sbo/lbo for LUT check")
+                pair = (int(desc.meta["sbo"]), int(desc.meta["lbo"]))
+                if pair not in allowed:
+                    raise ValueError(f"{op_name}: descriptor '{desc_name}' sbo/lbo {pair} not in LUT {sorted(allowed)}")
         elif "smem_buf" in op_args:
             buf_name = op_args.get("smem_buf")
             if buf_name not in g.buffers:
@@ -209,9 +242,29 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
         desc_a = op_args.get("desc_a")
         desc_b = op_args.get("desc_b")
         if desc_a is not None:
+            desc = g.descriptors.get(str(desc_a))
+            swizzle = _norm_swizzle(desc.meta.get("swizzle")) if desc else None
+            major = str(desc.meta.get("major")).upper() if desc and desc.meta.get("major") else None
+            allowed = _lookup_desc_lut("tcgen05_mma", op_args.get("shape"), op_args.get("tile"), swizzle, major)
             _validate_desc_ref(str(desc_a))
+            if allowed is not None:
+                if not isinstance(desc.meta.get("sbo"), int) or not isinstance(desc.meta.get("lbo"), int):
+                    raise ValueError(f"{op_name}: descriptor '{desc_a}' requires numeric sbo/lbo for LUT check")
+                pair = (int(desc.meta["sbo"]), int(desc.meta["lbo"]))
+                if pair not in allowed:
+                    raise ValueError(f"{op_name}: descriptor '{desc_a}' sbo/lbo {pair} not in LUT {sorted(allowed)}")
         if desc_b is not None:
+            desc = g.descriptors.get(str(desc_b))
+            swizzle = _norm_swizzle(desc.meta.get("swizzle")) if desc else None
+            major = str(desc.meta.get("major")).upper() if desc and desc.meta.get("major") else None
+            allowed = _lookup_desc_lut("tcgen05_mma", op_args.get("shape"), op_args.get("tile"), swizzle, major)
             _validate_desc_ref(str(desc_b))
+            if allowed is not None:
+                if not isinstance(desc.meta.get("sbo"), int) or not isinstance(desc.meta.get("lbo"), int):
+                    raise ValueError(f"{op_name}: descriptor '{desc_b}' requires numeric sbo/lbo for LUT check")
+                pair = (int(desc.meta["sbo"]), int(desc.meta["lbo"]))
+                if pair not in allowed:
+                    raise ValueError(f"{op_name}: descriptor '{desc_b}' sbo/lbo {pair} not in LUT {sorted(allowed)}")
 
     if canonical == "tma_gmem2smem":
         size = op_args.get("size")
