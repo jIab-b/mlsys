@@ -390,13 +390,13 @@ DEVICE_010 = r"""
       for (int n = 0; n < BLOCK_N / WIDTH; n++) {
         float tmp[WIDTH];  // if WIDTH=128, we are using 128 registers here
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==128
-        // @op shape=32x32b num=128
+        // @op shape=32x32b num=128 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 128) tcgen05_ld_32x32bx128(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==64
-        // @op shape=32x32b num=64
+        // @op shape=32x32b num=64 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 64) tcgen05_ld_32x32bx64(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==32
-        // @op shape=32x32b num=32
+        // @op shape=32x32b num=32 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 32) tcgen05_ld_32x32bx32(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_wait_ld
         // @op
@@ -420,13 +420,13 @@ DEVICE_010 = r"""
       for (int m = 0; m < 32 / 16; m++) {
         float tmp[BLOCK_N / 2];
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==128
-        // @op shape=16x256b num=16
+        // @op shape=16x256b num=16 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 128) tcgen05_ld_16x256bx16(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==64
-        // @op shape=16x256b num=8
+        // @op shape=16x256b num=8 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 64) tcgen05_ld_16x256bx8(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==32
-        // @op shape=16x256b num=4
+        // @op shape=16x256b num=4 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 32) tcgen05_ld_16x256bx4(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_wait_ld
         // @op
@@ -771,13 +771,13 @@ DEVICE_015 = r"""
       for (int n = 0; n < BLOCK_N / WIDTH; n++) {
         float tmp[WIDTH];  // if WIDTH=128, we are using 128 registers here
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==128
-        // @op shape=32x32b num=128
+        // @op shape=32x32b num=128 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 128) tcgen05_ld_32x32bx128(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==64
-        // @op shape=32x32b num=64
+        // @op shape=32x32b num=64 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 64) tcgen05_ld_32x32bx64(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==32
-        // @op shape=32x32b num=32
+        // @op shape=32x32b num=32 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 32) tcgen05_ld_32x32bx32(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_wait_ld
         // @op
@@ -792,13 +792,13 @@ DEVICE_015 = r"""
       for (int m = 0; m < 32 / 16; m++) {
         float tmp[BLOCK_N / 2];
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==128
-        // @op shape=16x256b num=16
+        // @op shape=16x256b num=16 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 128) tcgen05_ld_16x256bx16(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==64
-        // @op shape=16x256b num=8
+        // @op shape=16x256b num=8 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 64) tcgen05_ld_16x256bx8(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==32
-        // @op shape=16x256b num=4
+        // @op shape=16x256b num=4 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 32) tcgen05_ld_16x256bx4(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_wait_ld
         // @op

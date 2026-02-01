@@ -1012,13 +1012,13 @@ void kernel_v4(
       for (int n = 0; n < BLOCK_N / WIDTH; n++) {
         float tmp[WIDTH];  // if WIDTH=128, we are using 128 registers here
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==128
-        // @op shape=32x32b num=128
+        // @op shape=32x32b num=128 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 128) tcgen05_ld_32x32bx128(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==64
-        // @op shape=32x32b num=64
+        // @op shape=32x32b num=64 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 64) tcgen05_ld_32x32bx64(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==32
-        // @op shape=32x32b num=32
+        // @op shape=32x32b num=32 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 32) tcgen05_ld_32x32bx32(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_wait_ld
         // @op
@@ -1042,13 +1042,13 @@ void kernel_v4(
       for (int m = 0; m < 32 / 16; m++) {
         float tmp[BLOCK_N / 2];
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==128
-        // @op shape=16x256b num=16
+        // @op shape=16x256b num=16 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 128) tcgen05_ld_16x256bx16(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==64
-        // @op shape=16x256b num=8
+        // @op shape=16x256b num=8 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 64) tcgen05_ld_16x256bx8(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==32
-        // @op shape=16x256b num=4
+        // @op shape=16x256b num=4 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 32) tcgen05_ld_16x256bx4(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_wait_ld
         // @op
@@ -1373,13 +1373,13 @@ void kernel_v3b(
       for (int n = 0; n < BLOCK_N / WIDTH; n++) {
         float tmp[WIDTH];  // if WIDTH=128, we are using 128 registers here
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==128
-        // @op shape=32x32b num=128
+        // @op shape=32x32b num=128 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 128) tcgen05_ld_32x32bx128(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==64
-        // @op shape=32x32b num=64
+        // @op shape=32x32b num=64 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 64) tcgen05_ld_32x32bx64(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==32
-        // @op shape=32x32b num=32
+        // @op shape=32x32b num=32 warp_id=warp_id lane_id=lane_id
         if constexpr (WIDTH == 32) tcgen05_ld_32x32bx32(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_wait_ld
         // @op
@@ -1394,13 +1394,13 @@ void kernel_v3b(
       for (int m = 0; m < 32 / 16; m++) {
         float tmp[BLOCK_N / 2];
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==128
-        // @op shape=16x256b num=16
+        // @op shape=16x256b num=16 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 128) tcgen05_ld_16x256bx16(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==64
-        // @op shape=16x256b num=8
+        // @op shape=16x256b num=8 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 64) tcgen05_ld_16x256bx8(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==32
-        // @op shape=16x256b num=4
+        // @op shape=16x256b num=4 warp_id=warp_id lane_id=lane_id
         if constexpr (BLOCK_N == 32) tcgen05_ld_16x256bx4(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_wait_ld
         // @op
@@ -1517,10 +1517,10 @@ at::Tensor gemm_launch_v4(
 
   CUtensorMap A_tmap, B_tmap;
   // @op cute_tmap name=A_tmap rank=3
-  // @op
+  // @op dtype=16u4_align8b interleave=none swizzle=128b l2=none oob=none global_dim0=256 global_dim1=global_height global_dim2=global_width/256 global_stride0=global_width/2 global_stride1=128 box_dim0=256 box_dim1=shared_height box_dim2=shared_width/256 elem_stride0=1 elem_stride1=1 elem_stride2=1
   init_AB_tmap(&A_tmap, A_ptr, new_M, K, BLOCK_M, BLOCK_K);
   // @op cute_tmap name=B_tmap rank=3
-  // @op
+  // @op dtype=16u4_align8b interleave=none swizzle=128b l2=none oob=none global_dim0=256 global_dim1=global_height global_dim2=global_width/256 global_stride0=global_width/2 global_stride1=128 box_dim0=256 box_dim1=shared_height box_dim2=shared_width/256 elem_stride0=1 elem_stride1=1 elem_stride2=1
   init_AB_tmap(&B_tmap, B_ptr, new_N, K, BLOCK_N, BLOCK_K);
 
   dim3 grid(SPLIT_K, (new_M / BLOCK_M) * (new_N / BLOCK_N));
@@ -1610,10 +1610,10 @@ at::Tensor gemm_launch_v3b(
 
   CUtensorMap A_tmap, B_tmap;
   // @op cute_tmap name=A_tmap rank=3
-  // @op
+  // @op dtype=16u4_align8b interleave=none swizzle=128b l2=none oob=none global_dim0=256 global_dim1=global_height global_dim2=global_width/256 global_stride0=global_width/2 global_stride1=128 box_dim0=256 box_dim1=shared_height box_dim2=shared_width/256 elem_stride0=1 elem_stride1=1 elem_stride2=1
   init_AB_tmap(&A_tmap, A_ptr, new_M, K, BLOCK_M, BLOCK_K);
   // @op cute_tmap name=B_tmap rank=3
-  // @op
+  // @op dtype=16u4_align8b interleave=none swizzle=128b l2=none oob=none global_dim0=256 global_dim1=global_height global_dim2=global_width/256 global_stride0=global_width/2 global_stride1=128 box_dim0=256 box_dim1=shared_height box_dim2=shared_width/256 elem_stride0=1 elem_stride1=1 elem_stride2=1
   init_AB_tmap(&B_tmap, B_ptr, new_N, K, BLOCK_N, BLOCK_K);
 
   int grid = (new_M / BLOCK_M) * (new_N / BLOCK_N);

@@ -38,12 +38,12 @@ CONTRACTS: Dict[str, OpContract] = {
     ),
     "tcgen05_ld": OpContract(
         name="tcgen05_ld",
-        issue_scope="one_thread",
+        issue_scope="one_warp",
         buffer_pre={"tmem": BufferState.FULL},
     ),
     "tcgen05_st": OpContract(
         name="tcgen05_st",
-        issue_scope="one_thread",
+        issue_scope="one_warp",
         buffer_pre={"tmem": BufferState.FULL},
     ),
     "tcgen05_commit": OpContract(
@@ -403,6 +403,31 @@ TCGEN05_MMA_SHAPES = {
     "f16.ss",
     "f16.ts",
     "ws.f16.ts",
+}
+
+# TMA tensor map constraints (CUDA Driver API).
+TMA_INTERLEAVE_SET = {"none", "16b", "32b"}
+TMA_SWIZZLE_SET = {
+    "none",
+    "32b",
+    "64b",
+    "128b",
+    "128b_atom_32b",
+    "128b_atom_32b_flip_8b",
+    "128b_atom_64b",
+}
+TMA_DTYPE_ELEMENT_SIZE_BYTES = {
+    "16u4_align8b": 0.5,
+    "16u4_align16b": 0.5,
+    "16u6_align16b": 0.75,
+    "bf16": 2.0,
+    "f16": 2.0,
+    "f32": 4.0,
+}
+TMA_DTYPE_STRIDE32 = {"16u4_align16b", "16u6_align16b"}
+TMA_DTYPE_SWIZZLE_ALLOWED = {
+    "16u6_align16b": {"none", "128b", "128b_atom_32b", "128b_atom_64b"},
+    "16u4_align16b": {"none", "128b", "128b_atom_32b"},
 }
 
 # Descriptor validation: baseline LUT for known-good (sbo, lbo) pairs.

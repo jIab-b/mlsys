@@ -91,10 +91,10 @@ at::Tensor gemm_launch_v4(
 
   CUtensorMap A_tmap, B_tmap;
   // @op cute_tmap name=A_tmap rank=3
-  // @op
+  // @op dtype=16u4_align8b interleave=none swizzle=128b l2=none oob=none global_dim0=256 global_dim1=global_height global_dim2=global_width/256 global_stride0=global_width/2 global_stride1=128 box_dim0=256 box_dim1=shared_height box_dim2=shared_width/256 elem_stride0=1 elem_stride1=1 elem_stride2=1
   init_AB_tmap(&A_tmap, A_ptr, new_M, K, BLOCK_M, BLOCK_K);
   // @op cute_tmap name=B_tmap rank=3
-  // @op
+  // @op dtype=16u4_align8b interleave=none swizzle=128b l2=none oob=none global_dim0=256 global_dim1=global_height global_dim2=global_width/256 global_stride0=global_width/2 global_stride1=128 box_dim0=256 box_dim1=shared_height box_dim2=shared_width/256 elem_stride0=1 elem_stride1=1 elem_stride2=1
   init_AB_tmap(&B_tmap, B_ptr, new_N, K, BLOCK_N, BLOCK_K);
 
   dim3 grid(SPLIT_K, (new_M / BLOCK_M) * (new_N / BLOCK_N));
@@ -196,10 +196,10 @@ at::Tensor gemm_launch_v3b(
 
   CUtensorMap A_tmap, B_tmap;
   // @op cute_tmap name=A_tmap rank=3
-  // @op
+  // @op dtype=16u4_align8b interleave=none swizzle=128b l2=none oob=none global_dim0=256 global_dim1=global_height global_dim2=global_width/256 global_stride0=global_width/2 global_stride1=128 box_dim0=256 box_dim1=shared_height box_dim2=shared_width/256 elem_stride0=1 elem_stride1=1 elem_stride2=1
   init_AB_tmap(&A_tmap, A_ptr, new_M, K, BLOCK_M, BLOCK_K);
   // @op cute_tmap name=B_tmap rank=3
-  // @op
+  // @op dtype=16u4_align8b interleave=none swizzle=128b l2=none oob=none global_dim0=256 global_dim1=global_height global_dim2=global_width/256 global_stride0=global_width/2 global_stride1=128 box_dim0=256 box_dim1=shared_height box_dim2=shared_width/256 elem_stride0=1 elem_stride1=1 elem_stride2=1
   init_AB_tmap(&B_tmap, B_ptr, new_N, K, BLOCK_N, BLOCK_K);
 
   int grid = (new_M / BLOCK_M) * (new_N / BLOCK_N);
