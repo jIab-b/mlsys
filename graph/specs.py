@@ -1,0 +1,431 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+from graph.core import BarrierState, BufferState, OpContract
+
+ROOT = Path(__file__).resolve().parent
+REPO_ROOT = ROOT.parent
+PTX_LIB = REPO_ROOT / "ptx_lib"
+
+
+# tcgen op contracts only (everything else must be Raw)
+CONTRACTS: Dict[str, OpContract] = {
+    # tcgen05 core
+    "tcgen05_alloc": OpContract(
+        name="tcgen05_alloc",
+        issue_scope="one_warp",
+        buffer_pre={"tmem": BufferState.EMPTY},
+        buffer_post={"tmem": BufferState.FULL},
+    ),
+    "tcgen05_dealloc": OpContract(
+        name="tcgen05_dealloc",
+        issue_scope="one_warp",
+        buffer_pre={"tmem": BufferState.FULL},
+        buffer_post={"tmem": BufferState.EMPTY},
+    ),
+    "tcgen05_cp": OpContract(
+        name="tcgen05_cp",
+        issue_scope="one_thread",
+        buffer_pre={"tmem": BufferState.FULL},
+    ),
+    "tcgen05_mma": OpContract(
+        name="tcgen05_mma",
+        issue_scope="one_thread",
+        buffer_pre={"tmem": BufferState.FULL},
+    ),
+    "tcgen05_ld": OpContract(
+        name="tcgen05_ld",
+        issue_scope="one_thread",
+        buffer_pre={"tmem": BufferState.FULL},
+    ),
+    "tcgen05_st": OpContract(
+        name="tcgen05_st",
+        issue_scope="one_thread",
+        buffer_pre={"tmem": BufferState.FULL},
+    ),
+    "tcgen05_commit": OpContract(
+        name="tcgen05_commit",
+        issue_scope="one_thread",
+    ),
+    "tcgen05_commit_mcast": OpContract(
+        name="tcgen05_commit_mcast",
+        issue_scope="one_thread",
+    ),
+    "tcgen05_wait": OpContract(
+        name="tcgen05_wait",
+        issue_scope="one_thread",
+    ),
+    "tcgen05_wait_ld": OpContract(
+        name="tcgen05_wait_ld",
+        issue_scope="one_thread",
+    ),
+    "tcgen05_wait_st": OpContract(
+        name="tcgen05_wait_st",
+        issue_scope="one_thread",
+    ),
+    "tcgen05_fence": OpContract(
+        name="tcgen05_fence",
+        issue_scope="one_thread",
+    ),
+    "tcgen05_fence_before_thread_sync": OpContract(
+        name="tcgen05_fence_before_thread_sync",
+        issue_scope="one_thread",
+    ),
+    "tcgen05_fence_after_thread_sync": OpContract(
+        name="tcgen05_fence_after_thread_sync",
+        issue_scope="one_thread",
+    ),
+    # mbarrier
+    "mbarrier_init": OpContract(name="mbarrier_init", issue_scope="one_thread"),
+    "mbarrier_arrive_expect_tx": OpContract(name="mbarrier_arrive_expect_tx", issue_scope="one_thread"),
+    "mbarrier_arrive_expect_tx_cta": OpContract(name="mbarrier_arrive_expect_tx_cta", issue_scope="one_thread"),
+    "mbarrier_wait": OpContract(name="mbarrier_wait", issue_scope="all_warps"),
+    "mbarrier_wait_ticks": OpContract(name="mbarrier_wait_ticks", issue_scope="all_warps"),
+    "mbarrier_wait_relaxed": OpContract(name="mbarrier_wait_relaxed", issue_scope="all_warps"),
+    "mbarrier_fence_init_release": OpContract(name="mbarrier_fence_init_release", issue_scope="one_thread"),
+    "barrier_cluster_arrive": OpContract(name="barrier_cluster_arrive", issue_scope="all_warps"),
+    "barrier_cluster_wait": OpContract(name="barrier_cluster_wait", issue_scope="all_warps"),
+    # tma / cp.async bulk
+    "tma_gmem2smem": OpContract(name="tma_gmem2smem", issue_scope="one_thread"),
+    "tma_1d_gmem2smem": OpContract(name="tma_1d_gmem2smem", issue_scope="one_thread"),
+    "tma_2d_gmem2smem": OpContract(name="tma_2d_gmem2smem", issue_scope="one_thread"),
+    "tma_3d_gmem2smem": OpContract(name="tma_3d_gmem2smem", issue_scope="one_thread"),
+    "tma_1d_gmem2smem_mcast": OpContract(name="tma_1d_gmem2smem_mcast", issue_scope="one_thread"),
+    "tma_2d_gmem2smem_mcast": OpContract(name="tma_2d_gmem2smem_mcast", issue_scope="one_thread"),
+    "tma_3d_gmem2smem_mcast": OpContract(name="tma_3d_gmem2smem_mcast", issue_scope="one_thread"),
+    "cp_async_bulk_prefetch": OpContract(name="cp_async_bulk_prefetch", issue_scope="one_thread"),
+    "cp_async_bulk_prefetch_1d": OpContract(name="cp_async_bulk_prefetch_1d", issue_scope="one_thread"),
+    "cp_async_bulk_prefetch_2d": OpContract(name="cp_async_bulk_prefetch_2d", issue_scope="one_thread"),
+    "cp_async_bulk_prefetch_3d": OpContract(name="cp_async_bulk_prefetch_3d", issue_scope="one_thread"),
+    # ptx common helpers
+    "ptx_laneid": OpContract(name="ptx_laneid", issue_scope="one_thread"),
+    "ptx_activemask": OpContract(name="ptx_activemask", issue_scope="one_thread"),
+    "ptx_elect_one_sync": OpContract(name="ptx_elect_one_sync", issue_scope="one_thread"),
+    "ptx_elect_sync": OpContract(name="ptx_elect_sync", issue_scope="one_thread"),
+    "ptx_bar_sync": OpContract(name="ptx_bar_sync", issue_scope="all_warps"),
+    # host-side metadata ops
+    "cute_tmap": OpContract(name="cute_tmap", issue_scope="host"),
+}
+
+TCGEN_PREFIX_CONTRACTS: Tuple[Tuple[str, str], ...] = (
+    ("tcgen05_alloc", "tcgen05_alloc"),
+    ("tcgen05_dealloc", "tcgen05_dealloc"),
+    ("tcgen05_cp", "tcgen05_cp"),
+    ("tcgen05_mma", "tcgen05_mma"),
+    ("tcgen05_ld", "tcgen05_ld"),
+    ("tcgen05_st", "tcgen05_st"),
+    ("tcgen05_commit", "tcgen05_commit"),
+    ("tcgen05_wait", "tcgen05_wait"),
+    ("tcgen05_fence", "tcgen05_fence"),
+    ("mbarrier_", "mbarrier_init"),
+    ("tma_", "tma_1d_gmem2smem"),
+    ("ptx_", "ptx_laneid"),
+    ("barrier_cluster_arrive", "barrier_cluster_arrive"),
+    ("barrier_cluster_wait", "barrier_cluster_wait"),
+)
+
+OP_ALIASES: Dict[str, str] = {
+    "tcgen05_cp_nvfp4": "tcgen05_cp",
+    "tcgen05_mma_nvfp4": "tcgen05_mma",
+    "tcgen05_ld_32x32bx128": "tcgen05_ld",
+    "tcgen05_ld_32x32bx64": "tcgen05_ld",
+    "tcgen05_ld_32x32bx32": "tcgen05_ld",
+    "tcgen05_ld_16x256bx16": "tcgen05_ld",
+    "tcgen05_ld_16x256bx8": "tcgen05_ld",
+    "tcgen05_ld_16x256bx4": "tcgen05_ld",
+    "ptx_bar_sync": "ptx_bar_sync",
+}
+
+
+def _extract_ptx_functions(header_text: str) -> set[str]:
+    names: set[str] = set()
+    for line in header_text.splitlines():
+        if "PTX_DEVICE" not in line and "__device__" not in line:
+            continue
+        m = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def _infer_ptx_base(name: str) -> Optional[str]:
+    if name in CONTRACTS:
+        return name
+    if name.startswith("tcgen05_commit_mcast"):
+        return "tcgen05_commit_mcast"
+    if name.startswith("tcgen05_commit"):
+        return "tcgen05_commit"
+    if name.startswith("tcgen05_wait_ld"):
+        return "tcgen05_wait_ld"
+    if name.startswith("tcgen05_wait_st"):
+        return "tcgen05_wait_st"
+    if name.startswith("tcgen05_wait"):
+        return "tcgen05_wait"
+    if name.startswith("tcgen05_fence_before_thread_sync"):
+        return "tcgen05_fence_before_thread_sync"
+    if name.startswith("tcgen05_fence_after_thread_sync"):
+        return "tcgen05_fence_after_thread_sync"
+    if name.startswith("tcgen05_fence"):
+        return "tcgen05_fence"
+    if name.startswith("tcgen05_alloc"):
+        return "tcgen05_alloc"
+    if name.startswith("tcgen05_dealloc"):
+        return "tcgen05_dealloc"
+    if name.startswith("tcgen05_cp"):
+        return "tcgen05_cp"
+    if name.startswith("tcgen05_mma"):
+        return "tcgen05_mma"
+    if name.startswith("tcgen05_ld"):
+        return "tcgen05_ld"
+    if name.startswith("tcgen05_st"):
+        return "tcgen05_st"
+    if name.startswith("mbarrier_arrive_expect_tx_cta"):
+        return "mbarrier_arrive_expect_tx_cta"
+    if name.startswith("mbarrier_arrive_expect_tx"):
+        return "mbarrier_arrive_expect_tx"
+    if name.startswith("mbarrier_wait_relaxed"):
+        return "mbarrier_wait_relaxed"
+    if name.startswith("mbarrier_wait_ticks"):
+        return "mbarrier_wait_ticks"
+    if name.startswith("mbarrier_wait"):
+        return "mbarrier_wait"
+    if name.startswith("mbarrier_fence_init_release"):
+        return "mbarrier_fence_init_release"
+    if name.startswith("mbarrier_init"):
+        return "mbarrier_init"
+    if name.startswith("barrier_cluster_arrive"):
+        return "barrier_cluster_arrive"
+    if name.startswith("barrier_cluster_wait"):
+        return "barrier_cluster_wait"
+    if name.startswith("tma_"):
+        if name in CONTRACTS:
+            return name
+        if "3d" in name:
+            return "tma_3d_gmem2smem"
+        if "2d" in name:
+            return "tma_2d_gmem2smem"
+        if "1d" in name:
+            return "tma_1d_gmem2smem"
+        return "tma_gmem2smem"
+    if name.startswith("ptx_"):
+        if name in CONTRACTS:
+            return name
+        return "ptx_laneid"
+    return None
+
+
+def _load_ptx_aliases() -> Dict[str, str]:
+    if not PTX_LIB.exists():
+        return {}
+    aliases: Dict[str, str] = {}
+    for header in PTX_LIB.glob("*.cuh"):
+        names = _extract_ptx_functions(header.read_text())
+        for name in names:
+            base = _infer_ptx_base(name)
+            if base and base != name:
+                aliases.setdefault(name, base)
+    return aliases
+
+
+OP_ALIASES.update(_load_ptx_aliases())
+
+OP_ARG_SPECS: Dict[str, Dict[str, Any]] = {
+    "tcgen05_alloc": {
+        "required": {"tmem", "cols"},
+        "ints": {"cols"},
+        "optional": {"cta_group", "scope"},
+    },
+    "tcgen05_dealloc": {
+        "required": {"tmem", "cols"},
+        "ints": {"cols"},
+        "optional": {"cta_group", "scope"},
+    },
+    "tcgen05_cp": {
+        "required": {"tmem"},
+        "optional": {"cta_group", "tmem_offset", "cols"},
+        "ints": {"tmem_offset", "cols"},
+    },
+    "tcgen05_mma": {
+        "required": {"tmem"},
+        "optional": {"cta_group"},
+    },
+    "tcgen05_ld": {
+        "required": {"tmem"},
+        "optional": {"cta_group"},
+    },
+    "tcgen05_wait_ld": {
+        "required": set(),
+        "optional": set(),
+    },
+    "tcgen05_commit": {
+        "required": {"bar"},
+        "optional": {"cta_group"},
+    },
+    "tcgen05_fence_after_thread_sync": {
+        "required": set(),
+        "optional": set(),
+    },
+    "mbarrier_init": {
+        "required": {"bar", "count"},
+        "ints": {"count"},
+        "optional": {"scope"},
+    },
+    "mbarrier_arrive_expect_tx": {
+        "required": {"bar", "size"},
+        "ints": {"size"},
+        "optional": {"scope"},
+    },
+    "mbarrier_arrive_expect_tx_cta": {
+        "required": {"bar", "size"},
+        "ints": {"size"},
+        "optional": {"scope"},
+    },
+    "mbarrier_wait": {
+        "required": {"bar", "phase"},
+        "ints": {"phase"},
+        "optional": {"scope"},
+    },
+    "mbarrier_wait_relaxed": {
+        "required": {"bar", "phase"},
+        "ints": {"phase"},
+        "optional": {"scope"},
+    },
+    "mbarrier_wait_ticks": {
+        "required": {"bar", "phase"},
+        "ints": {"phase", "ticks"},
+        "optional": {"scope", "ticks"},
+    },
+    "tma_gmem2smem": {
+        "required": {"bar", "size"},
+        "ints": {"size"},
+        "optional": {"dst_align", "src_align"},
+    },
+    "tma_3d_gmem2smem": {
+        "required": {"bar", "tmap"},
+        "optional": {"dim"},
+    },
+    "tma_1d_gmem2smem": {
+        "required": {"bar", "tmap"},
+        "optional": {"dim"},
+    },
+    "tma_2d_gmem2smem": {
+        "required": {"bar", "tmap"},
+        "optional": {"dim"},
+    },
+    "tma_1d_gmem2smem_mcast": {
+        "required": {"bar", "tmap", "cta_mask"},
+        "optional": {"dim"},
+        "ints": {"cta_mask"},
+    },
+    "tma_2d_gmem2smem_mcast": {
+        "required": {"bar", "tmap", "cta_mask"},
+        "optional": {"dim"},
+        "ints": {"cta_mask"},
+    },
+    "tma_3d_gmem2smem_mcast": {
+        "required": {"bar", "tmap", "cta_mask"},
+        "optional": {"dim"},
+        "ints": {"cta_mask"},
+    },
+    "tcgen05_commit": {
+        "required": {"bar"},
+        "optional": {"cta_group"},
+    },
+    "tcgen05_commit_mcast": {
+        "required": {"bar", "cta_mask"},
+        "ints": {"cta_mask"},
+        "optional": {"cta_group"},
+    },
+    "barrier_cluster_arrive": {
+        "required": set(),
+        "optional": set(),
+    },
+    "barrier_cluster_wait": {
+        "required": set(),
+        "optional": set(),
+    },
+    "cp_async_bulk_prefetch": {
+        "required": {"addr", "size"},
+        "ints": {"size"},
+        "optional": set(),
+    },
+    "cp_async_bulk_prefetch_1d": {
+        "required": {"tmap", "x"},
+        "ints": {"x"},
+        "optional": set(),
+    },
+    "cp_async_bulk_prefetch_2d": {
+        "required": {"tmap", "x", "y"},
+        "ints": {"x", "y"},
+        "optional": set(),
+    },
+    "cp_async_bulk_prefetch_3d": {
+        "required": {"tmap", "x", "y", "z"},
+        "ints": {"x", "y", "z"},
+        "optional": set(),
+    },
+    "ptx_bar_sync": {
+        "required": {"bar_id", "count"},
+        "ints": {"bar_id", "count"},
+    },
+    "cute_tmap": {
+        "required": {"name"},
+        "optional": {"rank", "global_height", "global_width", "shared_height", "shared_width"},
+        "ints": {"rank", "global_height", "global_width", "shared_height", "shared_width"},
+    },
+}
+
+ISSUE_SCOPES = {"one_thread", "one_warp", "all_warps", "host"}
+BARRIER_SCOPES = {"cta", "cluster"}
+
+# Graph assumptions:
+# - B200 shared memory per block limit is 227 KiB; keep a 1 KiB safety margin.
+# - tmem columns are limited to 512 per CTA.
+GRAPH_SMEM_LIMIT_BYTES = 227 * 1024 - 1024
+GRAPH_TMEM_MAX_COLS = 512
+CTA_MASK_BITS = 16
+
+
+def _canonical_op_name(kind: str) -> str:
+    if kind in OP_ALIASES:
+        return OP_ALIASES[kind]
+    if kind in CONTRACTS:
+        return kind
+    for prefix, name in TCGEN_PREFIX_CONTRACTS:
+        if kind.startswith(prefix):
+            return name
+    return kind
+
+
+def _resolve_contract(kind: str) -> Optional[OpContract]:
+    canonical = _canonical_op_name(kind)
+    return CONTRACTS.get(canonical)
+
+
+def _infer_op_metadata(op_name: str, op_args: Dict[str, Any]) -> None:
+    if op_name.startswith("tcgen05_ld_"):
+        m = re.match(r"tcgen05_ld_(?P<shape>\d+x\d+b)x(?P<num>\d+)", op_name)
+        if m:
+            op_args.setdefault("shape", m.group("shape"))
+            op_args.setdefault("num", int(m.group("num")))
+    if op_name.startswith("tcgen05_cp_"):
+        m = re.match(r"tcgen05_cp_(?P<shape>\d+x\d+b)(?:_(?P<tile>warpx\d+))?", op_name)
+        if m:
+            op_args.setdefault("shape", m.group("shape"))
+            tile = m.group("tile")
+            if tile:
+                op_args.setdefault("tile", tile)
+    if op_name.startswith("tcgen05_mma_"):
+        variant = op_name[len("tcgen05_mma_") :]
+        if variant:
+            op_args.setdefault("shape", variant.replace("_", "."))
+    if op_name.startswith("tma_"):
+        if "1d" in op_name:
+            op_args.setdefault("rank", 1)
+        elif "2d" in op_name:
+            op_args.setdefault("rank", 2)
+        elif "3d" in op_name:
+            op_args.setdefault("rank", 3)

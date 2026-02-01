@@ -44,6 +44,13 @@ class Barrier:
 
 
 @dataclass
+class Descriptor:
+    name: str
+    buf: Optional[str]
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class OpContract:
     name: str
     issue_scope: str  # "one_thread", "one_warp", "all_warps"
@@ -74,6 +81,7 @@ class Graph:
         self.sections: Dict[str, List[Node]] = {"device": [], "host": [], "python": []}
         self.barriers: Dict[str, Barrier] = {}
         self.buffers: Dict[str, Tensor] = {}
+        self.descriptors: Dict[str, Descriptor] = {}
         self.tmaps: Dict[str, Dict[str, Any]] = {}
         self.default_tmem: Optional[str] = None
 
@@ -104,6 +112,15 @@ class Graph:
             return
         self.tmaps[name] = dict(meta)
 
+    def add_descriptor(self, name: str, buf: Optional[str], meta: Dict[str, Any]) -> None:
+        if name in self.descriptors:
+            existing = self.descriptors[name]
+            if existing.buf != buf:
+                raise ValueError(f"Descriptor '{name}' buffer mismatch: {existing.buf} vs {buf}")
+            existing.meta.update(meta)
+            return
+        self.descriptors[name] = Descriptor(name=name, buf=buf, meta=dict(meta))
+
     def set_default_tmem(self, name: str) -> None:
         self.default_tmem = name
 
@@ -116,13 +133,6 @@ class Graph:
         from .nodes.raw import RawNode
 
         node = RawNode(code=code, meta=meta or {})
-        self.sections[section].append(node)
-        return node
-
-    def add_event(self, section: str, op: str) -> Node:
-        from .nodes.event import EventNode
-
-        node = EventNode(op=op)
         self.sections[section].append(node)
         return node
 

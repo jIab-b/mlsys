@@ -662,13 +662,11 @@ PTX_DEVICE void tma_3d_gmem2smem_mcast(int dst, const void *tmap_ptr, int x, int
 }
 
 // ----- device.cuh -----
-// @chunk name=device_header
 #include <cudaTypedefs.h>
 #include <cuda_fp16.h>
 
 #include <torch/library.h>
 #include <ATen/core/Tensor.h>
-
 constexpr int WARP_SIZE = 32;
 constexpr int MMA_K = 64;  // 32 bytes
 
@@ -687,14 +685,12 @@ enum ProfilerTag {
   WaitEpilogue,
   Epilogue,
 };
-
 __device__ inline
 int64_t globaltimer() {
   int64_t t;
   asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t) :: "memory");
   return t;
 }
-
 struct Profiler {
   int64_t *data_ptr_;
   int sm_id_;
@@ -725,10 +721,8 @@ struct Profiler {
     data_ptr_[0] = cnt_;
   }
 };
-
 __device__ inline
 constexpr uint64_t desc_encode(uint64_t x) { return (x & 0x3'FFFFULL) >> 4ULL; };
-
 // https://github.com/NVIDIA/cutlass/blob/v4.2.1/include/cute/arch/cluster_sm90.hpp#L180
 __device__
 uint32_t elect_sync() {
@@ -744,7 +738,6 @@ uint32_t elect_sync() {
   );
   return pred;
 }
-// @chunk name=kernel_v4
 template <
   int K,
   int BLOCK_M,
@@ -754,7 +747,7 @@ template <
   bool C_N_MAJOR,
   int NUM_STAGES
 >
-// @kernel name=kernel_v4
+// @kernel name=kernel_v4 arch=sm_100a warp_size=WARP_SIZE num_warps=NUM_WARPS cluster_ctas=1
 __global__
 __launch_bounds__(BLOCK_M + 2 * WARP_SIZE)
 void kernel_v4(
@@ -783,6 +776,12 @@ void kernel_v4(
 
   constexpr int NUM_WARPS = BLOCK_M / WARP_SIZE + 2;
 
+  // @buffer name=tmem0 space=tmem cols=BLOCK_N*2 dtype=f32
+  // @buffer name=A_smem space=smem dtype=fp4 major=K swizzle=128B element_bits=4
+  // @buffer name=B_smem space=smem dtype=fp4 major=K swizzle=128B element_bits=4
+  // @buffer name=SFA_smem space=smem dtype=fp4 major=K swizzle=none element_bits=4
+  // @buffer name=SFB_smem space=smem dtype=fp4 major=K swizzle=none element_bits=4
+
   // set up smem
   extern __shared__ __align__(1024) char smem_ptr[];
   const int smem = static_cast<int>(__cvta_generic_to_shared(smem_ptr));
@@ -810,13 +809,14 @@ void kernel_v4(
   // - (128, 64) of A -> (128, 4) of SFA -> reshaped as (32, 4', 4) -> 4 tmem columns
   constexpr int SFA_tmem = BLOCK_N;
   constexpr int SFB_tmem = SFA_tmem + 4 * (BLOCK_K / MMA_K);
-  // @buffer name=tmem0 space=tmem cols=BLOCK_N*2
-
   if (warp_id == 0 && elect_sync()) {
     // only 1 thread issue
     // @op mbarrier_init bar=tma_mbar count=1 scope=cta
+    // @op warp_id=0 lane_id=elect
     // @op mbarrier_init bar=mma_mbar count=1 scope=cta
+    // @op warp_id=0 lane_id=elect
     // @op mbarrier_init bar=mainloop_mbar count=1 scope=cta
+    // @op warp_id=0 lane_id=elect
     for (int i = 0; i < NUM_STAGES * 2 + 1; i++)
       mbarrier_init(tma_mbar_addr + i * 8, 1);
     asm volatile("fence.mbarrier_init.release.cluster;");  // visible to async proxy
@@ -825,12 +825,12 @@ void kernel_v4(
     // allocate tmem
     // tmem address should be 0, don't bother storing and reading it.
     // @op tcgen05_alloc tmem=tmem0 cols=BLOCK_N*2 cta_group=1 scope=one_warp
+    // @op warp_id=1
     tcgen05_alloc(smem, BLOCK_N * 2);
   }
   __syncthreads();  // visible to all threads
 
   constexpr int num_iters = K / BLOCK_K / SPLIT_K;
-
   // warp-specialization
   if (warp_id == NUM_WARPS - 2 && elect_sync()) {
     // TMA warp
@@ -853,8 +853,10 @@ void kernel_v4(
       // issue TMA
       const int off_k = SPLIT_K == 1 ? iter_k * BLOCK_K : (iter_k * SPLIT_K + bid_k) * BLOCK_K;
       // @op tma_3d_gmem2smem bar=tma_mbar tmap=A_tmap
+      // @op warp_id=NUM_WARPS-2 lane_id=elect rank=3
       tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 256, mbar_addr, cache_A);
       // @op tma_3d_gmem2smem bar=tma_mbar tmap=B_tmap
+      // @op warp_id=NUM_WARPS-2 lane_id=elect rank=3
       tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 256, mbar_addr, cache_B);
 
       // layout of SFA is [M/128, rest_k, 32, 4, 4]
@@ -863,12 +865,15 @@ void kernel_v4(
       const char *SFA_src = SFA_ptr + ((off_m / 128) * rest_k + off_k / (16 * 4)) * 512;  // 512 = 32x4x4
       const char *SFB_src = SFB_ptr + ((off_n / 128) * rest_k + off_k / (16 * 4)) * 512;
       // @op tma_gmem2smem bar=tma_mbar size=SFA_size dst_align=16 src_align=16
+      // @op warp_id=NUM_WARPS-2 lane_id=elect
       tma_gmem2smem(SFA_smem, SFA_src, SFA_size, mbar_addr, cache_A);
       // @op tma_gmem2smem bar=tma_mbar size=SFB_size dst_align=16 src_align=16
+      // @op warp_id=NUM_WARPS-2 lane_id=elect
       tma_gmem2smem(SFB_smem, SFB_src, SFB_size, mbar_addr, cache_B);
 
       // signal TMA done
       // @op mbarrier_arrive_expect_tx bar=tma_mbar size=STAGE_SIZE
+      // @op warp_id=NUM_WARPS-2 lane_id=elect
       asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
                   :: "r"(mbar_addr), "r"(STAGE_SIZE) : "memory");
     };
@@ -883,6 +888,7 @@ void kernel_v4(
       const int stage_id = iter_k % NUM_STAGES;
       const int mma_phase = (iter_k / NUM_STAGES - 1) % 2;
       // @op mbarrier_wait bar=mma_mbar phase=mma_phase
+      // @op warp_id=NUM_WARPS-2 lane_id=elect
       mbarrier_wait(mma_mbar_addr + stage_id * 8, mma_phase);
 
       issue_tma(iter_k, stage_id);
@@ -907,6 +913,7 @@ void kernel_v4(
       const int stage_id = iter_k % NUM_STAGES;
       const int tma_phase = (iter_k / NUM_STAGES) % 2;
       // @op mbarrier_wait bar=tma_mbar phase=tma_phase
+      // @op warp_id=NUM_WARPS-1 lane_id=elect
       mbarrier_wait(tma_mbar_addr + stage_id * 8, tma_phase);
 
       const int A_smem = smem + stage_id * STAGE_SIZE;
@@ -917,11 +924,13 @@ void kernel_v4(
       // set up shared memory descriptors for A and B
       // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-shared-memory-descriptor
       // 128-byte swizzling. LBO is implied to be 1.
+      // @desc name=AB_desc major=K swizzle=128B sbo=8*128 lbo=1
       auto make_desc_AB = [](int addr) -> uint64_t {
         const int SBO = 8 * 128;
         return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
       };
       // no swizzling
+      // @desc name=SF_desc major=K swizzle=none sbo=8*16 lbo=1
       auto make_desc_SF = [](int addr) -> uint64_t {
         const int SBO = 8 * 16;
         return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL);
@@ -940,8 +949,10 @@ void kernel_v4(
         uint64_t sfa_desc = SFA_desc + (uint64_t)k * (512ULL >> 4ULL);  // 4 columns, 512 bytes of 128x4 / 32x4x4
         uint64_t sfb_desc = SFB_desc + (uint64_t)k * (512ULL >> 4ULL);
         // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
+        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect desc=SF_desc smem_buf=SFA_smem
         tcgen05_cp_nvfp4(SFA_tmem + k * 4, sfa_desc);
         // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
+        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect desc=SF_desc smem_buf=SFB_smem
         tcgen05_cp_nvfp4(SFB_tmem + k * 4, sfb_desc);
       }
       // @endloop
@@ -963,6 +974,7 @@ void kernel_v4(
 
           const int enable_input_d = (k1 == 0 && k2 == 0) ? iter_k : 1;
           // @op tcgen05_mma tmem=tmem0 cta_group=1 issue=one_thread
+          // @op shape=mxf4nvf4.block16 warp_id=NUM_WARPS-1 lane_id=elect desc_a=AB_desc desc_b=AB_desc
           tcgen05_mma_nvfp4(a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d);
         }
         // @endloop
@@ -971,12 +983,14 @@ void kernel_v4(
 
       // signal MMA done
       // @op tcgen05_commit bar=mma_mbar cta_group=1
+      // @op warp_id=NUM_WARPS-1 lane_id=elect
       tcgen05_commit(mma_mbar_addr + stage_id * 8);
     }
     // @endloop
 
     // signal mainloop done
     // @op tcgen05_commit bar=mainloop_mbar cta_group=1
+    // @op warp_id=NUM_WARPS-1 lane_id=elect
     tcgen05_commit(mainloop_mbar_addr);
   }
   else if (tid < BLOCK_M) {
@@ -984,8 +998,10 @@ void kernel_v4(
 
     // wait mainloop
     // @op mbarrier_wait bar=mainloop_mbar phase=0
+    // @op
     mbarrier_wait(mainloop_mbar_addr, 0);
     // @op tcgen05_fence_after_thread_sync
+    // @op
     tcgen05_fence_after_thread_sync();
 
     auto epilogue_M_major = [&]() {
@@ -995,13 +1011,17 @@ void kernel_v4(
       // @loop var=n iters=BLOCK_N/WIDTH
       for (int n = 0; n < BLOCK_N / WIDTH; n++) {
         float tmp[WIDTH];  // if WIDTH=128, we are using 128 registers here
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==128
+        // @op shape=32x32b num=128
         if constexpr (WIDTH == 128) tcgen05_ld_32x32bx128(tmp, warp_id * 32, n * WIDTH);
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==64
+        // @op shape=32x32b num=64
         if constexpr (WIDTH == 64) tcgen05_ld_32x32bx64(tmp, warp_id * 32, n * WIDTH);
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==32
+        // @op shape=32x32b num=32
         if constexpr (WIDTH == 32) tcgen05_ld_32x32bx32(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_wait_ld
+        // @op
         tcgen05_wait_ld();
 
         for (int i = 0; i < WIDTH; i++) {
@@ -1021,13 +1041,17 @@ void kernel_v4(
       // @loop var=m iters=32/16
       for (int m = 0; m < 32 / 16; m++) {
         float tmp[BLOCK_N / 2];
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==128
+        // @op shape=16x256b num=16
         if constexpr (BLOCK_N == 128) tcgen05_ld_16x256bx16(tmp, warp_id * 32 + m * 16, 0);
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==64
+        // @op shape=16x256b num=8
         if constexpr (BLOCK_N == 64) tcgen05_ld_16x256bx8(tmp, warp_id * 32 + m * 16, 0);
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==32
+        // @op shape=16x256b num=4
         if constexpr (BLOCK_N == 32) tcgen05_ld_16x256bx4(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_wait_ld
+        // @op
         tcgen05_wait_ld();
 
         for (int i = 0; i < BLOCK_N / 8; i++) {
@@ -1052,16 +1076,17 @@ void kernel_v4(
       epilogue_M_major();
 
     // @op ptx_bar_sync bar_id=1 count=BLOCK_M
+    // @op
     asm volatile("bar.sync 1, %0;" :: "r"(BLOCK_M) : "memory");  // everyone is done with tmem
     if (warp_id == 0)  // deallocate tmem. tmem address should be 0.
       // @op tcgen05_dealloc tmem=tmem0 cols=BLOCK_N*2 cta_group=1 scope=one_warp
+      // @op warp_id=0
       tcgen05_dealloc(0, BLOCK_N * 2);
 
   }
 }
 
 // @endkernel
-// @chunk name=kernel_v3b
 template <
   int K,
   int BLOCK_M,
@@ -1071,7 +1096,7 @@ template <
   int NUM_STAGES,
   bool DO_PROFILE
 >
-// @kernel name=kernel_v3b
+// @kernel name=kernel_v3b arch=sm_100a warp_size=WARP_SIZE num_warps=NUM_WARPS cluster_ctas=1
 __global__
 __launch_bounds__(BLOCK_M + 2 * WARP_SIZE)
 void kernel_v3b(
@@ -1099,6 +1124,12 @@ void kernel_v3b(
   const int off_n = bid_n * BLOCK_N;
 
   constexpr int NUM_WARPS = BLOCK_M / WARP_SIZE + 2;
+
+  // @buffer name=tmem0 space=tmem cols=BLOCK_N*2 dtype=f32
+  // @buffer name=A_smem space=smem dtype=fp4 major=K swizzle=128B element_bits=4
+  // @buffer name=B_smem space=smem dtype=fp4 major=K swizzle=128B element_bits=4
+  // @buffer name=SFA_smem space=smem dtype=fp4 major=K swizzle=none element_bits=4
+  // @buffer name=SFB_smem space=smem dtype=fp4 major=K swizzle=none element_bits=4
 
   Profiler profiler;
   if constexpr (DO_PROFILE) if (elect_sync()) {
@@ -1130,12 +1161,14 @@ void kernel_v3b(
   // - (128, 64) of A -> (128, 4) of SFA -> reshaped as (32, 4', 4) -> 4 tmem columns
   constexpr int SFA_tmem = BLOCK_N;
   constexpr int SFB_tmem = SFA_tmem + 4 * (BLOCK_K / MMA_K);
-
   if (warp_id == 0 && elect_sync()) {
     // only 1 thread issue
     // @op mbarrier_init bar=tma_mbar count=1 scope=cta
+    // @op warp_id=0 lane_id=elect
     // @op mbarrier_init bar=mma_mbar count=1 scope=cta
+    // @op warp_id=0 lane_id=elect
     // @op mbarrier_init bar=mainloop_mbar count=1 scope=cta
+    // @op warp_id=0 lane_id=elect
     for (int i = 0; i < NUM_STAGES * 2 + 1; i++)
       mbarrier_init(tma_mbar_addr + i * 8, 1);
     asm volatile("fence.mbarrier_init.release.cluster;");  // visible to async proxy
@@ -1144,6 +1177,7 @@ void kernel_v3b(
     // allocate tmem
     // tmem address should be 0, don't bother storing and reading it.
     // @op tcgen05_alloc tmem=tmem0 cols=BLOCK_N*2 cta_group=1 scope=one_warp
+    // @op warp_id=1
     tcgen05_alloc(smem, BLOCK_N * 2);
   }
   __syncthreads();  // visible to all threads
@@ -1151,7 +1185,6 @@ void kernel_v3b(
 
   // TODO: make K constexpr as well
   const int num_iters = K / BLOCK_K;
-
   // warp-specialization
   if (warp_id == NUM_WARPS - 2 && elect_sync()) {
     // TMA warp
@@ -1175,8 +1208,10 @@ void kernel_v3b(
       // issue TMA
       const int off_k = iter_k * BLOCK_K;
       // @op tma_3d_gmem2smem bar=tma_mbar tmap=A_tmap
+      // @op warp_id=NUM_WARPS-2 lane_id=elect rank=3
       tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 256, mbar_addr, cache_A);
       // @op tma_3d_gmem2smem bar=tma_mbar tmap=B_tmap
+      // @op warp_id=NUM_WARPS-2 lane_id=elect rank=3
       tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 256, mbar_addr, cache_B);
 
       // layout of SFA is [M/128, rest_k, 32, 4, 4]
@@ -1185,12 +1220,15 @@ void kernel_v3b(
       const char *SFA_src = SFA_ptr + ((off_m / 128) * rest_k + off_k / (16 * 4)) * 512;  // 512 = 32x4x4
       const char *SFB_src = SFB_ptr + ((off_n / 128) * rest_k + off_k / (16 * 4)) * 512;
       // @op tma_gmem2smem bar=tma_mbar size=SFA_size dst_align=16 src_align=16
+      // @op warp_id=NUM_WARPS-2 lane_id=elect
       tma_gmem2smem(SFA_smem, SFA_src, SFA_size, mbar_addr, cache_A);
       // @op tma_gmem2smem bar=tma_mbar size=SFB_size dst_align=16 src_align=16
+      // @op warp_id=NUM_WARPS-2 lane_id=elect
       tma_gmem2smem(SFB_smem, SFB_src, SFB_size, mbar_addr, cache_B);
 
       // signal TMA done
       // @op mbarrier_arrive_expect_tx bar=tma_mbar size=STAGE_SIZE
+      // @op warp_id=NUM_WARPS-2 lane_id=elect
       asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
                   :: "r"(mbar_addr), "r"(STAGE_SIZE) : "memory");
       if constexpr (DO_PROFILE) profiler.stop();
@@ -1207,6 +1245,7 @@ void kernel_v3b(
       const int stage_id = iter_k % NUM_STAGES;
       const int mma_phase = (iter_k / NUM_STAGES - 1) % 2;
       // @op mbarrier_wait bar=mma_mbar phase=mma_phase
+      // @op warp_id=NUM_WARPS-2 lane_id=elect
       mbarrier_wait(mma_mbar_addr + stage_id * 8, mma_phase);
       if constexpr (DO_PROFILE) profiler.stop();
 
@@ -1231,6 +1270,7 @@ void kernel_v3b(
       const int stage_id = iter_k % NUM_STAGES;
       const int tma_phase = (iter_k / NUM_STAGES) % 2;
       // @op mbarrier_wait bar=tma_mbar phase=tma_phase
+      // @op warp_id=NUM_WARPS-1 lane_id=elect
       mbarrier_wait(tma_mbar_addr + stage_id * 8, tma_phase);
       if constexpr (DO_PROFILE) profiler.stop();
 
@@ -1243,11 +1283,13 @@ void kernel_v3b(
       // set up shared memory descriptors for A and B
       // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-shared-memory-descriptor
       // 128-byte swizzling. LBO is implied to be 1.
+      // @desc name=AB_desc major=K swizzle=128B sbo=8*128 lbo=1
       auto make_desc_AB = [](int addr) -> uint64_t {
         const int SBO = 8 * 128;
         return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
       };
       // no swizzling
+      // @desc name=SF_desc major=K swizzle=none sbo=8*16 lbo=1
       auto make_desc_SF = [](int addr) -> uint64_t {
         const int SBO = 8 * 16;
         return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL);
@@ -1266,8 +1308,10 @@ void kernel_v3b(
         uint64_t sfa_desc = SFA_desc + (uint64_t)k * (512ULL >> 4ULL);  // 4 columns, 512 bytes of 128x4 / 32x4x4
         uint64_t sfb_desc = SFB_desc + (uint64_t)k * (512ULL >> 4ULL);
         // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
+        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect desc=SF_desc smem_buf=SFA_smem
         tcgen05_cp_nvfp4(SFA_tmem + k * 4, sfa_desc);
         // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
+        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect desc=SF_desc smem_buf=SFB_smem
         tcgen05_cp_nvfp4(SFB_tmem + k * 4, sfb_desc);
       }
       // @endloop
@@ -1289,6 +1333,7 @@ void kernel_v3b(
 
           const int enable_input_d = (k1 == 0 && k2 == 0) ? iter_k : 1;
           // @op tcgen05_mma tmem=tmem0 cta_group=1 issue=one_thread
+          // @op shape=mxf4nvf4.block16 warp_id=NUM_WARPS-1 lane_id=elect desc_a=AB_desc desc_b=AB_desc
           tcgen05_mma_nvfp4(a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d);
         }
         // @endloop
@@ -1297,6 +1342,7 @@ void kernel_v3b(
 
       // signal MMA done
       // @op tcgen05_commit bar=mma_mbar cta_group=1
+      // @op warp_id=NUM_WARPS-1 lane_id=elect
       tcgen05_commit(mma_mbar_addr + stage_id * 8);
       if constexpr (DO_PROFILE) profiler.stop();
     }
@@ -1304,6 +1350,7 @@ void kernel_v3b(
 
     // signal mainloop done
     // @op tcgen05_commit bar=mainloop_mbar cta_group=1
+    // @op warp_id=NUM_WARPS-1 lane_id=elect
     tcgen05_commit(mainloop_mbar_addr);
   }
   else if (tid < BLOCK_M) {
@@ -1312,8 +1359,10 @@ void kernel_v3b(
     // wait mainloop
     if constexpr (DO_PROFILE) if (elect_sync()) profiler.start(ProfilerTag::WaitMainloop);
     // @op mbarrier_wait bar=mainloop_mbar phase=0
+    // @op
     mbarrier_wait(mainloop_mbar_addr, 0);
     // @op tcgen05_fence_after_thread_sync
+    // @op
     tcgen05_fence_after_thread_sync();
     if constexpr (DO_PROFILE) if (elect_sync()) profiler.stop();
 
@@ -1324,12 +1373,16 @@ void kernel_v3b(
       for (int n = 0; n < BLOCK_N / WIDTH; n++) {
         float tmp[WIDTH];  // if WIDTH=128, we are using 128 registers here
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==128
+        // @op shape=32x32b num=128
         if constexpr (WIDTH == 128) tcgen05_ld_32x32bx128(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==64
+        // @op shape=32x32b num=64
         if constexpr (WIDTH == 64) tcgen05_ld_32x32bx64(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_ld tmem=tmem0 cta_group=1 when=WIDTH==32
+        // @op shape=32x32b num=32
         if constexpr (WIDTH == 32) tcgen05_ld_32x32bx32(tmp, warp_id * 32, n * WIDTH);
         // @op tcgen05_wait_ld
+        // @op
         tcgen05_wait_ld();
 
         for (int i = 0; i < WIDTH; i++)
@@ -1340,13 +1393,17 @@ void kernel_v3b(
       // C is N-major
       for (int m = 0; m < 32 / 16; m++) {
         float tmp[BLOCK_N / 2];
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==128
+        // @op shape=16x256b num=16
         if constexpr (BLOCK_N == 128) tcgen05_ld_16x256bx16(tmp, warp_id * 32 + m * 16, 0);
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==64
+        // @op shape=16x256b num=8
         if constexpr (BLOCK_N == 64) tcgen05_ld_16x256bx8(tmp, warp_id * 32 + m * 16, 0);
-        // @op tcgen05_ld tmem=tmem0 cta_group=1
+        // @op tcgen05_ld tmem=tmem0 cta_group=1 when=BLOCK_N==32
+        // @op shape=16x256b num=4
         if constexpr (BLOCK_N == 32) tcgen05_ld_16x256bx4(tmp, warp_id * 32 + m * 16, 0);
         // @op tcgen05_wait_ld
+        // @op
         tcgen05_wait_ld();
 
         for (int i = 0; i < BLOCK_N / 8; i++) {
@@ -1366,9 +1423,11 @@ void kernel_v3b(
       epilogue_M_major();
 
     // @op ptx_bar_sync bar_id=1 count=BLOCK_M
+    // @op
     asm volatile("bar.sync 1, %0;" :: "r"(BLOCK_M) : "memory");  // everyone is done with tmem
     if (warp_id == 0)  // deallocate tmem. tmem address should be 0.
       // @op tcgen05_dealloc tmem=tmem0 cols=BLOCK_N*2 cta_group=1 scope=one_warp
+      // @op warp_id=0
       tcgen05_dealloc(0, BLOCK_N * 2);
 
     if constexpr (DO_PROFILE) if (elect_sync()) profiler.stop();
@@ -1379,7 +1438,6 @@ void kernel_v3b(
 
 // @endkernel
 // ----- host.cuh -----
-// @chunk name=host_helpers
 void check_cu(CUresult err) {
   if (err == CUDA_SUCCESS) return;
   const char *error_msg_ptr;
@@ -1387,12 +1445,10 @@ void check_cu(CUresult err) {
     error_msg_ptr = "unable to get error string";
   TORCH_CHECK(false, "cuTensorMapEncodeTiled error: ", error_msg_ptr);
 }
-
 void check_cuda(cudaError_t err) {
   if (err == cudaSuccess) return;
   TORCH_CHECK(false, cudaGetErrorString(err));
 }
-
 void init_AB_tmap(
   CUtensorMap *tmap,
   const char *ptr,
@@ -1421,7 +1477,6 @@ void init_AB_tmap(
   );
   check_cu(err);
 }
-// @chunk name=gemm_launch_v4
 template <
   int K,
   int BLOCK_M,
@@ -1462,8 +1517,10 @@ at::Tensor gemm_launch_v4(
 
   CUtensorMap A_tmap, B_tmap;
   // @op cute_tmap name=A_tmap rank=3
+  // @op
   init_AB_tmap(&A_tmap, A_ptr, new_M, K, BLOCK_M, BLOCK_K);
   // @op cute_tmap name=B_tmap rank=3
+  // @op
   init_AB_tmap(&B_tmap, B_ptr, new_N, K, BLOCK_N, BLOCK_K);
 
   dim3 grid(SPLIT_K, (new_M / BLOCK_M) * (new_N / BLOCK_N));
@@ -1482,7 +1539,6 @@ at::Tensor gemm_launch_v4(
   else
     return C_N_MAJOR ? buf : buf.view({N, M, 1}).transpose(0, 1);
 }
-// @chunk name=gemm_v4
 at::Tensor gemm_v4(
   const at::Tensor& A,
   const at::Tensor& B,
@@ -1510,12 +1566,10 @@ at::Tensor gemm_v4(
 
   return C;
 }
-// @chunk name=register_v4
 TORCH_LIBRARY(my_module_v4, m) {
   m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C, Tensor(b!) buf) -> Tensor");
   m.impl("gemm", &gemm_v4);
 }
-// @chunk name=gemm_launch_v3b
 template <
   int K,
   int BLOCK_M,
@@ -1556,8 +1610,10 @@ at::Tensor gemm_launch_v3b(
 
   CUtensorMap A_tmap, B_tmap;
   // @op cute_tmap name=A_tmap rank=3
+  // @op
   init_AB_tmap(&A_tmap, A_ptr, new_M, K, BLOCK_M, BLOCK_K);
   // @op cute_tmap name=B_tmap rank=3
+  // @op
   init_AB_tmap(&B_tmap, B_ptr, new_N, K, BLOCK_N, BLOCK_K);
 
   int grid = (new_M / BLOCK_M) * (new_N / BLOCK_N);
@@ -1573,7 +1629,6 @@ at::Tensor gemm_launch_v3b(
 
   return C_N_MAJOR ? C : C.view({N, M, 1}).transpose(0, 1);
 }
-// @chunk name=gemm_v3b
 at::Tensor gemm_v3b(
   const at::Tensor& A,
   const at::Tensor& B,
@@ -1601,7 +1656,6 @@ at::Tensor gemm_v3b(
 
   return C;
 }
-// @chunk name=register_v3b
 TORCH_LIBRARY(my_module_v3b, m) {
   m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C) -> Tensor");
   m.impl("gemm", &gemm_v3b);

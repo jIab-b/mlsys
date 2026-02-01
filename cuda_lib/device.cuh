@@ -109,7 +109,7 @@ template <
   bool C_N_MAJOR,
   int NUM_STAGES
 >
-// @kernel name=kernel_v4
+// @kernel name=kernel_v4 arch=sm_100a warp_size=WARP_SIZE num_warps=NUM_WARPS cluster_ctas=1
 __global__
 __launch_bounds__(BLOCK_M + 2 * WARP_SIZE)
 void kernel_v4(
@@ -138,6 +138,12 @@ void kernel_v4(
 
   constexpr int NUM_WARPS = BLOCK_M / WARP_SIZE + 2;
 
+  // @buffer name=tmem0 space=tmem cols=BLOCK_N*2 dtype=f32
+  // @buffer name=A_smem space=smem dtype=fp4 major=K swizzle=128B element_bits=4
+  // @buffer name=B_smem space=smem dtype=fp4 major=K swizzle=128B element_bits=4
+  // @buffer name=SFA_smem space=smem dtype=fp4 major=K swizzle=none element_bits=4
+  // @buffer name=SFB_smem space=smem dtype=fp4 major=K swizzle=none element_bits=4
+
   // set up smem
   extern __shared__ __align__(1024) char smem_ptr[];
   const int smem = static_cast<int>(__cvta_generic_to_shared(smem_ptr));
@@ -165,7 +171,6 @@ void kernel_v4(
   // - (128, 64) of A -> (128, 4) of SFA -> reshaped as (32, 4', 4) -> 4 tmem columns
   constexpr int SFA_tmem = BLOCK_N;
   constexpr int SFB_tmem = SFA_tmem + 4 * (BLOCK_K / MMA_K);
-  // @buffer name=tmem0 space=tmem cols=BLOCK_N*2
 """
 
 # @chunk name=device_007
@@ -293,11 +298,13 @@ DEVICE_009 = r"""
       // set up shared memory descriptors for A and B
       // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-shared-memory-descriptor
       // 128-byte swizzling. LBO is implied to be 1.
+      // @desc name=AB_desc major=K swizzle=128B sbo=8*128 lbo=1
       auto make_desc_AB = [](int addr) -> uint64_t {
         const int SBO = 8 * 128;
         return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
       };
       // no swizzling
+      // @desc name=SF_desc major=K swizzle=none sbo=8*16 lbo=1
       auto make_desc_SF = [](int addr) -> uint64_t {
         const int SBO = 8 * 16;
         return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL);
@@ -316,10 +323,10 @@ DEVICE_009 = r"""
         uint64_t sfa_desc = SFA_desc + (uint64_t)k * (512ULL >> 4ULL);  // 4 columns, 512 bytes of 128x4 / 32x4x4
         uint64_t sfb_desc = SFB_desc + (uint64_t)k * (512ULL >> 4ULL);
         // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
-        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect
+        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect desc=SF_desc smem_buf=SFA_smem
         tcgen05_cp_nvfp4(SFA_tmem + k * 4, sfa_desc);
         // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
-        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect
+        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect desc=SF_desc smem_buf=SFB_smem
         tcgen05_cp_nvfp4(SFB_tmem + k * 4, sfb_desc);
       }
       // @endloop
@@ -341,7 +348,7 @@ DEVICE_009 = r"""
 
           const int enable_input_d = (k1 == 0 && k2 == 0) ? iter_k : 1;
           // @op tcgen05_mma tmem=tmem0 cta_group=1 issue=one_thread
-          // @op shape=mxf4nvf4.block16 warp_id=NUM_WARPS-1 lane_id=elect
+          // @op shape=mxf4nvf4.block16 warp_id=NUM_WARPS-1 lane_id=elect desc_a=AB_desc desc_b=AB_desc
           tcgen05_mma_nvfp4(a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d);
         }
         // @endloop
@@ -471,7 +478,7 @@ template <
   int NUM_STAGES,
   bool DO_PROFILE
 >
-// @kernel name=kernel_v3b
+// @kernel name=kernel_v3b arch=sm_100a warp_size=WARP_SIZE num_warps=NUM_WARPS cluster_ctas=1
 __global__
 __launch_bounds__(BLOCK_M + 2 * WARP_SIZE)
 void kernel_v3b(
@@ -499,6 +506,12 @@ void kernel_v3b(
   const int off_n = bid_n * BLOCK_N;
 
   constexpr int NUM_WARPS = BLOCK_M / WARP_SIZE + 2;
+
+  // @buffer name=tmem0 space=tmem cols=BLOCK_N*2 dtype=f32
+  // @buffer name=A_smem space=smem dtype=fp4 major=K swizzle=128B element_bits=4
+  // @buffer name=B_smem space=smem dtype=fp4 major=K swizzle=128B element_bits=4
+  // @buffer name=SFA_smem space=smem dtype=fp4 major=K swizzle=none element_bits=4
+  // @buffer name=SFB_smem space=smem dtype=fp4 major=K swizzle=none element_bits=4
 
   Profiler profiler;
   if constexpr (DO_PROFILE) if (elect_sync()) {
@@ -664,11 +677,13 @@ DEVICE_014 = r"""
       // set up shared memory descriptors for A and B
       // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-shared-memory-descriptor
       // 128-byte swizzling. LBO is implied to be 1.
+      // @desc name=AB_desc major=K swizzle=128B sbo=8*128 lbo=1
       auto make_desc_AB = [](int addr) -> uint64_t {
         const int SBO = 8 * 128;
         return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
       };
       // no swizzling
+      // @desc name=SF_desc major=K swizzle=none sbo=8*16 lbo=1
       auto make_desc_SF = [](int addr) -> uint64_t {
         const int SBO = 8 * 16;
         return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL);
@@ -687,10 +702,10 @@ DEVICE_014 = r"""
         uint64_t sfa_desc = SFA_desc + (uint64_t)k * (512ULL >> 4ULL);  // 4 columns, 512 bytes of 128x4 / 32x4x4
         uint64_t sfb_desc = SFB_desc + (uint64_t)k * (512ULL >> 4ULL);
         // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
-        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect
+        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect desc=SF_desc smem_buf=SFA_smem
         tcgen05_cp_nvfp4(SFA_tmem + k * 4, sfa_desc);
         // @op tcgen05_cp tmem=tmem0 cta_group=1 issue=one_thread
-        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect
+        // @op shape=32x128b tile=warpx4 warp_id=NUM_WARPS-1 lane_id=elect desc=SF_desc smem_buf=SFB_smem
         tcgen05_cp_nvfp4(SFB_tmem + k * 4, sfb_desc);
       }
       // @endloop
@@ -712,7 +727,7 @@ DEVICE_014 = r"""
 
           const int enable_input_d = (k1 == 0 && k2 == 0) ? iter_k : 1;
           // @op tcgen05_mma tmem=tmem0 cta_group=1 issue=one_thread
-          // @op shape=mxf4nvf4.block16 warp_id=NUM_WARPS-1 lane_id=elect
+          // @op shape=mxf4nvf4.block16 warp_id=NUM_WARPS-1 lane_id=elect desc_a=AB_desc desc_b=AB_desc
           tcgen05_mma_nvfp4(a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d);
         }
         // @endloop

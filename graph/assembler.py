@@ -195,7 +195,7 @@ def main() -> int:
     parser.add_argument("--python", default="python.py", help="Unused (graph defines sources)")
     parser.add_argument("--host", default="host.cuh", help="Unused (graph defines sources)")
     parser.add_argument("--device", default="device.cuh", help="Unused (graph defines sources)")
-    parser.add_argument("--out", default="submission.py", help="Output submission.py path")
+    parser.add_argument("--out", default="sub_test.py", help="Output submission.py path")
     parser.add_argument("--compile", action="store_true", help="Run compile.py to regenerate cuda_lib/*")
     parser.add_argument("--build-only", action="store_true", help="Only build submission.py")
     parser.add_argument("args", nargs=argparse.REMAINDER, help="Unused; kept for compatibility")
