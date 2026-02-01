@@ -29,9 +29,9 @@ GPU_ALIASES = {
 }
 
 # --- Paths ---
-PROJECT_ROOT = Path(__file__).parent.parent
-LOCAL_EVAL_SUITE = PROJECT_ROOT / "eval_suite"
-LOCAL_OUTPUTS = PROJECT_ROOT / "modal" / "outputs"
+LOCAL_EVAL_SUITE = Path(__file__).parent.parent  # eval_suite/
+PROJECT_ROOT = LOCAL_EVAL_SUITE.parent  # mlsys/
+LOCAL_OUTPUTS = LOCAL_EVAL_SUITE / "modal" / "outputs"
 VOLUME_MOUNT_PATH = PurePosixPath("/kernel_data")
 CONTAINER_EVAL_SUITE = VOLUME_MOUNT_PATH / "eval_suite"
 VOLUME_EVAL_SUITE = PurePosixPath("/eval_suite")
@@ -361,6 +361,38 @@ def run_eval(
             tmp_path.unlink(missing_ok=True)
             shutil.rmtree(trace_dir, ignore_errors=True)
     return result
+
+
+@app.function(
+    image=image,
+    volumes={str(VOLUME_MOUNT_PATH): volume},
+    gpu=_gpu_type(),
+    timeout=600,
+)
+def run_ref_test(ref_code: str, ref_name: str) -> dict:
+    """Run a reference test file directly (calls main() or test_correctness())."""
+    import sys
+
+    work = Path("/tmp/ref_test")
+    work.mkdir(parents=True, exist_ok=True)
+
+    ref_file = work / f"{ref_name}.py"
+    ref_file.write_text(ref_code)
+
+    proc = subprocess.Popen(
+        [sys.executable, str(ref_file)],
+        cwd=str(work),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout, stderr = proc.communicate()
+
+    return {
+        "stdout": stdout.decode(errors="replace"),
+        "stderr": stderr.decode(errors="replace"),
+        "returncode": proc.returncode,
+        "system": _system_info(),
+    }
 
 
 # --- Shell helpers ---

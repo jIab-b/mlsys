@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-"""CLI for running eval_suite sparse attention on Modal."""
+"""CLI for running eval_suite kernels on Modal."""
 import argparse
 import sys
 import subprocess
 from pathlib import Path
 
-from app import app, sync_sglang, run_eval
+from app import app, sync_sglang, run_eval, run_ref_test
 from format import format_result
 
-PROJECT_ROOT = Path(__file__).parent.parent
-EVAL_ROOT = PROJECT_ROOT / "eval_suite"
+EVAL_ROOT = Path(__file__).parent.parent  # eval_suite/
+PROJECT_ROOT = EVAL_ROOT.parent  # mlsys/
+
+# Add paths for imports
+sys.path.insert(0, str(EVAL_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from references.registry import REFS
+
+# Build TASKS from registry + legacy sparse tasks
 TASKS = {
+    # Legacy sparse attention tasks
     "sparse_attention": "test_kernels/sparse_attention",
     "sparse_index": "test_kernels/sparse_index",
     "sparse_attn": "test_kernels/sparse_attn",
 }
-
-# Add eval_suite to path for workload_loader
-sys.path.insert(0, str(EVAL_ROOT))
+# Add all registry definitions
+for name, info in REFS.items():
+    TASKS[name] = f"definitions/{info['op_type']}/{name}"
 
 def _log(message: str) -> None:
     print(message, file=sys.stderr)
@@ -127,7 +136,7 @@ def main():
     parser.add_argument("submission", nargs="?", help="Submission file path")
     parser.add_argument("-o", "--output", default="out.txt", help="Output file for formatted result")
     parser.add_argument("-m", "--mode", default="benchmark", choices=["test", "benchmark", "leaderboard", "profile"])
-    parser.add_argument("-t", "--task", default="sparse_attention", choices=list(TASKS.keys()))
+    parser.add_argument("-t", "--task", default="sparse_attention", help="Task name (use --list-tasks to see all)")
     parser.add_argument("--no-sync", action="store_true", help="Skip syncing eval_suite")
     parser.add_argument(
         "--trace",
@@ -168,7 +177,50 @@ def main():
         action="store_true",
         help="Force full re-sync of eval_suite",
     )
+    parser.add_argument(
+        "--list-tasks",
+        action="store_true",
+        help="List all available tasks and exit",
+    )
+    parser.add_argument(
+        "--ref-test",
+        action="store_true",
+        help="Run a reference test file directly (tests against FlashInfer)",
+    )
     args = parser.parse_args(_strip_eval_subcommand(sys.argv[1:]))
+
+    # Handle --list-tasks
+    if args.list_tasks:
+        print("Available tasks:")
+        for name in sorted(TASKS.keys()):
+            print(f"  {name}")
+        return
+
+    # Handle --ref-test
+    if args.ref_test:
+        if not args.submission:
+            parser.error("submission (reference file) is required for --ref-test")
+        ref_file = Path(args.submission)
+        if not ref_file.exists():
+            ref_file = PROJECT_ROOT / args.submission
+        if not ref_file.exists():
+            raise FileNotFoundError(f"Reference file not found: {args.submission}")
+
+        _log(f"Running reference test {ref_file.name} on Modal...")
+        ref_code = ref_file.read_text()
+        with app.run():
+            result = run_ref_test.remote(ref_code, ref_file.stem)
+
+        print(f"\n{'='*60}")
+        print(f"Reference test: {ref_file.stem}")
+        print(f"GPU: {result.get('system', {}).get('gpu', 'Unknown')}")
+        print(f"Return code: {result.get('returncode', 'Unknown')}")
+        print(f"{'='*60}")
+        print(result.get("stdout", ""))
+        if result.get("stderr"):
+            print("--- stderr ---")
+            print(result.get("stderr", ""))
+        return
 
     # Handle sync-only mode (no GPU needed)
     if args.sync_only:
