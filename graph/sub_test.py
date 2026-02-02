@@ -1437,6 +1437,9 @@ void kernel_v3b(
 }
 
 // @endkernel
+// experimental device snippet (placeholder)
+__device__ __forceinline__ int exp_add(int a, int b) { return a + b; }
+__device__ __forceinline__ int exp_sub(int a, int b) { return a - b; }
 // ----- host.cuh -----
 void check_cu(CUresult err) {
   if (err == CUDA_SUCCESS) return;
@@ -1660,6 +1663,8 @@ TORCH_LIBRARY(my_module_v3b, m) {
   m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C) -> Tensor");
   m.impl("gemm", &gemm_v3b);
 }
+// experimental host snippet (placeholder)
+inline int exp_host_noop(int x) { return x; }
 '''
 
 # @chunk name=python_header

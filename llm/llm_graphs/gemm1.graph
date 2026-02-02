@@ -1,39 +1,41 @@
-# sources:device
-cuda_lib/device.cuh:3-7 chunk=device_000
-cuda_lib/device.cuh:12-29 chunk=device_001
-cuda_lib/device.cuh:34-39 chunk=device_002
-cuda_lib/device.cuh:44-73 chunk=device_003
-cuda_lib/device.cuh:78-79 chunk=device_004
-cuda_lib/device.cuh:84-98 chunk=device_005
-cuda_lib/device.cuh:103-173 chunk=device_006
-cuda_lib/device.cuh:178-199 chunk=device_007
-cuda_lib/device.cuh:204-267 chunk=device_008
-cuda_lib/device.cuh:272-369 chunk=device_009
-cuda_lib/device.cuh:374-467 chunk=device_010
-cuda_lib/device.cuh:472-545 chunk=device_011
-cuda_lib/device.cuh:550-573 chunk=device_012
-cuda_lib/device.cuh:578-645 chunk=device_013
-cuda_lib/device.cuh:650-749 chunk=device_014
-cuda_lib/device.cuh:754-837 chunk=device_015
-# sources:host
-cuda_lib/host.cuh:3-9 chunk=host_000
-cuda_lib/host.cuh:14-17 chunk=host_001
-cuda_lib/host.cuh:22-49 chunk=host_002
-cuda_lib/host.cuh:54-115 chunk=host_003
-cuda_lib/host.cuh:120-146 chunk=host_004
-cuda_lib/host.cuh:151-154 chunk=host_005
-cuda_lib/host.cuh:159-217 chunk=host_006
-cuda_lib/host.cuh:222-248 chunk=host_007
-cuda_lib/host.cuh:253-256 chunk=host_008
-# sources:python
-cuda_lib/python.py:1-27
+# section:device
+Raw cuda_lib/device.cuh:3-7 chunk=device_000
+Raw cuda_lib/device.cuh:12-29 chunk=device_001
+Raw cuda_lib/device.cuh:34-39 chunk=device_002
+Raw cuda_lib/device.cuh:44-73 chunk=device_003
+Raw cuda_lib/device.cuh:78-79 chunk=device_004
+Raw cuda_lib/device.cuh:84-98 chunk=device_005
+Raw cuda_lib/device.cuh:103-173 chunk=device_006
+Raw cuda_lib/device.cuh:178-199 chunk=device_007
+Raw cuda_lib/device.cuh:204-267 chunk=device_008
+Raw cuda_lib/device.cuh:272-369 chunk=device_009
+Raw cuda_lib/device.cuh:374-467 chunk=device_010
+Raw cuda_lib/device.cuh:472-545 chunk=device_011
+Raw cuda_lib/device.cuh:550-573 chunk=device_012
+Raw cuda_lib/device.cuh:578-645 chunk=device_013
+Raw cuda_lib/device.cuh:650-749 chunk=device_014
+Raw cuda_lib/device.cuh:754-837 chunk=device_015
+Raw cuda_lib/experimental/device/device_00.cuh:1-3
+# section:host
+Raw cuda_lib/host.cuh:3-9 chunk=host_000
+Raw cuda_lib/host.cuh:14-17 chunk=host_001
+Raw cuda_lib/host.cuh:22-49 chunk=host_002
+Raw cuda_lib/host.cuh:54-115 chunk=host_003
+Raw cuda_lib/host.cuh:120-146 chunk=host_004
+Raw cuda_lib/host.cuh:151-154 chunk=host_005
+Raw cuda_lib/host.cuh:159-217 chunk=host_006
+Raw cuda_lib/host.cuh:222-248 chunk=host_007
+Raw cuda_lib/host.cuh:253-256 chunk=host_008
+Raw cuda_lib/experimental/host/host_00.cuh:1-2
+# section:python
+Raw cuda_lib/python.py:1-27
 # graph:
 Graph:
   buffers: ['tmem0', 'A_smem', 'B_smem', 'SFA_smem', 'SFB_smem']
   barriers: ['tma_mbar', 'mma_mbar', 'mainloop_mbar']
   tmaps: ['A_tmap', 'B_tmap']
   default_tmem: tmem0
-  section:device nodes=76
+  section:device nodes=77
     Block
       Raw(lines=5) meta=['chunk']
       Raw(lines=18) meta=['chunk']
@@ -135,7 +137,8 @@ Graph:
       Op(ptx_bar_sync) type=PtxBarSync
       Op(tcgen05_dealloc) type=Tcgen05Dealloc
       KernelEnd
-  section:host nodes=13
+      Raw(lines=3)
+  section:host nodes=14
     Block
       Raw(lines=7) meta=['chunk']
       Raw(lines=4) meta=['chunk']
@@ -150,6 +153,7 @@ Graph:
       Op(cute_tmap)
       Raw(lines=27) meta=['chunk']
       Raw(lines=4) meta=['chunk']
+      Raw(lines=2)
   section:python nodes=5
     Block
       Raw(lines=6) meta=['chunk']

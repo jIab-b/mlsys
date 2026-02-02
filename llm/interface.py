@@ -15,7 +15,7 @@ GRAPH_ROOT = ROOT / "graph"
 if str(GRAPH_ROOT) not in sys.path:
     sys.path.insert(0, str(GRAPH_ROOT))
 
-from compiler import _write_sub_test, build_gemm1_graph  # noqa: E402
+from compiler import _write_sub_test  # noqa: E402
 from graph.core import Graph, MemSpace  # noqa: E402
 from graph_string import graph_string  # noqa: E402
 from parse import _split_python_with_load_inline, _split_with_annotations  # noqa: E402
@@ -54,13 +54,13 @@ def _read_range(path: Path, start: int, end: int) -> str:
 def _parse_sources(graph_path: Path) -> Dict[str, List[SourceRange]]:
     sources: Dict[str, List[SourceRange]] = {"device": [], "host": [], "python": []}
     section: Optional[str] = None
-    source_re = re.compile(r"^(?P<path>[^:]+):(?P<start>\d+)-(?P<end>\d+)(?:\s+chunk=(?P<chunk>\S+))?$")
+    source_re = re.compile(r"^Raw\s+(?P<path>[^:]+):(?P<start>\d+)-(?P<end>\d+)(?:\s+chunk=(?P<chunk>\S+))?$")
 
     for raw in graph_path.read_text().splitlines():
         line = raw.strip()
         if not line:
             continue
-        if line.startswith("# sources:"):
+        if line.startswith("# section:"):
             section = line.split(":", 1)[1].strip()
             if section not in sources:
                 sources[section] = []
@@ -73,7 +73,7 @@ def _parse_sources(graph_path: Path) -> Dict[str, List[SourceRange]]:
             continue
         m = source_re.match(line)
         if not m:
-            raise ValueError(f"{graph_path}: invalid source line: {line}")
+            raise ValueError(f"{graph_path}: invalid raw line: {line}")
         path = (ROOT / m.group("path")).resolve()
         sources[section].append(
             SourceRange(
@@ -190,44 +190,55 @@ def cmd_make_graph(args: argparse.Namespace) -> int:
             ranges.append(SourceRange(path=path, start=start_line, end=end_line, chunk=name))
         return ranges
 
+    def _ranges_for_dir(dir_path: Path, prefix: str) -> List[SourceRange]:
+        ranges: List[SourceRange] = []
+        for path in sorted(dir_path.glob(f"{prefix}_*.cuh")):
+            ranges.extend(_ranges_for(path))
+        return ranges
+
     device_path = Path(args.device)
     host_path = Path(args.host)
     python_path = Path(args.python)
 
+    exp_device = _ranges_for_dir(DEVICE_EXP_DIR, "device")
+    exp_host = _ranges_for_dir(HOST_EXP_DIR, "host")
+
     sources = {
-        "device": _ranges_for(device_path),
-        "host": _ranges_for(host_path),
+        "device": _ranges_for(device_path) + exp_device,
+        "host": _ranges_for(host_path) + exp_host,
         "python": _ranges_for(python_path),
     }
 
-    g = build_gemm1_graph(
-        device_paths=[device_path],
-        host_paths=[host_path],
-        python_path=python_path,
-    )
+    g = _build_graph_from_sources(sources)
     validate_graph(g)
     dump = graph_string(g)
 
+    def _fmt_path(path: Path) -> str:
+        try:
+            return str(path.relative_to(ROOT))
+        except ValueError:
+            return str(path)
+
     lines = [
-        "# sources:device",
+        "# section:device",
         *[
-            f"{src.path}:{src.start}-{src.end} chunk={src.chunk}"
+            f"Raw {_fmt_path(src.path)}:{src.start}-{src.end} chunk={src.chunk}"
             if src.chunk
-            else f"{src.path}:{src.start}-{src.end}"
+            else f"Raw {_fmt_path(src.path)}:{src.start}-{src.end}"
             for src in sources["device"]
         ],
-        "# sources:host",
+        "# section:host",
         *[
-            f"{src.path}:{src.start}-{src.end} chunk={src.chunk}"
+            f"Raw {_fmt_path(src.path)}:{src.start}-{src.end} chunk={src.chunk}"
             if src.chunk
-            else f"{src.path}:{src.start}-{src.end}"
+            else f"Raw {_fmt_path(src.path)}:{src.start}-{src.end}"
             for src in sources["host"]
         ],
-        "# sources:python",
+        "# section:python",
         *[
-            f"{src.path}:{src.start}-{src.end} chunk={src.chunk}"
+            f"Raw {_fmt_path(src.path)}:{src.start}-{src.end} chunk={src.chunk}"
             if src.chunk
-            else f"{src.path}:{src.start}-{src.end}"
+            else f"Raw {_fmt_path(src.path)}:{src.start}-{src.end}"
             for src in sources["python"]
         ],
         "# graph:",
@@ -318,22 +329,31 @@ def cmd_append_raw(args: argparse.Namespace) -> int:
     prefix = "device" if section == "device" else "host"
 
     existing = sorted(exp_dir.glob(f"{prefix}_*.cuh"))
-    if existing:
-        target = existing[-1]
-    else:
-        target = exp_dir / f"{prefix}_00.cuh"
+    target = Path(args.path).resolve() if args.path else (existing[-1] if existing else exp_dir / f"{prefix}_00.cuh")
+    if target.parent.resolve() != exp_dir.resolve():
+        raise ValueError(f"path must be inside {exp_dir}")
+    if not target.exists() and args.path:
+        target.touch()
 
     lines = target.read_text().splitlines() if target.exists() else []
-    if len(lines) > 500:
+    if len(lines) >= 500:
         idx = len(existing)
         target = exp_dir / f"{prefix}_{idx:02d}.cuh"
         lines = []
 
+    expected_start = len(lines) + 1
+    if args.start_line is not None and args.start_line != expected_start:
+        raise ValueError(f"{target}: start_line {args.start_line} != expected {expected_start}")
+
+    code_lines = args.code.rstrip().splitlines() if args.code else [""]
     with target.open("a", encoding="utf-8") as f:
-        if lines and not lines[-1].endswith("\n"):
+        if lines:
             f.write("\n")
         f.write(args.code.rstrip() + "\n")
-    print(target)
+    start = expected_start
+    end = expected_start + len(code_lines) - 1
+    rel_target = target.relative_to(ROOT)
+    print(f"{rel_target}:{start}-{end}")
     return 0
 
 
@@ -384,6 +404,8 @@ def main() -> int:
     p_append = sub.add_parser("append-raw", help="Append raw code to experimental device/host")
     p_append.add_argument("--section", required=True, help="device or host")
     p_append.add_argument("--code", required=True, help="Raw code to append")
+    p_append.add_argument("--path", default=None, help="Explicit experimental file path to append to")
+    p_append.add_argument("--start-line", type=int, default=None, help="Expected start line for append validation")
     p_append.set_defaults(func=cmd_append_raw)
 
     args = parser.parse_args()
