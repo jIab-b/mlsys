@@ -1,0 +1,58 @@
+{
+  "kernels": {},
+  "runs": [],
+  "templates": {
+    "gemm_nvfp4_tma_warpspecialized_v4": {
+      "constraints": [
+        "K % 256 == 0",
+        "BLOCK_K == 256",
+        "BLOCK_M % 32 == 0",
+        "BLOCK_N in [64, 128]"
+      ],
+      "id": "gemm_nvfp4_tma_warpspecialized_v4",
+      "op_type": "gemm",
+      "params": [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "NUM_STAGES",
+        "SPLIT_K",
+        "SWAP_AB",
+        "C_N_MAJOR"
+      ],
+      "raw_groups": [
+        "prologue_tma_setup",
+        "mainloop_tma_mma",
+        "epilogue_writeback"
+      ],
+      "required_buffers": [
+        "tmem0",
+        "A_smem",
+        "B_smem",
+        "SFA_smem",
+        "SFB_smem"
+      ],
+      "required_ops": [
+        "mbarrier_init",
+        "mbarrier_arrive_expect_tx_cta",
+        "mbarrier_wait",
+        "tma_2d_gmem2smem",
+        "tcgen05_alloc",
+        "tcgen05_cp_nvfp4",
+        "tcgen05_mma_nvfp4",
+        "tcgen05_commit",
+        "tcgen05_wait_ld",
+        "tcgen05_dealloc"
+      ],
+      "summary": "B200 nvfp4 block-scaled GEMM with TMA pipeline + tcgen05 MMA",
+      "tags": [
+        "nvfp4",
+        "tma",
+        "tcgen05",
+        "warpspecialized",
+        "split_k"
+      ],
+      "version": 1
+    }
+  }
+}

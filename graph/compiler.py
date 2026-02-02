@@ -7,10 +7,12 @@ host/device/python raw code. The compiler emits sub_test.py with CUDA_SRC inline
 from __future__ import annotations
 
 import argparse
+import glob
+import importlib.util
 import re
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
@@ -83,6 +85,35 @@ def _select_ptx_headers(ptx_headers: list[Path], sources: list[str]) -> list[Pat
     return used_headers if used_headers else ([ptx_common] if ptx_common else [])
 
 
+def _expand_inputs(values: list[str]) -> list[Path]:
+    expanded: list[Path] = []
+    for value in values:
+        pattern = value
+        if not Path(value).is_absolute():
+            pattern = str(REPO_ROOT / value)
+        matches = [Path(p).resolve() for p in glob.glob(pattern, recursive=True)]
+        if matches:
+            expanded.extend(sorted(matches))
+        else:
+            expanded.append(Path(pattern).resolve())
+    return expanded
+
+
+def _load_graph_py(path: Path, fn_name: str = "build_graph") -> Graph:
+    spec = importlib.util.spec_from_file_location("graph_module", str(path))
+    if spec is None or spec.loader is None:
+        raise ValueError(f"Unable to load graph module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    fn = getattr(module, fn_name, None)
+    if fn is None:
+        raise AttributeError(f"{path}: missing function '{fn_name}'")
+    graph = fn()
+    if not isinstance(graph, Graph):
+        raise TypeError(f"{path}: '{fn_name}' did not return Graph")
+    return graph
+
+
 def _collect_load_inline_nodes(nodes: List[object]) -> List[object]:
     collected: List[object] = []
     for node in nodes:
@@ -130,19 +161,32 @@ def _build_cuda_src(
     return "".join(parts)
 
 
-def build_gemm1_graph() -> Graph:
+def build_gemm1_graph(
+    device_paths: Optional[List[Path]] = None,
+    host_paths: Optional[List[Path]] = None,
+    python_path: Optional[Path] = None,
+) -> Graph:
     g = Graph()
-    missing = [name for name, path in SECTION_FILES.items() if not path.exists()]
-    if missing:
-        raise FileNotFoundError(f"Missing cuda_lib files for gemm1: {missing}")
+    device_paths = device_paths or [SECTION_FILES["device"]]
+    host_paths = host_paths or [SECTION_FILES["host"]]
+    python_path = python_path or SECTION_FILES["python"]
 
-    load_section_nodes("device", SECTION_FILES["device"], g)
+    missing: list[str] = []
+    for path in device_paths + host_paths + [python_path]:
+        if not path.exists():
+            missing.append(str(path))
+    if missing:
+        raise FileNotFoundError(f"Missing source files: {missing}")
+
+    for path in device_paths:
+        load_section_nodes("device", path, g)
     if not g.buffers:
         g.add_buffer("tmem0", MemSpace.TMEM, (0,), "opaque")
-    load_section_nodes("host", SECTION_FILES["host"], g)
-    python_text = SECTION_FILES["python"].read_text()
+    for path in host_paths:
+        load_section_nodes("host", path, g)
+    python_text = python_path.read_text()
     pre_py, post_py = _split_python_with_load_inline(python_text)
-    for node in _split_with_annotations(pre_py, SECTION_FILES["python"], g):
+    for node in _split_with_annotations(pre_py, python_path, g):
         g.sections["python"].append(node)
     g.add_load_inline(
         "python",
@@ -163,7 +207,7 @@ def build_gemm1_graph() -> Graph:
         ],
         extra_ldflags=["-lcuda"],
     )
-    for node in _split_with_annotations(post_py, SECTION_FILES["python"], g):
+    for node in _split_with_annotations(post_py, python_path, g):
         g.sections["python"].append(node)
     return g
 
@@ -222,9 +266,69 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Compile graph into sub_test.py")
     parser.add_argument("--dump-graph", action="store_true", help="Print graph structure")
     parser.add_argument("--out", default="sub_test.py", help="Output sub_test.py path (relative to graph)")
+    parser.add_argument(
+        "--graph-py",
+        default=None,
+        help="Load graph from a Python file (expects build_graph()). Path is relative to repo root.",
+    )
+    parser.add_argument(
+        "--graph-fn",
+        default="build_graph",
+        help="Function name in --graph-py that returns a Graph (default: build_graph).",
+    )
+    parser.add_argument(
+        "--device",
+        action="append",
+        default=[],
+        help="Device source file(s). If set, overrides default cuda_lib/device.cuh. Paths are relative to repo root.",
+    )
+    parser.add_argument(
+        "--host",
+        action="append",
+        default=[],
+        help="Host source file(s). If set, overrides default cuda_lib/host.cuh. Paths are relative to repo root.",
+    )
+    parser.add_argument(
+        "--python",
+        default=None,
+        help="Python wrapper file. Defaults to cuda_lib/python.py. Path is relative to repo root.",
+    )
+    parser.add_argument(
+        "--extra-device",
+        action="append",
+        default=[],
+        help="Additional device source file(s) appended after --device/default.",
+    )
+    parser.add_argument(
+        "--extra-host",
+        action="append",
+        default=[],
+        help="Additional host source file(s) appended after --host/default.",
+    )
     args = parser.parse_args()
 
-    g = build_gemm1_graph()
+    if args.graph_py:
+        graph_paths = _expand_inputs([args.graph_py])
+        if len(graph_paths) != 1:
+            raise ValueError(f"--graph-py must resolve to a single file, got {graph_paths}")
+        g = _load_graph_py(graph_paths[0], args.graph_fn)
+    else:
+        device_paths = _expand_inputs(args.device) if args.device else [SECTION_FILES["device"]]
+        host_paths = _expand_inputs(args.host) if args.host else [SECTION_FILES["host"]]
+        if args.extra_device:
+            device_paths.extend(_expand_inputs(args.extra_device))
+        if args.extra_host:
+            host_paths.extend(_expand_inputs(args.extra_host))
+        python_paths = _expand_inputs([args.python]) if args.python else [SECTION_FILES["python"]]
+        if len(python_paths) != 1:
+            raise ValueError(f"--python must resolve to a single file, got {python_paths}")
+        python_path = python_paths[0]
+
+        g = build_gemm1_graph(
+            device_paths=device_paths,
+            host_paths=host_paths,
+            python_path=python_path,
+        )
     validate_graph(g)
     if args.dump_graph:
         print(graph_string(g))
