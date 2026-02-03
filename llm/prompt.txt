@@ -21,6 +21,10 @@ Context & guidance:
 - Focus on a vanilla TMA-producer / tcgen05-MMA consumer pipeline, tuned to minimize wasted work for small M.
 - Stick to cta_group::1 only.
 
+
+assume the benchmarking starts from the time custom_kernel is called. edits to most python / host side stuff should
+be fairly minimal, most work is done in device.
+
 Task spec (verbatim task.yml):
 ---
 # name: nvfp4-block-scaled-gemm

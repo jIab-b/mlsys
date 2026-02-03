@@ -22,6 +22,12 @@ KERNELS = {
         "tags": ["gemm", "nvfp4", "tma", "tcgen05", "warpspecialized", "grouped", "single_cta"],
         "kernels": ["grouped_gemm_kernel"],
     },
+    "__llm_test": {
+        "graph": "__llm_test.graph",
+        "description": "test entry",
+        "tags": ["test", "graph"],
+        "kernels": ["kernel_test"],
+    },
 }
 
 

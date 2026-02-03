@@ -1,0 +1,195 @@
+# section:device
+Raw cuda_lib/device.cuh:3-7 chunk=device_000
+Raw cuda_lib/device.cuh:12-29 chunk=device_001
+Raw cuda_lib/device.cuh:34-39 chunk=device_002
+Raw cuda_lib/device.cuh:44-73 chunk=device_003
+Raw cuda_lib/device.cuh:78-79 chunk=device_004
+Raw cuda_lib/device.cuh:84-98 chunk=device_005
+Raw cuda_lib/device.cuh:103-173 chunk=device_006
+Raw cuda_lib/device.cuh:178-199 chunk=device_007
+Raw cuda_lib/device.cuh:204-267 chunk=device_008
+Raw cuda_lib/device.cuh:272-369 chunk=device_009
+Raw cuda_lib/device.cuh:374-467 chunk=device_010
+Raw cuda_lib/device.cuh:472-545 chunk=device_011
+Raw cuda_lib/device.cuh:550-573 chunk=device_012
+Raw cuda_lib/device.cuh:578-645 chunk=device_013
+Raw cuda_lib/device.cuh:650-749 chunk=device_014
+Raw cuda_lib/device.cuh:754-837 chunk=device_015
+Raw cuda_lib/experimental/device/device_00.cuh:1-327
+# section:host
+Raw cuda_lib/host.cuh:3-9 chunk=host_000
+Raw cuda_lib/host.cuh:14-17 chunk=host_001
+Raw cuda_lib/host.cuh:22-49 chunk=host_002
+Raw cuda_lib/host.cuh:54-115 chunk=host_003
+Raw cuda_lib/host.cuh:120-146 chunk=host_004
+Raw cuda_lib/host.cuh:151-154 chunk=host_005
+Raw cuda_lib/host.cuh:159-217 chunk=host_006
+Raw cuda_lib/host.cuh:222-248 chunk=host_007
+Raw cuda_lib/host.cuh:253-256 chunk=host_008
+Raw cuda_lib/experimental/host/host_includes.cuh:1-4
+Raw cuda_lib/experimental/host/host_00.cuh:1-156
+# section:python
+Raw cuda_lib/experimental/python/python_00.py:1-84
+# graph:
+Graph:
+  buffers: ['tmem0', 'A_smem', 'B_smem', 'SFA_smem', 'SFB_smem']
+  barriers: ['tma_mbar', 'mma_mbar', 'mainloop_mbar']
+  tmaps: ['A_tmap', 'B_tmap']
+  default_tmem: tmem0
+  section:device nodes=103
+    Block
+      Raw(lines=5) meta=['chunk']
+      Raw(lines=18) meta=['chunk']
+      Raw(lines=6) meta=['chunk']
+      Raw(lines=30) meta=['chunk']
+      Raw(lines=2) meta=['chunk']
+      Raw(lines=15) meta=['chunk']
+      Raw(lines=71) meta=['chunk']
+      KernelStart(kernel_v4)
+      Raw(lines=22) meta=['chunk']
+      Op(mbarrier_init) type=MbarrierInit
+      Op(mbarrier_init) type=MbarrierInit
+      Op(mbarrier_init) type=MbarrierInit
+      Op(tcgen05_alloc) type=Tcgen05Alloc
+      Raw(lines=64) meta=['chunk']
+      Op(tma_3d_gmem2smem) type=Tma3dGmem2Smem
+      Op(tma_3d_gmem2smem) type=Tma3dGmem2Smem
+      Op(tma_gmem2smem) type=TmaGmem2Smem
+      Op(tma_gmem2smem) type=TmaGmem2Smem
+      Op(mbarrier_arrive_expect_tx) type=MbarrierArriveExpectTx
+      Op(mbarrier_wait) type=MbarrierWait
+      Raw(lines=98) meta=['chunk']
+      Op(mbarrier_wait) type=MbarrierWait
+      Op(tcgen05_cp) shape=32x128b type=Tcgen05Cp32x128bWarpx4
+      Op(tcgen05_cp) shape=32x128b type=Tcgen05Cp32x128bWarpx4
+      Op(tcgen05_mma) shape=mxf4nvf4.block16 type=Tcgen05MmaMxf4Nvf4Block16
+      Op(tcgen05_commit) type=Tcgen05Commit
+      Op(tcgen05_commit) type=Tcgen05Commit
+      Raw(lines=94) meta=['chunk']
+      Op(mbarrier_wait) type=MbarrierWait
+      Op(tcgen05_fence_after_thread_sync) type=Tcgen05FenceAfterThreadSync
+      If {'cond': 'WIDTH==128'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=32x32b num=128 type=Tcgen05Ld32x32bX128
+      If {'cond': 'WIDTH==64'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=32x32b num=64 type=Tcgen05Ld32x32bX64
+      If {'cond': 'WIDTH==32'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=32x32b num=32 type=Tcgen05Ld32x32bX32
+      Op(tcgen05_wait_ld) type=Tcgen05WaitLd
+      If {'cond': 'BLOCK_N==128'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=16x256b num=16 type=Tcgen05Ld16x256bX16
+      If {'cond': 'BLOCK_N==64'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=16x256b num=8 type=Tcgen05Ld16x256bX8
+      If {'cond': 'BLOCK_N==32'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=16x256b num=4 type=Tcgen05Ld16x256bX4
+      Op(tcgen05_wait_ld) type=Tcgen05WaitLd
+      Op(ptx_bar_sync) type=PtxBarSync
+      Op(tcgen05_dealloc) type=Tcgen05Dealloc
+      KernelEnd
+      Raw(lines=74) meta=['chunk']
+      KernelStart(kernel_v3b)
+      Raw(lines=24) meta=['chunk']
+      Op(mbarrier_init) type=MbarrierInit
+      Op(mbarrier_init) type=MbarrierInit
+      Op(mbarrier_init) type=MbarrierInit
+      Op(tcgen05_alloc) type=Tcgen05Alloc
+      Raw(lines=68) meta=['chunk']
+      Op(tma_3d_gmem2smem) type=Tma3dGmem2Smem
+      Op(tma_3d_gmem2smem) type=Tma3dGmem2Smem
+      Op(tma_gmem2smem) type=TmaGmem2Smem
+      Op(tma_gmem2smem) type=TmaGmem2Smem
+      Op(mbarrier_arrive_expect_tx) type=MbarrierArriveExpectTx
+      Op(mbarrier_wait) type=MbarrierWait
+      Raw(lines=100) meta=['chunk']
+      Op(mbarrier_wait) type=MbarrierWait
+      Op(tcgen05_cp) shape=32x128b type=Tcgen05Cp32x128bWarpx4
+      Op(tcgen05_cp) shape=32x128b type=Tcgen05Cp32x128bWarpx4
+      Op(tcgen05_mma) shape=mxf4nvf4.block16 type=Tcgen05MmaMxf4Nvf4Block16
+      Op(tcgen05_commit) type=Tcgen05Commit
+      Op(tcgen05_commit) type=Tcgen05Commit
+      Raw(lines=84) meta=['chunk']
+      Op(mbarrier_wait) type=MbarrierWait
+      Op(tcgen05_fence_after_thread_sync) type=Tcgen05FenceAfterThreadSync
+      If {'cond': 'WIDTH==128'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=32x32b num=128 type=Tcgen05Ld32x32bX128
+      If {'cond': 'WIDTH==64'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=32x32b num=64 type=Tcgen05Ld32x32bX64
+      If {'cond': 'WIDTH==32'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=32x32b num=32 type=Tcgen05Ld32x32bX32
+      Op(tcgen05_wait_ld) type=Tcgen05WaitLd
+      If {'cond': 'BLOCK_N==128'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=16x256b num=16 type=Tcgen05Ld16x256bX16
+      If {'cond': 'BLOCK_N==64'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=16x256b num=8 type=Tcgen05Ld16x256bX8
+      If {'cond': 'BLOCK_N==32'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=16x256b num=4 type=Tcgen05Ld16x256bX4
+      Op(tcgen05_wait_ld) type=Tcgen05WaitLd
+      Op(ptx_bar_sync) type=PtxBarSync
+      Op(tcgen05_dealloc) type=Tcgen05Dealloc
+      KernelEnd
+      Raw(lines=327)
+      KernelStart(grouped_gemm_kernel)
+      Op(mbarrier_init) type=MbarrierInit
+      Op(mbarrier_init) type=MbarrierInit
+      Op(mbarrier_init) type=MbarrierInit
+      Op(tcgen05_alloc) type=Tcgen05Alloc
+      Op(tma_gmem2smem) type=TmaGmem2Smem
+      Op(tma_gmem2smem) type=TmaGmem2Smem
+      Op(tma_gmem2smem) type=TmaGmem2Smem
+      Op(tma_gmem2smem) type=TmaGmem2Smem
+      Op(mbarrier_arrive_expect_tx) type=MbarrierArriveExpectTx
+      Op(mbarrier_wait) type=MbarrierWait
+      Op(mbarrier_wait) type=MbarrierWait
+      Op(tcgen05_cp) shape=32x128b type=Tcgen05Cp32x128bWarpx4
+      Op(tcgen05_cp) shape=32x128b type=Tcgen05Cp32x128bWarpx4
+      Op(tcgen05_mma) shape=mxf4nvf4.block16 type=Tcgen05MmaMxf4Nvf4Block16
+      Op(tcgen05_commit) type=Tcgen05Commit
+      Op(tcgen05_commit) type=Tcgen05Commit
+      Op(mbarrier_wait) type=MbarrierWait
+      Op(tcgen05_fence_after_thread_sync) type=Tcgen05FenceAfterThreadSync
+      If {'cond': 'BLOCK_N==128'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=16x256b num=16 type=Tcgen05Ld16x256bX16
+      If {'cond': 'BLOCK_N==64'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=16x256b num=8 type=Tcgen05Ld16x256bX8
+      If {'cond': 'BLOCK_N==32'} meta=['validate_only']
+        Then
+          Op(tcgen05_ld) shape=16x256b num=4 type=Tcgen05Ld16x256bX4
+      Op(tcgen05_wait_ld) type=Tcgen05WaitLd
+      Op(ptx_bar_sync) type=PtxBarSync
+      Op(tcgen05_dealloc) type=Tcgen05Dealloc
+      KernelEnd
+  section:host nodes=14
+    Block
+      Raw(lines=7) meta=['chunk']
+      Raw(lines=4) meta=['chunk']
+      Raw(lines=28) meta=['chunk']
+      Raw(lines=62) meta=['chunk']
+      Op(cute_tmap)
+      Op(cute_tmap)
+      Raw(lines=27) meta=['chunk']
+      Raw(lines=4) meta=['chunk']
+      Raw(lines=59) meta=['chunk']
+      Op(cute_tmap)
+      Op(cute_tmap)
+      Raw(lines=27) meta=['chunk']
+      Raw(lines=4) meta=['chunk']
+      Raw(lines=152)
+  section:python nodes=4
+    Block
+      Raw(lines=6) meta=['chunk']
+      LoadInline(name=gemm_all)
+      Raw(lines=3) meta=['chunk']
+      Raw(lines=43) meta=['chunk']

@@ -1,0 +1,49 @@
+llm/interface.py usage (single entrypoint)
+
+Purpose:
+- Build graphs, compile/eval, and edit files exclusively via the CLI.
+- All destructive ops create a backup under .llm_backups/ and print the backup path.
+
+Core commands:
+1) make-graph
+   python llm/interface.py make-graph --name <graph_name> \
+     --device cuda_lib/device.cuh --host cuda_lib/host.cuh --python cuda_lib/python.py
+
+2) compile + eval
+   python llm/interface.py compile --graph graph/kernel_graphs/<name>.graph --out graph/sub_test.py
+   python llm/interface.py eval --task <gemm|grouped_gemm|...> --mode benchmark \
+     --submission graph/sub_test.py --out out.txt
+
+3) append raw code (experimental sources only)
+   python llm/interface.py append-raw --section device|host|python \
+     --path cuda_lib/experimental/<device|host|python>/<file> \
+     --start-line <expected_next_line> \
+     --code "<raw code block>"
+
+File edits (with backups):
+4) edit-range (replace/insert/delete by line numbers)
+   python llm/interface.py edit-range --path <file> --start-line 10 --end-line 20 --code "..."
+   python llm/interface.py edit-range --path <file> --start-line 10 --end-line 20 --mode delete
+   python llm/interface.py edit-range --path <file> --start-line 10 --end-line 10 --mode insert_before --code "..."
+   python llm/interface.py edit-range --path <file> --start-line 10 --end-line 10 --mode insert_after --code "..."
+
+5) delete-range (explicit destructive counterpart)
+   python llm/interface.py delete-range --path <file> --start-line 10 --end-line 20
+
+6) delete-file / delete-graph
+   python llm/interface.py delete-file --path <file>
+   python llm/interface.py delete-graph --name <graph_name>
+
+Registry ops:
+7) register/unregister graph
+   python llm/interface.py register-graph --name <kernel_name> --graph <name>.graph \
+     --description "..." --tags tag1,tag2 --kernels kernel_fn1,kernel_fn2
+   python llm/interface.py unregister-graph --name <kernel_name>
+
+Undo:
+8) restore from backup
+   python llm/interface.py restore-file --backup .llm_backups/<stamp>__<path>.bak --path <file>
+
+Notes:
+- Backups are created for any change and printed as "backup:<path>".
+- For append-raw, the file must live under cuda_lib/experimental/<section>/.
