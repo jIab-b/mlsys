@@ -37,6 +37,9 @@ def _format_node(node: Node, indent: int = 0) -> List[str]:
         lines = [f"{pad}KernelStart({name})"]
     elif node.kind == "KernelEnd":
         lines = [f"{pad}KernelEnd"]
+    elif node.kind == "Launch":
+        args = f" {node.args}" if node.args else ""
+        lines = [f"{pad}Launch{args}"]
     else:
         args = f" {node.args}" if node.args else ""
         meta = "" if not node.meta else f" meta={list(node.meta.keys())}"

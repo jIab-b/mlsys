@@ -247,6 +247,10 @@ def _split_with_annotations(
         elif kind == "endkernel":
             events.append(Node(kind="KernelEnd", args={}, loc=loc))
             pending_op = None
+        elif kind == "launch":
+            args = _parse_kv_tokens(shlex.split(body)) if body else {}
+            events.append(Node(kind="Launch", args=args, loc=loc))
+            pending_op = None
         else:
             # Unknown annotation: keep it in Raw, but do not validate
             pending_op = None

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import re
 import subprocess
 import sys
@@ -21,17 +20,11 @@ from graph_string import graph_string  # noqa: E402
 from parse import _split_python_with_load_inline, _split_with_annotations  # noqa: E402
 from state_machine import validate_graph  # noqa: E402
 
-from ledger import (  # noqa: E402
-    DEFAULT_LEDGER_PATH,
-    insert_kernel,
-    insert_run,
-    reset_ledger,
-)
-
 CUDA_EXP_ROOT = ROOT / "cuda_lib" / "experimental"
 DEVICE_EXP_DIR = CUDA_EXP_ROOT / "device"
 HOST_EXP_DIR = CUDA_EXP_ROOT / "host"
-LLM_GRAPHS_DIR = Path(__file__).resolve().parent / "llm_graphs"
+PY_EXP_DIR = CUDA_EXP_ROOT / "python"
+KERNEL_GRAPHS_DIR = GRAPH_ROOT / "kernel_graphs"
 
 
 @dataclass
@@ -146,29 +139,17 @@ def _build_graph_from_sources(sources: Dict[str, List[SourceRange]]) -> Graph:
     return g
 
 
-def _hash_files(paths: List[Path]) -> str:
-    h = hashlib.sha256()
-    for path in paths:
-        if path.exists():
-            h.update(path.read_bytes())
-    return h.hexdigest()
-
-
 def _ensure_exp_dirs() -> None:
     DEVICE_EXP_DIR.mkdir(parents=True, exist_ok=True)
     HOST_EXP_DIR.mkdir(parents=True, exist_ok=True)
-    LLM_GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def cmd_init_ledger(args: argparse.Namespace) -> int:
-    reset_ledger(Path(args.ledger))
-    return 0
+    PY_EXP_DIR.mkdir(parents=True, exist_ok=True)
+    KERNEL_GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def cmd_make_graph(args: argparse.Namespace) -> int:
     _ensure_exp_dirs()
     name = args.name
-    graph_path = LLM_GRAPHS_DIR / f"{name}.graph"
+    graph_path = KERNEL_GRAPHS_DIR / f"{name}.graph"
 
     def _ranges_for(path: Path) -> List[SourceRange]:
         text = path.read_text()
@@ -279,57 +260,27 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return result.returncode
 
 
-def cmd_record_run(args: argparse.Namespace) -> int:
-    ledger_path = Path(args.ledger)
-    graph_path = Path(args.graph)
-    sources = _parse_sources(graph_path)
-    device_files = {s.path for s in sources.get("device", [])}
-    host_files = {s.path for s in sources.get("host", [])}
-    python_files = {s.path for s in sources.get("python", [])}
-
-    kernel_id = args.kernel_id
-    code_hash = _hash_files(sorted(device_files | host_files | python_files))
-    graph_hash = _hash_files([graph_path])
-
-    insert_kernel(
-        {
-            "id": kernel_id,
-            "template_id": args.template_id,
-            "code_hash": code_hash,
-            "graph_hash": graph_hash,
-            "cuda_dir": str(CUDA_EXP_ROOT),
-            "graph_path": str(graph_path),
-            "params": args.params,
-            "notes": args.notes,
-        },
-        path=ledger_path,
-    )
-    insert_run(
-        {
-            "id": args.run_id,
-            "kernel_id": kernel_id,
-            "task_name": args.task,
-            "status": args.status,
-            "metric": args.metric,
-            "time_us": args.time_us,
-            "cli_cmd": args.cli_cmd,
-            "log_ref": args.log_ref,
-        },
-        path=ledger_path,
-    )
-    return 0
-
-
 def cmd_append_raw(args: argparse.Namespace) -> int:
     _ensure_exp_dirs()
     section = args.section
-    if section not in {"device", "host"}:
-        raise ValueError("section must be 'device' or 'host'")
-    exp_dir = DEVICE_EXP_DIR if section == "device" else HOST_EXP_DIR
-    prefix = "device" if section == "device" else "host"
+    if section not in {"device", "host", "python"}:
+        raise ValueError("section must be 'device', 'host', or 'python'")
+    if section == "device":
+        exp_dir = DEVICE_EXP_DIR
+        prefix = "device"
+        suffix = ".cuh"
+    elif section == "host":
+        exp_dir = HOST_EXP_DIR
+        prefix = "host"
+        suffix = ".cuh"
+    else:
+        exp_dir = PY_EXP_DIR
+        prefix = "python"
+        suffix = ".py"
 
-    existing = sorted(exp_dir.glob(f"{prefix}_*.cuh"))
-    target = Path(args.path).resolve() if args.path else (existing[-1] if existing else exp_dir / f"{prefix}_00.cuh")
+    existing = sorted(exp_dir.glob(f"{prefix}_*{suffix}"))
+    default_target = exp_dir / f"{prefix}_00{suffix}"
+    target = Path(args.path).resolve() if args.path else (existing[-1] if existing else default_target)
     if target.parent.resolve() != exp_dir.resolve():
         raise ValueError(f"path must be inside {exp_dir}")
     if not target.exists() and args.path:
@@ -338,7 +289,7 @@ def cmd_append_raw(args: argparse.Namespace) -> int:
     lines = target.read_text().splitlines() if target.exists() else []
     if len(lines) >= 500:
         idx = len(existing)
-        target = exp_dir / f"{prefix}_{idx:02d}.cuh"
+        target = exp_dir / f"{prefix}_{idx:02d}{suffix}"
         lines = []
 
     expected_start = len(lines) + 1
@@ -361,18 +312,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="LLM interface for kernel tooling")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_init = sub.add_parser("init-ledger", help="Reset ledger JSON")
-    p_init.add_argument("--ledger", default=str(DEFAULT_LEDGER_PATH))
-    p_init.set_defaults(func=cmd_init_ledger)
-
     p_graph = sub.add_parser("make-graph", help="Create a graph file from sources")
-    p_graph.add_argument("--name", required=True, help="Graph name (llm_graphs/<name>.graph)")
+    p_graph.add_argument("--name", required=True, help="Graph name (kernel_graphs/<name>.graph)")
     p_graph.add_argument("--device", default=str(ROOT / "cuda_lib" / "device.cuh"))
     p_graph.add_argument("--host", default=str(ROOT / "cuda_lib" / "host.cuh"))
     p_graph.add_argument("--python", default=str(ROOT / "cuda_lib" / "python.py"))
     p_graph.set_defaults(func=cmd_make_graph)
 
-    p_compile = sub.add_parser("compile", help="Compile from llm graph file")
+    p_compile = sub.add_parser("compile", help="Compile from graph file")
     p_compile.add_argument("--graph", required=True, help="Path to .graph file")
     p_compile.add_argument("--out", default="sub_test.py")
     p_compile.add_argument("--dump-graph", action="store_true")
@@ -384,22 +331,6 @@ def main() -> int:
     p_eval.add_argument("--submission", default="graph/sub_test.py")
     p_eval.add_argument("--out", default="out_test.txt")
     p_eval.set_defaults(func=cmd_eval)
-
-    p_run = sub.add_parser("record-run", help="Record a run in ledger JSON")
-    p_run.add_argument("--ledger", default=str(DEFAULT_LEDGER_PATH))
-    p_run.add_argument("--graph", required=True)
-    p_run.add_argument("--kernel-id", required=True)
-    p_run.add_argument("--template-id", default=None)
-    p_run.add_argument("--run-id", required=True)
-    p_run.add_argument("--task", required=True)
-    p_run.add_argument("--status", required=True)
-    p_run.add_argument("--metric", default=None)
-    p_run.add_argument("--time-us", type=float, default=None)
-    p_run.add_argument("--cli-cmd", default=None)
-    p_run.add_argument("--log-ref", default=None)
-    p_run.add_argument("--params", default=None)
-    p_run.add_argument("--notes", default=None)
-    p_run.set_defaults(func=cmd_record_run)
 
     p_append = sub.add_parser("append-raw", help="Append raw code to experimental device/host")
     p_append.add_argument("--section", required=True, help="device or host")

@@ -796,7 +796,7 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
             state.last_alloc_cols = merged.last_alloc_cols
             continue
 
-        if node.kind in ("Raw", "LoadInline"):
+        if node.kind in ("Raw", "LoadInline", "Launch"):
             # Raw nodes are opaque; validation happens only on annotated ops.
             continue
         if node.kind == "Op":

@@ -88,7 +88,7 @@ def _emit_nodes(
             if raw:
                 lines.append(raw.rstrip("\n") + "\n")
             continue
-        if node.kind in ("Op", "KernelStart", "KernelEnd"):
+        if node.kind in ("Op", "KernelStart", "KernelEnd", "Launch"):
             continue
 
         if node.kind == "For":
