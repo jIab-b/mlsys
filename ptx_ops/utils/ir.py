@@ -76,6 +76,48 @@ class SourceLoc:
     column: int = 1
 
 
+@dataclass
+class OpNode(Node):
+    def __init__(self, op: str, args: Optional[Dict[str, Any]] = None, loc: Optional[SourceLoc] = None) -> None:
+        super().__init__(kind="Op", args={"op": op, "op_args": args or {}}, loc=loc)
+
+
+@dataclass
+class RawNode(Node):
+    def __init__(self, code: str, meta: Optional[Dict[str, str]] = None) -> None:
+        super().__init__(kind="Raw", args={"code": code}, meta=meta or {})
+
+
+@dataclass
+class LoadInlineNode(Node):
+    def __init__(
+        self,
+        name: str,
+        cuda_src_var: str = "CUDA_SRC",
+        cpp_sources: str = "",
+        extra_cuda_cflags: Optional[List[str]] = None,
+        extra_ldflags: Optional[List[str]] = None,
+        verbose: bool = False,
+        is_python_module: bool = False,
+        no_implicit_headers: bool = True,
+        sections: Optional[List[str]] = None,
+    ) -> None:
+        super().__init__(
+            kind="LoadInline",
+            args={
+                "name": name,
+                "cuda_src_var": cuda_src_var,
+                "cpp_sources": cpp_sources,
+                "extra_cuda_cflags": extra_cuda_cflags or [],
+                "extra_ldflags": extra_ldflags or [],
+                "verbose": verbose,
+                "is_python_module": is_python_module,
+                "no_implicit_headers": no_implicit_headers,
+                "sections": sections or [],
+            },
+        )
+
+
 class Graph:
     def __init__(self) -> None:
         self.sections: Dict[str, List[Node]] = {"device": [], "host": [], "python": []}
@@ -131,15 +173,11 @@ class Graph:
         return node
 
     def add_raw(self, section: str, code: str, meta: Optional[Dict[str, str]] = None) -> Node:
-        from .nodes.raw import RawNode
-
         node = RawNode(code=code, meta=meta or {})
         self.sections[section].append(node)
         return node
 
     def add_load_inline(self, section: str, **kwargs: Any) -> Node:
-        from .nodes.load_inline import LoadInlineNode
-
         node = LoadInlineNode(**kwargs)
         self.sections[section].append(node)
         return node
@@ -158,4 +196,4 @@ class Graph:
         return Node(kind="For", args={"var": var, "iters": str(iters)}, children=body)
 
     def raw(self, code: str, meta: Optional[Dict[str, str]] = None) -> Node:
-        return Node(kind="Raw", args={"code": code}, meta=meta or {})
+        return RawNode(code=code, meta=meta or {})

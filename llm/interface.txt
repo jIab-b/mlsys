@@ -10,9 +10,10 @@ Core commands:
      --device cuda_lib/device.cuh --host cuda_lib/host.cuh --python cuda_lib/python.py
 
 2) compile + eval
-   python llm/interface.py compile --graph graph/kernel_graphs/<name>.graph --out graph/sub_test.py
+   python llm/interface.py compile --graph kernel_graphs/<name>.graph --out graph/sub_test.py --backend ptx_inline
    python llm/interface.py eval --task <gemm|grouped_gemm|...> --mode benchmark \
      --submission graph/sub_test.py --out out.txt
+   # backend scaffold available (not implemented yet): --backend cute
 
 3) dynamic validation (60s timeout per Modal eval subprocess)
    python llm/interface.py validate-dynamic --task grouped_gemm --mode test \

@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from graph.core import BarrierState, BufferState, OpContract
+from ptx_ops.utils.ir import BarrierState, BufferState, OpContract
 
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent.parent

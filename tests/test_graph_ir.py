@@ -21,7 +21,7 @@ def _run() -> None:
     from state_machine import validate_graph  # noqa: WPS433
     from syntax import load_typed_graph  # noqa: WPS433
 
-    graph_dir = repo_root / "graph" / "kernel_graphs"
+    graph_dir = repo_root / "kernel_graphs"
     checks = [
         ("gemm1.graph", {"kernel_v4", "kernel_v3b"}),
         ("grouped_gemm.graph", {"grouped_gemm_kernel"}),

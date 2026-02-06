@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Optional
 
-from graph.core import Graph, Node
+from ptx_ops.utils.ir import Graph, Node
 from ptx_ops.spec import (
     PTX_TCGEN05_CP_SHAPE_TILE,
     PTX_TCGEN05_MMA_SHAPES,

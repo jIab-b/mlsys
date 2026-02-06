@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from graph.core import BarrierState, BufferState, Graph, MemSpace, Node, SourceLoc
+from ptx_ops.utils.ir import BarrierState, BufferState, Graph, MemSpace, Node, SourceLoc
 from ptx_ops.spec import (
     BARRIER_SCOPES,
     CTA_MASK_BITS,

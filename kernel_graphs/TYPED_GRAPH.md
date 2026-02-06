@@ -44,7 +44,7 @@ Run:
 
 ```bash
 python tests/test_graph_ir.py
-python llm/interface.py compile --graph graph/kernel_graphs/gemm1.graph --validate-only
-python llm/interface.py compile --graph graph/kernel_graphs/grouped_gemm.graph --validate-only
+python llm/interface.py compile --graph kernel_graphs/gemm1.graph --validate-only
+python llm/interface.py compile --graph kernel_graphs/grouped_gemm.graph --validate-only
 python llm/interface.py validate-dynamic --submission llm/sub_grouped_gemm.py --task grouped_gemm --timeout-seconds 60
 ```

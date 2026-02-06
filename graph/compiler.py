@@ -24,7 +24,7 @@ if str(ROOT) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from graph.core import Graph, MemSpace  # noqa: E402
+from ptx_ops.utils.ir import Graph, MemSpace  # noqa: E402
 from syntax import (  # noqa: E402
     _emit_nodes,
     _split_python_with_load_inline,

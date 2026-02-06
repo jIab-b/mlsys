@@ -7,17 +7,17 @@ Rules (must follow):
      --path cuda_lib/experimental/<device|host|python>/<file> \
      --start-line <expected_next_line> \
      --code "<raw code block>"
-2) Use the returned file:line-range to update graph/kernel_graphs/<name>.graph.
-3) Register new kernels in graph/kernel_graphs/registry.py (name, graph, tags, kernel list).
+2) Use the returned file:line-range to update kernel_graphs/<name>.graph.
+3) Register new kernels in kernel_graphs/registry.py (name, graph, tags, kernel list).
 4) Only PTX wrapper functions listed in llm/tcgen.cuh (ptx_lib) may be used. No inline PTX.
 5) All PTX/tcgen/tma/mbarrier calls must be annotated per llm/op_sig.h.
 6) Compile and validate with:
-   python llm/interface.py compile --graph graph/kernel_graphs/<name>.graph --out graph/sub_test.py
+   python llm/interface.py compile --graph kernel_graphs/<name>.graph --out graph/sub_test.py
 7) Evaluate with:
    python llm/interface.py eval --task gemm --mode benchmark --submission graph/sub_test.py --out out_test.txt
 
 Context & guidance:
-- Use the existing graph kernel in graph/kernel_graphs/gemm1.graph as a reference for annotation style.
+- Use the existing graph kernel in kernel_graphs/gemm1.graph as a reference for annotation style.
 - Focus on a vanilla TMA-producer / tcgen05-MMA consumer pipeline, tuned to minimize wasted work for small M.
 - Stick to cta_group::1 only.
 

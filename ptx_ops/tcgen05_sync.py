@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Type
 
-from graph.nodes.op import OpNode
+from ptx_ops.utils.ir import OpNode
 
 
 class Tcgen05SyncOp(OpNode):
