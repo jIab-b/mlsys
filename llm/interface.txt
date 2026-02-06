@@ -14,34 +14,40 @@ Core commands:
    python llm/interface.py eval --task <gemm|grouped_gemm|...> --mode benchmark \
      --submission graph/sub_test.py --out out.txt
 
-3) append raw code (experimental sources only)
+3) dynamic validation (60s timeout per Modal eval subprocess)
+   python llm/interface.py validate-dynamic --task grouped_gemm --mode test \
+     --submission llm/sub_grouped_gemm.py --out-dir dynamic_out --timeout-seconds 60
+   # optional sanitizer lanes:
+   #   --memcheck --racecheck
+
+4) append raw code (experimental sources only)
    python llm/interface.py append-raw --section device|host|python \
      --path cuda_lib/experimental/<device|host|python>/<file> \
      --start-line <expected_next_line> \
      --code "<raw code block>"
 
 File edits (with backups):
-4) edit-range (replace/insert/delete by line numbers)
+5) edit-range (replace/insert/delete by line numbers)
    python llm/interface.py edit-range --path <file> --start-line 10 --end-line 20 --code "..."
    python llm/interface.py edit-range --path <file> --start-line 10 --end-line 20 --mode delete
    python llm/interface.py edit-range --path <file> --start-line 10 --end-line 10 --mode insert_before --code "..."
    python llm/interface.py edit-range --path <file> --start-line 10 --end-line 10 --mode insert_after --code "..."
 
-5) delete-range (explicit destructive counterpart)
+6) delete-range (explicit destructive counterpart)
    python llm/interface.py delete-range --path <file> --start-line 10 --end-line 20
 
-6) delete-file / delete-graph
+7) delete-file / delete-graph
    python llm/interface.py delete-file --path <file>
    python llm/interface.py delete-graph --name <graph_name>
 
 Registry ops:
-7) register/unregister graph
+8) register/unregister graph
    python llm/interface.py register-graph --name <kernel_name> --graph <name>.graph \
      --description "..." --tags tag1,tag2 --kernels kernel_fn1,kernel_fn2
    python llm/interface.py unregister-graph --name <kernel_name>
 
 Undo:
-8) restore from backup
+9) restore from backup
    python llm/interface.py restore-file --backup .llm_backups/<stamp>__<path>.bak --path <file>
 
 Notes:

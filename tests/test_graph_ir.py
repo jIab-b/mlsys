@@ -15,6 +15,7 @@ def _iter_nodes(nodes: Iterable[object]) -> Iterable[object]:
 
 def _run() -> None:
     repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root))
     sys.path.insert(0, str(repo_root / "graph"))
 
     from state_machine import validate_graph  # noqa: WPS433

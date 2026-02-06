@@ -13,12 +13,14 @@ from typing import Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 GRAPH_ROOT = ROOT / "graph"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 if str(GRAPH_ROOT) not in sys.path:
     sys.path.insert(0, str(GRAPH_ROOT))
 
 from compiler import _write_sub_test  # noqa: E402
 from graph.core import Graph, MemSpace  # noqa: E402
-from state_machine import validate_graph  # noqa: E402
+from state_machine import run_dynamic_suite, validate_graph  # noqa: E402
 from syntax import (  # noqa: E402
     TypedGraphError,
     _parse_chunked_source,
@@ -484,6 +486,39 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return result.returncode
 
 
+def cmd_validate_dynamic(args: argparse.Namespace) -> int:
+    submission = Path(args.submission)
+    if not submission.exists():
+        submission = ROOT / args.submission
+    submission = submission.resolve()
+    if not submission.exists():
+        raise FileNotFoundError(f"submission not found: {args.submission}")
+
+    out_dir = Path(args.out_dir)
+    if not out_dir.is_absolute():
+        out_dir = ROOT / out_dir
+    out_dir = out_dir.resolve()
+
+    results = run_dynamic_suite(
+        repo_root=ROOT,
+        task=args.task,
+        mode=args.mode,
+        submission=submission,
+        output_dir=out_dir,
+        timeout_seconds=args.timeout_seconds,
+        include_memcheck=args.memcheck,
+        include_racecheck=args.racecheck,
+    )
+
+    failed = False
+    for result in results:
+        status = "timeout" if result.timed_out else ("pass" if result.returncode == 0 else "fail")
+        print(f"{result.label}: {status} out={result.output_path}")
+        if result.timed_out or result.returncode != 0:
+            failed = True
+    return 112 if failed else 0
+
+
 def cmd_append_raw(args: argparse.Namespace) -> int:
     _ensure_exp_dirs()
     section = args.section
@@ -657,6 +692,16 @@ def main() -> int:
     p_eval.add_argument("--submission", default="sub_test.py")
     p_eval.add_argument("--out", default="out_test.txt")
     p_eval.set_defaults(func=cmd_eval)
+
+    p_dyn = sub.add_parser("validate-dynamic", help="Run dynamic validation via Modal eval with optional sanitizers")
+    p_dyn.add_argument("--task", default="grouped_gemm")
+    p_dyn.add_argument("--mode", default="test", choices=["test", "benchmark", "leaderboard"])
+    p_dyn.add_argument("--submission", required=True, help="Path to submission .py")
+    p_dyn.add_argument("--out-dir", default="dynamic_out")
+    p_dyn.add_argument("--timeout-seconds", type=int, default=60)
+    p_dyn.add_argument("--memcheck", action="store_true", help="Also run compute-sanitizer memcheck")
+    p_dyn.add_argument("--racecheck", action="store_true", help="Also run compute-sanitizer racecheck")
+    p_dyn.set_defaults(func=cmd_validate_dynamic)
 
     p_append = sub.add_parser("append-raw", help="Append raw code to experimental device/host/python")
     p_append.add_argument("--section", required=True, help="device, host, or python")

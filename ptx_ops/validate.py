@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Optional
 
 from graph.core import Graph, Node
-from ops.spec import (
+from ptx_ops.spec import (
     PTX_TCGEN05_CP_SHAPE_TILE,
     PTX_TCGEN05_MMA_SHAPES,
     PTX_TCGEN05_NO_TRANSPOSE_KINDS,

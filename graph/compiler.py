@@ -21,6 +21,8 @@ PTX_LIB = REPO_ROOT / "ptx_lib"
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from graph.core import Graph, MemSpace  # noqa: E402
 from syntax import (  # noqa: E402

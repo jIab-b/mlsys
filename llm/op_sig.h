@@ -18,7 +18,7 @@
 //   when=<expr>             (validation-only conditional)
 //
 // NOTE: The validator enforces only what is specified in graph/static_validator.py
-// and graph/state_machine.py. Keep annotations aligned with those constraints.
+// and graph/state_machine/static.py. Keep annotations aligned with those constraints.
 //
 // ---------------------------------------------------------------------------
 // tcgen05 (tmem) ops

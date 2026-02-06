@@ -32,9 +32,13 @@ Kernel graphs in this directory now use a typed IR format (`# typed_graph:v1`) i
 
 Validation now runs in three layers:
 
-1. `state_machine.validate_graph`: graph/state/lifetime checks.
-2. `ptx_spec.validate_graph_ptx_spec`: per-op PTX form checks.
-3. `protocol_validator.validate_graph_protocol`: sequence/protocol checks (strict for typed graphs).
+1. `state_machine.validate_graph`: graph/state/lifetime checks (`graph/state_machine/static.py`).
+2. `ptx_ops.validate.validate_graph_ptx_spec`: per-op PTX form checks.
+3. `ptx_ops.validate.validate_graph_protocol`: sequence/protocol checks (strict for typed graphs).
+
+Dynamic validation (optional):
+- `llm/interface.py validate-dynamic --submission <file.py> --task grouped_gemm --timeout-seconds 60`
+- Add `--memcheck` / `--racecheck` to run compute-sanitizer in Modal.
 
 Run:
 
@@ -42,4 +46,5 @@ Run:
 python tests/test_graph_ir.py
 python llm/interface.py compile --graph graph/kernel_graphs/gemm1.graph --validate-only
 python llm/interface.py compile --graph graph/kernel_graphs/grouped_gemm.graph --validate-only
+python llm/interface.py validate-dynamic --submission llm/sub_grouped_gemm.py --task grouped_gemm --timeout-seconds 60
 ```

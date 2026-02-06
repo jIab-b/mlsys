@@ -9,8 +9,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from constants import LOAD_INLINE_MARKER
 from graph.core import Graph, MemSpace, Node, SourceLoc
 from graph.nodes.op import OpNode
-from ops import select_op
-from ops.spec import GRAPH_TMEM_MAX_COLS, _canonical_op_name, _infer_op_metadata
+from ptx_ops import select_op
+from ptx_ops.spec import GRAPH_TMEM_MAX_COLS, _canonical_op_name, _infer_op_metadata
 
 
 # -------------------------
