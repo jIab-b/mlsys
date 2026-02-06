@@ -37,6 +37,22 @@ class Tma3dGmem2SmemMcast(TmaOp):
     pass
 
 
+class Tma1dSmem2Gmem(TmaOp):
+    pass
+
+
+class Tma2dSmem2Gmem(TmaOp):
+    pass
+
+
+class Tma3dSmem2Gmem(TmaOp):
+    pass
+
+
+class TmaStoreOut(TmaOp):
+    pass
+
+
 TMA_OP_REGISTRY: Dict[str, Type[TmaOp]] = {
     "tma_gmem2smem": TmaGmem2Smem,
     "tma_1d_gmem2smem": Tma1dGmem2Smem,
@@ -45,6 +61,10 @@ TMA_OP_REGISTRY: Dict[str, Type[TmaOp]] = {
     "tma_1d_gmem2smem_mcast": Tma1dGmem2SmemMcast,
     "tma_2d_gmem2smem_mcast": Tma2dGmem2SmemMcast,
     "tma_3d_gmem2smem_mcast": Tma3dGmem2SmemMcast,
+    "tma_1d_smem2gmem": Tma1dSmem2Gmem,
+    "tma_2d_smem2gmem": Tma2dSmem2Gmem,
+    "tma_3d_smem2gmem": Tma3dSmem2Gmem,
+    "tma_store_out": TmaStoreOut,
 }
 
 

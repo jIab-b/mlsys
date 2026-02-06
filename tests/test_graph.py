@@ -26,6 +26,9 @@ def main() -> int:
     if not modal_cli.exists():
         raise FileNotFoundError(f"Missing Modal CLI: {modal_cli}")
 
+    # Validate typed graph IR coverage for both gemm1 and grouped_gemm.
+    _run(["python", "tests/test_graph_ir.py"], cwd=repo_root)
+
     # Build sub_test.py from the current graph.
     _run([
         "python",

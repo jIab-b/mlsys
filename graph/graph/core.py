@@ -84,6 +84,7 @@ class Graph:
         self.descriptors: Dict[str, Descriptor] = {}
         self.tmaps: Dict[str, Dict[str, Any]] = {}
         self.default_tmem: Optional[str] = None
+        self.meta: Dict[str, Any] = {}
 
     def add_barrier(self, name: str, scope: str = "cta") -> None:
         if name in self.barriers:

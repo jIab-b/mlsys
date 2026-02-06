@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from graph.core import BarrierState, BufferState, Graph, MemSpace, Node, SourceLoc
+from protocol_validator import validate_graph_protocol
+from ptx_spec import validate_graph_ptx_spec
 from static_validator import (
     BARRIER_SCOPES,
     CTA_MASK_BITS,
@@ -85,8 +87,18 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
 
     _validate_args(canonical, op_args, loc)
 
-    if canonical == "cute_tmap":
+    if canonical in {"cute_tmap", "tmap_create"}:
         g.add_tmap(str(op_args["name"]), op_args)
+        return
+
+    if canonical == "cta_group_set":
+        value = op_args.get("value")
+        if not isinstance(value, int) or value not in (1, 2):
+            raise ValueError(f"{op_name}: cta_group_set value must be 1 or 2")
+        if state.cta_group is None:
+            state.cta_group = value
+        elif state.cta_group != value:
+            raise ValueError(f"{op_name}: cta_group_set {value} != prior {state.cta_group}")
         return
 
     scope_val = op_args.get("scope")
@@ -493,6 +505,24 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
                     if cta_mask & ~max_mask:
                         raise ValueError(f"{op_name}: cta_mask {cta_mask} outside cluster_ctas={state.cluster_ctas}")
 
+    if canonical in {"tma_1d_smem2gmem", "tma_2d_smem2gmem", "tma_3d_smem2gmem", "tma_store_out"}:
+        tmap = op_args.get("tmap")
+        if tmap not in g.tmaps:
+            raise ValueError(f"{op_name}: unknown tmap '{tmap}'")
+        _validate_tmap_meta(g.tmaps[tmap])
+        rank = g.tmaps[tmap].get("rank")
+        rank_required = {
+            "tma_1d_smem2gmem": 1,
+            "tma_2d_smem2gmem": 2,
+            "tma_3d_smem2gmem": 3,
+        }.get(canonical)
+        if rank_required is not None and isinstance(rank, int) and rank != rank_required:
+            raise ValueError(f"{op_name}: tmap '{tmap}' rank {rank} != {rank_required}")
+        if canonical == "tma_store_out":
+            req = op_args.get("rank")
+            if isinstance(req, int) and isinstance(rank, int) and req != rank:
+                raise ValueError(f"{op_name}: rank {req} != tmap rank {rank}")
+
     if canonical == "mbarrier_init":
         count = op_args.get("count")
         if isinstance(count, int) and count <= 0:
@@ -824,7 +854,7 @@ def _collect_tmaps(nodes: List[Node], g: Graph) -> None:
             op_name = str(node.args.get("op", ""))
             op_args = dict(node.args.get("op_args", {}))
             canonical = _canonical_op_name(op_name)
-            if canonical == "cute_tmap":
+            if canonical in {"cute_tmap", "tmap_create"}:
                 g.add_tmap(str(op_args["name"]), op_args)
         if node.children:
             _collect_tmaps(node.children, g)
@@ -875,6 +905,7 @@ def _estimate_smem_bytes(g: Graph) -> Optional[int]:
 
 def validate_graph(g: Graph) -> None:
     _collect_tmaps(g.sections.get("host", []), g)
+    validate_graph_ptx_spec(g)
     smem_bytes = _estimate_smem_bytes(g)
     if smem_bytes is not None and smem_bytes > GRAPH_SMEM_LIMIT_BYTES:
         raise ValueError(f"SMEM usage {smem_bytes} exceeds assumed limit {GRAPH_SMEM_LIMIT_BYTES} bytes")
@@ -891,3 +922,4 @@ def validate_graph(g: Graph) -> None:
         cluster_ctas=None,
     )
     _validate_nodes(g.sections.get("device", []), g, state)
+    validate_graph_protocol(g, strict=bool(g.meta.get("strict_protocol", False)))

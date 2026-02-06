@@ -11,7 +11,7 @@ REPO_ROOT = ROOT.parent
 PTX_LIB = REPO_ROOT / "ptx_lib"
 
 
-# tcgen op contracts only (everything else must be Raw)
+# Graph op contracts.
 CONTRACTS: Dict[str, OpContract] = {
     # tcgen05 core
     "tcgen05_alloc": OpContract(
@@ -96,6 +96,11 @@ CONTRACTS: Dict[str, OpContract] = {
     "tma_1d_gmem2smem_mcast": OpContract(name="tma_1d_gmem2smem_mcast", issue_scope="one_thread"),
     "tma_2d_gmem2smem_mcast": OpContract(name="tma_2d_gmem2smem_mcast", issue_scope="one_thread"),
     "tma_3d_gmem2smem_mcast": OpContract(name="tma_3d_gmem2smem_mcast", issue_scope="one_thread"),
+    "tma_1d_smem2gmem": OpContract(name="tma_1d_smem2gmem", issue_scope="one_thread"),
+    "tma_2d_smem2gmem": OpContract(name="tma_2d_smem2gmem", issue_scope="one_thread"),
+    "tma_3d_smem2gmem": OpContract(name="tma_3d_smem2gmem", issue_scope="one_thread"),
+    "tma_store_out": OpContract(name="tma_store_out", issue_scope="one_thread"),
+    "tmap_create": OpContract(name="tmap_create", issue_scope="one_thread"),
     "cp_async_bulk_prefetch": OpContract(name="cp_async_bulk_prefetch", issue_scope="one_thread"),
     "cp_async_bulk_prefetch_1d": OpContract(name="cp_async_bulk_prefetch_1d", issue_scope="one_thread"),
     "cp_async_bulk_prefetch_2d": OpContract(name="cp_async_bulk_prefetch_2d", issue_scope="one_thread"),
@@ -108,6 +113,9 @@ CONTRACTS: Dict[str, OpContract] = {
     "ptx_bar_sync": OpContract(name="ptx_bar_sync", issue_scope="all_warps"),
     # host-side metadata ops
     "cute_tmap": OpContract(name="cute_tmap", issue_scope="host"),
+    "cta_group_set": OpContract(name="cta_group_set", issue_scope="one_thread"),
+    "persistent_loop_begin": OpContract(name="persistent_loop_begin", issue_scope="all_warps"),
+    "persistent_loop_end": OpContract(name="persistent_loop_end", issue_scope="all_warps"),
 }
 
 TCGEN_PREFIX_CONTRACTS: Tuple[Tuple[str, str], ...] = (
@@ -137,6 +145,9 @@ OP_ALIASES: Dict[str, str] = {
     "tcgen05_ld_16x256bx8": "tcgen05_ld",
     "tcgen05_ld_16x256bx4": "tcgen05_ld",
     "ptx_bar_sync": "ptx_bar_sync",
+    "tma_1d_smem2gmem": "tma_1d_smem2gmem",
+    "tma_2d_smem2gmem": "tma_2d_smem2gmem",
+    "tma_3d_smem2gmem": "tma_3d_smem2gmem",
 }
 
 
@@ -201,6 +212,14 @@ def _infer_ptx_base(name: str) -> Optional[str]:
     if name.startswith("barrier_cluster_wait"):
         return "barrier_cluster_wait"
     if name.startswith("tma_"):
+        if "smem2gmem" in name:
+            if name.startswith("tma_3d"):
+                return "tma_3d_smem2gmem"
+            if name.startswith("tma_2d"):
+                return "tma_2d_smem2gmem"
+            if name.startswith("tma_1d"):
+                return "tma_1d_smem2gmem"
+            return "tma_store_out"
         if name in CONTRACTS:
             return name
         if "3d" in name:
@@ -330,6 +349,31 @@ OP_ARG_SPECS: Dict[str, Dict[str, Any]] = {
         "optional": {"dim"},
         "ints": {"cta_mask"},
     },
+    "tma_1d_smem2gmem": {
+        "required": {"tmap"},
+        "optional": {"x"},
+        "ints": {"x"},
+    },
+    "tma_2d_smem2gmem": {
+        "required": {"tmap"},
+        "optional": {"x", "y"},
+        "ints": {"x", "y"},
+    },
+    "tma_3d_smem2gmem": {
+        "required": {"tmap"},
+        "optional": {"x", "y", "z"},
+        "ints": {"x", "y", "z"},
+    },
+    "tma_store_out": {
+        "required": {"tmap"},
+        "optional": {"x", "y", "z", "rank"},
+        "ints": {"x", "y", "z", "rank"},
+    },
+    "tmap_create": {
+        "required": {"name", "rank", "dtype", "swizzle", "interleave"},
+        "optional": {"global_dim0", "global_dim1", "global_dim2", "global_stride0", "global_stride1", "global_stride2"},
+        "ints": {"rank", "global_dim0", "global_dim1", "global_dim2", "global_stride0", "global_stride1", "global_stride2"},
+    },
     "tcgen05_commit": {
         "required": {"bar"},
         "optional": {"cta_group"},
@@ -376,6 +420,19 @@ OP_ARG_SPECS: Dict[str, Dict[str, Any]] = {
         "optional": {"rank", "global_height", "global_width", "shared_height", "shared_width"},
         "ints": {"rank", "global_height", "global_width", "shared_height", "shared_width"},
     },
+    "cta_group_set": {
+        "required": {"value"},
+        "optional": set(),
+        "ints": {"value"},
+    },
+    "persistent_loop_begin": {
+        "required": set(),
+        "optional": {"scheduler"},
+    },
+    "persistent_loop_end": {
+        "required": set(),
+        "optional": set(),
+    },
 }
 
 ISSUE_SCOPES = {"one_thread", "one_warp", "all_warps", "host"}
@@ -397,11 +454,16 @@ TCGEN05_CP_SHAPE_TILE = {
     ("32x128b", "warpx4"),
     ("128x128b", None),
     ("128x256b", None),
+    ("4x256b", None),
+    ("64x128b", None),
 }
 TCGEN05_MMA_SHAPES = {
     "mxf4nvf4.block16",
+    "mxf4.block16",
     "f16.ss",
     "f16.ts",
+    "bf16.ss",
+    "bf16.ts",
     "ws.f16.ts",
 }
 

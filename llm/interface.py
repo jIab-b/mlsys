@@ -21,6 +21,7 @@ from graph.core import Graph, MemSpace  # noqa: E402
 from graph_string import graph_string  # noqa: E402
 from parse import _split_python_with_load_inline, _split_with_annotations  # noqa: E402
 from state_machine import validate_graph  # noqa: E402
+from typed_graph import TypedGraphError, dump_typed_graph, load_typed_graph  # noqa: E402
 
 CUDA_EXP_ROOT = ROOT / "cuda_lib" / "experimental"
 DEVICE_EXP_DIR = CUDA_EXP_ROOT / "device"
@@ -80,6 +81,20 @@ def _parse_sources(graph_path: Path) -> Dict[str, List[SourceRange]]:
             )
         )
     return sources
+
+
+def _looks_typed_graph(graph_path: Path) -> bool:
+    for raw in graph_path.read_text().splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("# typed_graph"):
+            return True
+        if line.startswith("#"):
+            continue
+        # Legacy manifests begin with "Raw ..."; typed graphs use directives.
+        return not line.startswith("Raw ")
+    return False
 
 
 def _build_graph_from_sources(sources: Dict[str, List[SourceRange]]) -> Graph:
@@ -383,33 +398,38 @@ def cmd_make_graph(args: argparse.Namespace) -> int:
         except ValueError:
             return str(path)
 
-    lines = [
-        "# section:device",
-        *[
-            f"Raw {_fmt_path(src.path)}:{src.start}-{src.end} chunk={src.chunk}"
-            if src.chunk
-            else f"Raw {_fmt_path(src.path)}:{src.start}-{src.end}"
-            for src in sources["device"]
-        ],
-        "# section:host",
-        *[
-            f"Raw {_fmt_path(src.path)}:{src.start}-{src.end} chunk={src.chunk}"
-            if src.chunk
-            else f"Raw {_fmt_path(src.path)}:{src.start}-{src.end}"
-            for src in sources["host"]
-        ],
-        "# section:python",
-        *[
-            f"Raw {_fmt_path(src.path)}:{src.start}-{src.end} chunk={src.chunk}"
-            if src.chunk
-            else f"Raw {_fmt_path(src.path)}:{src.start}-{src.end}"
-            for src in sources["python"]
-        ],
-        "# graph:",
-        dump,
-        "",
-    ]
-    graph_path.write_text("\n".join(lines))
+    if args.legacy_raw_manifest:
+        lines = [
+            "# section:device",
+            *[
+                f"Raw {_fmt_path(src.path)}:{src.start}-{src.end} chunk={src.chunk}"
+                if src.chunk
+                else f"Raw {_fmt_path(src.path)}:{src.start}-{src.end}"
+                for src in sources["device"]
+            ],
+            "# section:host",
+            *[
+                f"Raw {_fmt_path(src.path)}:{src.start}-{src.end} chunk={src.chunk}"
+                if src.chunk
+                else f"Raw {_fmt_path(src.path)}:{src.start}-{src.end}"
+                for src in sources["host"]
+            ],
+            "# section:python",
+            *[
+                f"Raw {_fmt_path(src.path)}:{src.start}-{src.end} chunk={src.chunk}"
+                if src.chunk
+                else f"Raw {_fmt_path(src.path)}:{src.start}-{src.end}"
+                for src in sources["python"]
+            ],
+            "# graph:",
+            dump,
+            "",
+        ]
+        graph_path.write_text("\n".join(lines))
+    else:
+        g.meta["typed_graph"] = True
+        g.meta["strict_protocol"] = True
+        dump_typed_graph(g, graph_path)
     if backup:
         print(f"backup:{backup}")
     print(graph_path)
@@ -419,11 +439,25 @@ def cmd_make_graph(args: argparse.Namespace) -> int:
 def cmd_compile(args: argparse.Namespace) -> int:
     _ensure_exp_dirs()
     graph_path = Path(args.graph)
-    sources = _parse_sources(graph_path)
-    g = _build_graph_from_sources(sources)
+    typed = _looks_typed_graph(graph_path)
+    if typed:
+        try:
+            g = load_typed_graph(graph_path)
+        except TypedGraphError as exc:
+            raise ValueError(f"{graph_path}: {exc}") from exc
+    else:
+        sources = _parse_sources(graph_path)
+        g = _build_graph_from_sources(sources)
     validate_graph(g)
     if args.dump_graph:
         print(graph_string(g))
+    if typed:
+        if args.validate_only:
+            return 0
+        raise ValueError(
+            "typed .graph compilation to CUDA source is not implemented yet; "
+            "run with --validate-only for graph/spec/protocol validation."
+        )
     out_path = (GRAPH_ROOT / args.out).resolve()
     _write_sub_test(g, out_path)
     return 0
@@ -602,12 +636,14 @@ def main() -> int:
     p_graph.add_argument("--device", default=str(ROOT / "cuda_lib" / "device.cuh"))
     p_graph.add_argument("--host", default=str(ROOT / "cuda_lib" / "host.cuh"))
     p_graph.add_argument("--python", default=str(ROOT / "cuda_lib" / "python.py"))
+    p_graph.add_argument("--legacy-raw-manifest", action="store_true", help="Emit legacy Raw source-range manifest")
     p_graph.set_defaults(func=cmd_make_graph)
 
     p_compile = sub.add_parser("compile", help="Compile from graph file")
     p_compile.add_argument("--graph", required=True, help="Path to .graph file")
     p_compile.add_argument("--out", default="sub_test.py")
     p_compile.add_argument("--dump-graph", action="store_true")
+    p_compile.add_argument("--validate-only", action="store_true", help="Validate graph without emitting sub_test.py")
     p_compile.set_defaults(func=cmd_compile)
 
     p_eval = sub.add_parser("eval", help="Run eval CLI")
