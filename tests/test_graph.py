@@ -16,7 +16,7 @@ def _run_shell(cmd: str, *, cwd: Path) -> None:
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     tests_dir = repo_root / "tests"
-    out_py = tests_dir / "sub_test.py"
+    out_py = tests_dir / "sub_gemm1.py"
     out_txt = tests_dir / "out.txt"
     venv_activate = tests_dir / "venv" / "bin" / "activate"
     modal_cli = tests_dir / "eval_test" / "modal" / "cli.py"
@@ -31,7 +31,7 @@ def main() -> int:
         "python",
         "graph/compiler.py",
         "--out",
-        "../tests/sub_test.py",
+        "../tests/sub_gemm1.py",
     ], cwd=repo_root)
 
     # Run the Modal benchmark for the GEMM task inside the tests venv.

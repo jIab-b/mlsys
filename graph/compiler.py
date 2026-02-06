@@ -265,7 +265,7 @@ def _write_sub_test(graph: Graph, out_path: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compile graph into sub_test.py")
     parser.add_argument("--dump-graph", action="store_true", help="Print graph structure")
-    parser.add_argument("--out", default="sub_test.py", help="Output sub_test.py path (relative to graph)")
+    parser.add_argument("--out", default=None, help="Output .py path (relative to graph). Defaults to sub_<graph_name>.py")
     parser.add_argument(
         "--graph-py",
         default=None,
@@ -311,7 +311,10 @@ def main() -> int:
         graph_paths = _expand_inputs([args.graph_py])
         if len(graph_paths) != 1:
             raise ValueError(f"--graph-py must resolve to a single file, got {graph_paths}")
-        g = _load_graph_py(graph_paths[0], args.graph_fn)
+        graph_path = graph_paths[0]
+        g = _load_graph_py(graph_path, args.graph_fn)
+        if args.out is None:
+            args.out = f"sub_{graph_path.stem}.py"
     else:
         device_paths = _expand_inputs(args.device) if args.device else [SECTION_FILES["device"]]
         host_paths = _expand_inputs(args.host) if args.host else [SECTION_FILES["host"]]
@@ -329,6 +332,8 @@ def main() -> int:
             host_paths=host_paths,
             python_path=python_path,
         )
+        if args.out is None:
+            args.out = "sub_gemm1.py"
     validate_graph(g)
     if args.dump_graph:
         print(graph_string(g))
