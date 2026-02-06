@@ -18,7 +18,7 @@ def _run() -> None:
     sys.path.insert(0, str(repo_root / "graph"))
 
     from state_machine import validate_graph  # noqa: WPS433
-    from typed_graph import load_typed_graph  # noqa: WPS433
+    from syntax import load_typed_graph  # noqa: WPS433
 
     graph_dir = repo_root / "graph" / "kernel_graphs"
     checks = [

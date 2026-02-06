@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 from graph.core import BarrierState, BufferState, OpContract
 
 ROOT = Path(__file__).resolve().parent
-REPO_ROOT = ROOT.parent
+REPO_ROOT = ROOT.parent.parent
 PTX_LIB = REPO_ROOT / "ptx_lib"
 
 
@@ -466,6 +466,11 @@ TCGEN05_MMA_SHAPES = {
     "bf16.ts",
     "ws.f16.ts",
 }
+
+# Canonical low-level ISA sets consumed by ops validation.
+PTX_TCGEN05_CP_SHAPE_TILE = TCGEN05_CP_SHAPE_TILE
+PTX_TCGEN05_MMA_SHAPES = TCGEN05_MMA_SHAPES
+PTX_TCGEN05_NO_TRANSPOSE_KINDS = {"mxf4", "mxf4nvf4"}
 
 # TMA tensor map constraints (CUDA Driver API).
 TMA_INTERLEAVE_SET = {"none", "16b", "32b"}

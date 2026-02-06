@@ -4,9 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from graph.core import BarrierState, BufferState, Graph, MemSpace, Node, SourceLoc
-from protocol_validator import validate_graph_protocol
-from ptx_spec import validate_graph_ptx_spec
-from static_validator import (
+from ops.spec import (
     BARRIER_SCOPES,
     CTA_MASK_BITS,
     GRAPH_SMEM_LIMIT_BYTES,
@@ -27,6 +25,7 @@ from static_validator import (
     _canonical_op_name,
     _resolve_contract,
 )
+from ops.validate import validate_graph_protocol, validate_graph_ptx_spec
 
 
 @dataclass

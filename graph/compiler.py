@@ -23,13 +23,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from graph.core import Graph, MemSpace  # noqa: E402
-from emit import _emit_nodes  # noqa: E402
-from parse import (  # noqa: E402
-    _split_with_annotations,
+from syntax import (  # noqa: E402
+    _emit_nodes,
     _split_python_with_load_inline,
+    _split_with_annotations,
+    graph_string,
     load_section_nodes,
 )
-from graph_string import graph_string  # noqa: E402
 from state_machine import validate_graph  # noqa: E402
 
 SECTION_FILES = {

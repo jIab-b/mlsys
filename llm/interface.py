@@ -18,10 +18,16 @@ if str(GRAPH_ROOT) not in sys.path:
 
 from compiler import _write_sub_test  # noqa: E402
 from graph.core import Graph, MemSpace  # noqa: E402
-from graph_string import graph_string  # noqa: E402
-from parse import _split_python_with_load_inline, _split_with_annotations  # noqa: E402
 from state_machine import validate_graph  # noqa: E402
-from typed_graph import TypedGraphError, dump_typed_graph, load_typed_graph  # noqa: E402
+from syntax import (  # noqa: E402
+    TypedGraphError,
+    _parse_chunked_source,
+    _split_python_with_load_inline,
+    _split_with_annotations,
+    dump_typed_graph,
+    graph_string,
+    load_typed_graph,
+)
 
 CUDA_EXP_ROOT = ROOT / "cuda_lib" / "experimental"
 DEVICE_EXP_DIR = CUDA_EXP_ROOT / "device"
@@ -351,7 +357,6 @@ def cmd_make_graph(args: argparse.Namespace) -> int:
 
     def _ranges_for(path: Path) -> List[SourceRange]:
         text = path.read_text()
-        from parse import _parse_chunked_source  # local import to keep dependencies light
 
         try:
             chunked = _parse_chunked_source(text, path)
@@ -649,7 +654,7 @@ def main() -> int:
     p_eval = sub.add_parser("eval", help="Run eval CLI")
     p_eval.add_argument("--task", default="gemm")
     p_eval.add_argument("--mode", default="benchmark")
-    p_eval.add_argument("--submission", default="graph/sub_test.py")
+    p_eval.add_argument("--submission", default="sub_test.py")
     p_eval.add_argument("--out", default="out_test.txt")
     p_eval.set_defaults(func=cmd_eval)
 

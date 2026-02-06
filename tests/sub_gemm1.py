@@ -144,27 +144,39 @@ PTX_DEVICE void barrier_cluster_wait_acquire_aligned() {
 // ----- ptx_tcgen05_cp.cuh -----
 
 
-// tcgen05.cp wrappers (CTA group 1 only for now)
+// tcgen05.cp wrappers (CTA group 1/2)
 
 template <int CTA_GROUP = 1>
 PTX_DEVICE void tcgen05_cp_32x128b_warpx4(int taddr, uint64_t s_desc) {
-  static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
   PTX_ELECT_ONE();
-  asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;" :: "r"(taddr), "l"(s_desc));
+  if constexpr (CTA_GROUP == 1) {
+    asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;" :: "r"(taddr), "l"(s_desc));
+  } else {
+    asm volatile("tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;" :: "r"(taddr), "l"(s_desc));
+  }
 }
 
 template <int CTA_GROUP = 1>
 PTX_DEVICE void tcgen05_cp_128x128b(int taddr, uint64_t s_desc) {
-  static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
   PTX_ELECT_ONE();
-  asm volatile("tcgen05.cp.cta_group::1.128x128b [%0], %1;" :: "r"(taddr), "l"(s_desc));
+  if constexpr (CTA_GROUP == 1) {
+    asm volatile("tcgen05.cp.cta_group::1.128x128b [%0], %1;" :: "r"(taddr), "l"(s_desc));
+  } else {
+    asm volatile("tcgen05.cp.cta_group::2.128x128b [%0], %1;" :: "r"(taddr), "l"(s_desc));
+  }
 }
 
 template <int CTA_GROUP = 1>
 PTX_DEVICE void tcgen05_cp_128x256b(int taddr, uint64_t s_desc) {
-  static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
   PTX_ELECT_ONE();
-  asm volatile("tcgen05.cp.cta_group::1.128x256b [%0], %1;" :: "r"(taddr), "l"(s_desc));
+  if constexpr (CTA_GROUP == 1) {
+    asm volatile("tcgen05.cp.cta_group::1.128x256b [%0], %1;" :: "r"(taddr), "l"(s_desc));
+  } else {
+    asm volatile("tcgen05.cp.cta_group::2.128x256b [%0], %1;" :: "r"(taddr), "l"(s_desc));
+  }
 }
 
 // Alias used by gemm1 (NVFP4 block scaling)
@@ -426,7 +438,7 @@ PTX_DEVICE void tcgen05_ld_16x256bx16(float *tmp, int row, int col) {
 // ----- ptx_tcgen05_mma.cuh -----
 
 
-// tcgen05.mma wrappers (CTA group 1 only for now)
+// tcgen05.mma wrappers (CTA group 1/2)
 
 struct COLLECTOR_USAGE {
   static constexpr char NONE[]      = "";
@@ -447,21 +459,35 @@ PTX_DEVICE void tcgen05_mma_mxf4nvf4_block16(
   int scale_B_tmem,
   int enable_input_d
 ) {
-  static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
   PTX_ELECT_ONE();
-  asm volatile(
-    "{\n\t"
-    ".reg .pred p;\n\t"
-    "setp.ne.b32 p, %6, 0;\n\t"
-    "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16%7 [%0], %1, %2, %3, [%4], [%5], p;\n\t"
-    "}"
-    :: "r"(d_tmem), "l"(a_desc), "l"(b_desc), "r"(idesc),
-       "r"(scale_A_tmem), "r"(scale_B_tmem), "r"(enable_input_d),
-       "C"(collector_usage)
-  );
+  if constexpr (CTA_GROUP == 1) {
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %6, 0;\n\t"
+      "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16%7 [%0], %1, %2, %3, [%4], [%5], p;\n\t"
+      "}"
+      :: "r"(d_tmem), "l"(a_desc), "l"(b_desc), "r"(idesc),
+         "r"(scale_A_tmem), "r"(scale_B_tmem), "r"(enable_input_d),
+         "C"(collector_usage)
+    );
+  } else {
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %6, 0;\n\t"
+      "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.block16%7 [%0], %1, %2, %3, [%4], [%5], p;\n\t"
+      "}"
+      :: "r"(d_tmem), "l"(a_desc), "l"(b_desc), "r"(idesc),
+         "r"(scale_A_tmem), "r"(scale_B_tmem), "r"(enable_input_d),
+         "C"(collector_usage)
+    );
+  }
 }
 
 // F16/BF16 MMA, SS (A/B in smem desc), C in tmem
+template <int CTA_GROUP = 1>
 PTX_DEVICE void tcgen05_mma_f16_ss(
   uint32_t tmem_c,
   uint64_t desc_a,
@@ -469,20 +495,34 @@ PTX_DEVICE void tcgen05_mma_f16_ss(
   uint32_t idesc,
   int accumulate
 ) {
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
   PTX_ELECT_ONE();
   uint32_t mask[4] = {0, 0, 0, 0};
-  asm volatile(
-    "{\n\t"
-    ".reg .pred p;\n\t"
-    "setp.ne.b32 p, %4, 0;\n\t"
-    "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
-    "}"
-    :: "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(idesc), "r"(accumulate),
-       "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
-  );
+  if constexpr (CTA_GROUP == 1) {
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
+      "}"
+      :: "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(idesc), "r"(accumulate),
+         "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
+    );
+  } else {
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
+      "}"
+      :: "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(idesc), "r"(accumulate),
+         "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
+    );
+  }
 }
 
 // F16/BF16 MMA, TS (A in tmem, B in smem desc), C in tmem
+template <int CTA_GROUP = 1>
 PTX_DEVICE void tcgen05_mma_f16_ts(
   uint32_t tmem_c,
   uint32_t tmem_a,
@@ -490,20 +530,34 @@ PTX_DEVICE void tcgen05_mma_f16_ts(
   uint32_t idesc,
   int accumulate
 ) {
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
   PTX_ELECT_ONE();
   uint32_t mask[4] = {0, 0, 0, 0};
-  asm volatile(
-    "{\n\t"
-    ".reg .pred p;\n\t"
-    "setp.ne.b32 p, %4, 0;\n\t"
-    "tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, {%5, %6, %7, %8}, p;\n\t"
-    "}"
-    :: "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(idesc), "r"(accumulate),
-       "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
-  );
+  if constexpr (CTA_GROUP == 1) {
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, {%5, %6, %7, %8}, p;\n\t"
+      "}"
+      :: "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(idesc), "r"(accumulate),
+         "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
+    );
+  } else {
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.cta_group::2.kind::f16 [%0], [%1], %2, %3, {%5, %6, %7, %8}, p;\n\t"
+      "}"
+      :: "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(idesc), "r"(accumulate),
+         "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
+    );
+  }
 }
 
 // F16/BF16 MMA, WS (warp-specialized), C in tmem
+template <int CTA_GROUP = 1>
 PTX_DEVICE void tcgen05_mma_ws_f16_ts(
   uint32_t tmem_c,
   uint32_t tmem_a,
@@ -511,18 +565,31 @@ PTX_DEVICE void tcgen05_mma_ws_f16_ts(
   uint32_t idesc,
   int accumulate
 ) {
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
   PTX_ELECT_ONE();
-  asm volatile(
-    "{\n\t"
-    ".reg .pred p;\n\t"
-    "setp.ne.b32 p, %4, 0;\n\t"
-    "tcgen05.mma.ws.cta_group::1.kind::f16 [%0], [%1], %2, %3, p, 0;\n\t"
-    "}"
-    :: "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(idesc), "r"(accumulate)
-  );
+  if constexpr (CTA_GROUP == 1) {
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.ws.cta_group::1.kind::f16 [%0], [%1], %2, %3, p, 0;\n\t"
+      "}"
+      :: "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(idesc), "r"(accumulate)
+    );
+  } else {
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.ws.cta_group::2.kind::f16 [%0], [%1], %2, %3, p, 0;\n\t"
+      "}"
+      :: "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(idesc), "r"(accumulate)
+    );
+  }
 }
 
 // Alias used by gemm1 (block-scaled NVFP4 MMA, d_tmem assumed 0)
+template <int CTA_GROUP = 1>
 PTX_DEVICE void tcgen05_mma_nvfp4(
   uint64_t a_desc,
   uint64_t b_desc,
@@ -531,7 +598,7 @@ PTX_DEVICE void tcgen05_mma_nvfp4(
   int scale_B_tmem,
   int enable_input_d
 ) {
-  tcgen05_mma_mxf4nvf4_block16<1, COLLECTOR_USAGE::NONE>(
+  tcgen05_mma_mxf4nvf4_block16<CTA_GROUP, COLLECTOR_USAGE::NONE>(
     0, a_desc, b_desc, i_desc, scale_A_tmem, scale_B_tmem, enable_input_d
   );
 }
@@ -539,37 +606,57 @@ PTX_DEVICE void tcgen05_mma_nvfp4(
 // ----- ptx_tcgen05_sync.cuh -----
 
 
-// tcgen05 commit, wait, fence wrappers (CTA group 1 only for now)
+// tcgen05 commit, wait, fence wrappers (CTA group 1/2)
 
 template <int CTA_GROUP = 1>
 PTX_DEVICE void tcgen05_commit(int mbar_addr) {
-  static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
   PTX_ELECT_ONE();
-  asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
-              :: "r"(mbar_addr) : "memory");
+  if constexpr (CTA_GROUP == 1) {
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                :: "r"(mbar_addr) : "memory");
+  } else {
+    asm volatile("tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                :: "r"(mbar_addr) : "memory");
+  }
 }
 
 template <int CTA_GROUP = 1>
 PTX_DEVICE void tcgen05_commit_mcast(int mbar_addr, uint16_t cta_mask) {
-  static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
   PTX_ELECT_ONE();
-  asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;"
-              :: "r"(mbar_addr), "h"(cta_mask) : "memory");
+  if constexpr (CTA_GROUP == 1) {
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;"
+                :: "r"(mbar_addr), "h"(cta_mask) : "memory");
+  } else {
+    asm volatile("tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;"
+                :: "r"(mbar_addr), "h"(cta_mask) : "memory");
+  }
 }
 
-// tcgen05 tmem allocation / deallocation (CTA group 1 only for now)
+// tcgen05 tmem allocation / deallocation (CTA group 1/2)
 template <int CTA_GROUP = 1>
 PTX_DEVICE void tcgen05_alloc(int smem_addr, int num_cols) {
-  static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
-  asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-              :: "r"(smem_addr), "r"(num_cols));
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
+  if constexpr (CTA_GROUP == 1) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                :: "r"(smem_addr), "r"(num_cols));
+  } else {
+    asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
+                :: "r"(smem_addr), "r"(num_cols));
+  }
 }
 
 template <int CTA_GROUP = 1>
 PTX_DEVICE void tcgen05_dealloc(int tmem_addr, int num_cols) {
-  static_assert(CTA_GROUP == 1, "Only CTA_GROUP=1 supported for now");
-  asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-              :: "r"(tmem_addr), "r"(num_cols));
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
+  if constexpr (CTA_GROUP == 1) {
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                :: "r"(tmem_addr), "r"(num_cols));
+  } else {
+    asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
+                :: "r"(tmem_addr), "r"(num_cols));
+  }
 }
 
 PTX_DEVICE void tcgen05_wait_ld() {
