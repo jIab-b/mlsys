@@ -18,8 +18,8 @@ if str(ROOT) not in sys.path:
 if str(GRAPH_ROOT) not in sys.path:
     sys.path.insert(0, str(GRAPH_ROOT))
 
-from backends import backend_names, emit_with_backend  # noqa: E402
-from ptx_ops.utils.ir import Graph, MemSpace  # noqa: E402
+from compiler import _write_sub_test  # noqa: E402
+from ir import Graph, MemSpace  # noqa: E402
 from state_machine import run_dynamic_suite, validate_graph  # noqa: E402
 from syntax import (  # noqa: E402
     TypedGraphError,
@@ -466,7 +466,7 @@ def cmd_compile(args: argparse.Namespace) -> int:
             "run with --validate-only for graph/spec/protocol validation."
         )
     out_path = (GRAPH_ROOT / args.out).resolve()
-    emit_with_backend(args.backend, g, out_path)
+    _write_sub_test(g, out_path)
     return 0
 
 
@@ -682,7 +682,6 @@ def main() -> int:
     p_compile = sub.add_parser("compile", help="Compile from graph file")
     p_compile.add_argument("--graph", required=True, help="Path to .graph file")
     p_compile.add_argument("--out", default="sub_test.py")
-    p_compile.add_argument("--backend", default="ptx_inline", choices=backend_names())
     p_compile.add_argument("--dump-graph", action="store_true")
     p_compile.add_argument("--validate-only", action="store_true", help="Validate graph without emitting sub_test.py")
     p_compile.set_defaults(func=cmd_compile)

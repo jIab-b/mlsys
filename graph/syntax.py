@@ -7,9 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from constants import LOAD_INLINE_MARKER
-from ptx_ops.utils.ir import Graph, MemSpace, Node, OpNode, SourceLoc
-from ptx_ops import select_op
-from ptx_ops.spec import GRAPH_TMEM_MAX_COLS, _canonical_op_name, _infer_op_metadata
+from ir import Graph, MemSpace, Node, OpNode, SourceLoc
+from ptx_ops.utils.spec import GRAPH_TMEM_MAX_COLS, _canonical_op_name, _infer_op_metadata
 
 
 # -------------------------
@@ -215,11 +214,6 @@ def _split_with_annotations(
                     raise ValueError(f"{filename}:{idx}: @op continuation cannot introduce 'when'")
                 pending_op.args.setdefault("op_args", {}).update(extra_args)
                 _infer_op_metadata(str(pending_op.args.get("op", "")), pending_op.args.get("op_args", {}))
-                op_name = str(pending_op.args.get("op", ""))
-                op_args = pending_op.args.get("op_args", {})
-                op_cls = select_op(op_name, op_args)
-                if op_cls is not None and not isinstance(pending_op, op_cls):
-                    pending_op.__class__ = op_cls
                 pending_op = None
             else:
                 op_name = tokens[0]
@@ -228,11 +222,7 @@ def _split_with_annotations(
                     op_args["_loops"] = [dict(entry) for entry in loop_stack]
                 when_cond = op_args.pop("when", None)
                 _infer_op_metadata(op_name, op_args)
-                op_cls = select_op(op_name, op_args)
-                if op_cls is not None:
-                    op_node = op_cls(op=op_name, args=op_args, loc=loc)
-                else:
-                    op_node = OpNode(op=op_name, args=op_args, loc=loc)
+                op_node = OpNode(op=op_name, args=op_args, loc=loc)
                 op_node.meta["base"] = _canonical_op_name(op_name)
                 if when_cond is not None:
                     if_node = Node(kind="If", args={"cond": str(when_cond)}, meta={"validate_only": "true"})
@@ -622,11 +612,7 @@ def _current_list(g: Graph, section: str, stack: List[Any]) -> List[Node]:
 
 def _parse_op(op_name: str, op_args: Dict[str, Any], loc: SourceLoc) -> OpNode:
     _infer_op_metadata(op_name, op_args)
-    op_cls = select_op(op_name, op_args)
-    if op_cls is not None:
-        node = op_cls(op=op_name, args=op_args, loc=loc)
-    else:
-        node = OpNode(op=op_name, args=op_args, loc=loc)
+    node = OpNode(op=op_name, args=op_args, loc=loc)
     node.meta["base"] = _canonical_op_name(op_name)
     return node
 
