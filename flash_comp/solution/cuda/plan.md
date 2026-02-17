@@ -34,8 +34,9 @@ Output:
 - One CTA handles one sequence row `b` (initial design; tune later).
 - `M = 64` fixed heads.
 - `K = 128` head dim, split as 4 slices of 32 for MMA stepping.
-- `Ntile` variable by seq bucket: `64`, `128`, `256` (cap at 256).
-- Double-buffer over `Ntile` (stage `s` compute while stage `s+1` loads).
+- `Ntile = 64` (page-aligned).
+- `num_stages = 10` on K-tile pipeline (tokens per stage = 64).
+- Stage tail policy: zero-fill invalid tokens in partial last tile, mask in compute/topk.
 - Keep `Q` staged for entire CTA lifetime (reuse across all `Ntile` iterations).
 
 ## PTX Instructions To Use (Current Library Names)
@@ -74,29 +75,54 @@ From `ptx_lib` (copy wrappers into solution files when integrating):
 ## Main Loop Skeleton
 1. Load metadata (`seq_len`, page span, block table base).
 2. Stage `Q[b,:,:]` once into smem/tmem-friendly layout.
-3. Initialize running topk structure for this sequence.
-4. For token tiles over sequence:
+3. Prepare `final_scores` backing store (fp32):
+   - if `seq_len <= seq_cap_smem`: use smem `final_scores_smem`.
+   - else: use global spill buffer with L2 cache hint stores/loads.
+4. Initialize running topk structure for this sequence.
+5. For token tiles over sequence:
    - Build gather row list (or contiguous row coordinates).
    - Issue TMA async load into smem stage buffer (`ping/pong`).
    - Wait/commit previous stage as needed.
    - Run MMA over 4 `K` slices, accumulating in TMEM.
    - `tcgen05_ld` accumulator fragments.
-   - Apply ReLU + head weights reduction.
-   - Update streaming topk (score + global token index).
-5. Finalize topk buffer, write `topk_indices[b,:]`, pad with `-1`.
+   - Apply ReLU + head weights reduction to fp32 scalar per token.
+   - Store scalar score to selected backing store (smem or L2-hinted global).
+6. Final topk pass over stored fp32 scores:
+   - read from smem or reload from global spill.
+   - compute exact topk=2048 indices.
+7. Write `topk_indices[b,:]`, pad with `-1`.
 
 ## Shared Memory / Buffer Budget (Planning Numbers)
-Assuming `Ntile=256` and packed K rows at `132 B/token`:
-- K stage buffer (single): `256 * 132 = 33,792 B` (~33.0 KiB)
-- K stage buffer (double): `67,584 B` (~66.0 KiB)
-- Q tile staged once (fp8): `64 * 128 = 8,192 B` (~8.0 KiB)
-- Weights: `64 * 4 = 256 B`
-- Topk scratch estimate:
-  - if storing `(score float32, idx int32)` for `k=2048`: `2048 * 8 = 16,384 B` (~16.0 KiB)
-- Total planning footprint with full double-buffer + simple topk scratch is high; likely requires:
-  - smaller `Ntile` on some paths, or
-  - register/partial topk staging, or
-  - reduced on-chip topk state.
+Assume `smem_total = 228 KiB = 233,472 B`.
+
+Fixed buffers:
+- K stage buffers: `10 * (64 * 132) = 84,480 B`
+- Q staged once: `64 * 128 = 8,192 B`
+- Weights staged once: `64 * 4 = 256 B`
+- Topk scratch (`scores fp32 + indices int32`, 2048 each): `16,384 B`
+- Misc/barriers/metadata reserve: `4,096 B`
+
+Fixed subtotal: `113,408 B`
+
+Maximum preallocated fp32 final-score buffer in smem:
+- `233,472 - 113,408 = 120,064 B`
+- `120,064 / 4 = 30,016` fp32 tokens
+
+Implication:
+- For common DSA max `seq_len <= 16,384`, full fp32 final-score buffer fits in smem.
+- Overflow path remains implemented for future larger `seq_len`.
+
+## Final Score Dtype Policy
+- Use fp32 for stored final scores and topk ranking path.
+- Do not use fp8 for final score storage/ranking (too much quantization error for stable cutoff ordering).
+- fp16 may be explored only as an optional fast mode, not default correctness mode.
+
+## Global Spill Path (Overflow)
+- If `seq_len > seq_cap_smem`, spill final scores to global workspace.
+- Use L2-hinted global stores during producer pass; reload with L2-hinted loads for final topk pass.
+- Workspace allocation policy:
+  - allocate once outside hot path (module init / compile hook),
+  - reuse across launches to avoid per-call alloc overhead.
 
 ## Binding / Integration Requirements
 - Keep DPS-only call path in Python (`topk_indices` is input-output buffer).

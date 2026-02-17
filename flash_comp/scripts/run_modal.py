@@ -4,7 +4,7 @@ FlashInfer-Bench Modal Cloud Benchmark Runner.
 Automatically packs the solution from source files and runs benchmarks
 on NVIDIA B200 GPUs via Modal.
 
-By default this reads `config.toml` via `scripts.pack_solution`.
+By default this reads `config.toml`.
 You can also bypass/override config with CLI flags like `--dsa_attn`.
 
 Setup (one-time):
@@ -15,6 +15,8 @@ Setup (one-time):
 
 import argparse
 import sys
+import tempfile
+import traceback
 from pathlib import Path
 
 # Add project root to path for imports
@@ -22,8 +24,6 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
-from flashinfer_bench import Benchmark, BenchmarkConfig, BuildSpec, Solution, TraceSet
-from flashinfer_bench.agents import pack_solution_from_files
 
 try:
     import tomllib
@@ -31,12 +31,20 @@ except ImportError:
     import tomli as tomllib
 
 app = modal.App("flashinfer-bench")
+OUT_REPORT_PATH = PROJECT_ROOT / "solution" / "out.txt"
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
+CUDA_HOME_PATH = "/usr/local/cuda"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
+    .env(
+        {
+            "CUDA_HOME": CUDA_HOME_PATH,
+            "CUDA_PATH": CUDA_HOME_PATH,
+        }
+    )
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
 )
 
@@ -50,10 +58,43 @@ DEFINITION_ALIASES = {
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
-    """Run benchmark on Modal B200 and return results."""
-    if config is None:
+def run_benchmark(
+    source_files: dict[str, bytes],
+    solution_meta: dict,
+    benchmark_config: dict | None = None,
+    max_workloads: int = 1,
+) -> dict:
+    """Pack solution and run benchmark on Modal B200, returning results + packed solution."""
+    from flashinfer_bench import Benchmark, BenchmarkConfig, BuildSpec, TraceSet
+    from flashinfer_bench.agents import pack_solution_from_files
+
+    if benchmark_config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+    else:
+        config = BenchmarkConfig(**benchmark_config)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source_root = Path(tmpdir) / "solution"
+        source_root.mkdir(parents=True, exist_ok=True)
+
+        for rel_path, content in source_files.items():
+            dst = source_root / rel_path
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(content)
+
+        spec = BuildSpec(
+            language=solution_meta["language"],
+            target_hardware=["cuda"],
+            entry_point=solution_meta["entry_point"],
+        )
+
+        solution = pack_solution_from_files(
+            path=str(source_root),
+            spec=spec,
+            name=solution_meta["name"],
+            definition=solution_meta["definition"],
+            author=solution_meta["author"],
+        )
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -65,6 +106,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+    if max_workloads > 0:
+        workloads = workloads[:max_workloads]
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -79,45 +122,102 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     traces = result_trace_set.traces.get(definition.name, [])
     results = {definition.name: {}}
+    stats = {"total": len(traces), "evaluated": 0, "non_evaluated": 0}
 
-    for trace in traces:
-        if trace.evaluation:
-            entry = {
-                "status": trace.evaluation.status.value,
-                "solution": trace.solution,
-            }
-            if trace.evaluation.performance:
-                entry["latency_ms"] = trace.evaluation.performance.latency_ms
-                entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
-                entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
-            if trace.evaluation.correctness:
-                entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
-                entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
-            results[definition.name][trace.workload.uuid] = entry
+    for i, trace in enumerate(traces):
+        raw = trace.model_dump(mode="json")
+        workload_obj = raw.get("workload")
+        if isinstance(workload_obj, dict):
+            workload_uuid = workload_obj.get("uuid") or f"trace_{i}"
+        else:
+            workload_uuid = f"trace_{i}"
+        entry = {"solution": raw.get("solution", "")}
 
-    return results
+        evaluation = raw.get("evaluation")
+        if evaluation:
+            if isinstance(evaluation, dict):
+                status_obj = evaluation.get("status")
+                if isinstance(status_obj, dict):
+                    entry["status"] = status_obj.get("value", "unknown")
+                elif status_obj is not None:
+                    entry["status"] = str(status_obj)
+                else:
+                    entry["status"] = "unknown"
+
+                performance = evaluation.get("performance")
+                if isinstance(performance, dict):
+                    entry["latency_ms"] = performance.get("latency_ms")
+                    entry["reference_latency_ms"] = performance.get("reference_latency_ms")
+                    entry["speedup_factor"] = performance.get("speedup_factor")
+
+                correctness = evaluation.get("correctness")
+                if isinstance(correctness, dict):
+                    entry["max_abs_error"] = correctness.get("max_absolute_error")
+                    entry["max_rel_error"] = correctness.get("max_relative_error")
+            else:
+                # Some bench versions serialize evaluation directly as a status string.
+                entry["status"] = str(evaluation)
+                entry["detail"] = (
+                    raw.get("message")
+                    or raw.get("error")
+                    or "Non-dict evaluation payload returned by benchmark."
+                )
+
+            stats["evaluated"] += 1
+        else:
+            entry["status"] = "NO_EVAL"
+            entry["detail"] = (
+                raw.get("status")
+                or raw.get("message")
+                or raw.get("error")
+                or "Trace has no evaluation object (likely build/runtime failure)."
+            )
+            stats["non_evaluated"] += 1
+
+        results[definition.name][workload_uuid] = entry
+
+    return {
+        "results": results,
+        "stats": stats,
+        "solution": {
+            "name": solution.name,
+            "definition": solution.definition,
+            "author": solution.author,
+            "language": solution_meta["language"],
+        },
+        "solution_json": solution.model_dump_json(indent=2),
+    }
 
 
-def print_results(results: dict):
+def print_results(results: dict, out_lines: list[str] | None = None):
     """Print benchmark results in a formatted way."""
+    def emit(line: str):
+        print(line)
+        if out_lines is not None:
+            out_lines.append(line)
+
     for def_name, traces in results.items():
-        print(f"\n{def_name}:")
+        emit("")
+        emit(f"{def_name}:")
         for workload_uuid, result in traces.items():
             status = result.get("status")
-            print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
+            line = f"  Workload {workload_uuid[:8]}...: {status}"
 
             if result.get("latency_ms") is not None:
-                print(f" | {result['latency_ms']:.3f} ms", end="")
+                line += f" | {result['latency_ms']:.3f} ms"
 
             if result.get("speedup_factor") is not None:
-                print(f" | {result['speedup_factor']:.2f}x speedup", end="")
+                line += f" | {result['speedup_factor']:.2f}x speedup"
 
             if result.get("max_abs_error") is not None:
                 abs_err = result["max_abs_error"]
                 rel_err = result.get("max_rel_error", 0)
-                print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
+                line += f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}"
 
-            print()
+            if result.get("detail"):
+                line += f" | detail={result['detail']}"
+
+            emit(line)
 
 
 def _load_config_best_effort() -> dict:
@@ -166,13 +266,13 @@ def _resolve_definition_alias(
     return ""
 
 
-def _pack_solution_with_overrides(
+def _resolve_solution_meta(
     definition: str,
     name: str,
     author: str,
     language: str,
     entry_point: str,
-) -> Solution:
+) -> tuple[dict, Path]:
     config = _load_config_best_effort()
     solution_cfg = config.get("solution", {})
     build_cfg = config.get("build", {})
@@ -184,8 +284,6 @@ def _pack_solution_with_overrides(
     final_language = language or build_cfg.get("language", "triton")
     if final_language not in ("triton", "cuda"):
         raise ValueError(f"Unsupported language: {final_language}")
-
-    final_entry_point = entry_point or build_cfg.get("entry_point", "kernel")
     final_name = name or solution_cfg.get("name", f"{final_definition}-dev")
     final_author = author or solution_cfg.get("author", "unknown")
 
@@ -193,29 +291,91 @@ def _pack_solution_with_overrides(
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
-    spec = BuildSpec(
-        language=final_language,
-        target_hardware=["cuda"],
-        entry_point=final_entry_point,
-    )
+    raw_entry_point = entry_point or build_cfg.get("entry_point", "kernel")
+    final_entry_point = _normalize_entry_point(raw_entry_point, final_language, source_dir)
 
-    solution = pack_solution_from_files(
-        path=str(source_dir),
-        spec=spec,
-        name=final_name,
-        definition=final_definition,
-        author=final_author,
-    )
+    return {
+        "definition": final_definition,
+        "name": final_name,
+        "author": final_author,
+        "language": final_language,
+        "entry_point": final_entry_point,
+    }, source_dir
 
-    solution_path = PROJECT_ROOT / "solution.json"
-    solution_path.write_text(solution.model_dump_json(indent=2))
-    print(f"Solution packed: {solution_path}")
-    print(f"  Name: {solution.name}")
-    print(f"  Definition: {solution.definition}")
-    print(f"  Author: {solution.author}")
-    print(f"  Language: {final_language}")
 
-    return solution
+def _collect_source_files(source_dir: Path) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
+
+    for path in source_dir.rglob("*"):
+        if not path.is_file():
+            continue
+
+        rel_parts = path.relative_to(source_dir).parts
+        if "__pycache__" in rel_parts:
+            continue
+
+        rel_path = Path(*rel_parts).as_posix()
+        files[rel_path] = path.read_bytes()
+
+    if not files:
+        raise FileNotFoundError(f"No source files found under {source_dir}")
+
+    return files
+
+
+def _normalize_entry_point(raw_entry_point: str, language: str, source_dir: Path) -> str:
+    entry_point = raw_entry_point.strip()
+    if not entry_point:
+        raise ValueError("Entry point cannot be empty")
+
+    if "::" in entry_point:
+        return entry_point
+
+    # Backward compatibility for old config style: entry_point = "kernel".
+    if language == "cuda":
+        candidates = ("binding.py", "kernel.cu")
+    else:
+        candidates = ("kernel.py",)
+
+    for filename in candidates:
+        if (source_dir / filename).exists():
+            return f"{filename}::{entry_point}"
+
+    return f"{candidates[0]}::{entry_point}"
+
+
+def _apply_file_override(
+    files: dict[str, bytes],
+    source_dir: Path,
+    language: str,
+    file_base: str,
+) -> dict[str, bytes]:
+    if not file_base:
+        return files
+
+    if language != "cuda":
+        raise ValueError("--file override is only supported for CUDA solutions")
+
+    base = Path(file_base)
+    if base.suffix in (".py", ".cu"):
+        base = base.with_suffix("")
+
+    py_rel = base.with_suffix(".py").as_posix()
+    cu_rel = base.with_suffix(".cu").as_posix()
+
+    if py_rel not in files:
+        raise FileNotFoundError(
+            f"--file override expected '{py_rel}' under {source_dir}, but it was not found"
+        )
+    if cu_rel not in files:
+        raise FileNotFoundError(
+            f"--file override expected '{cu_rel}' under {source_dir}, but it was not found"
+        )
+
+    remapped = dict(files)
+    remapped["binding.py"] = files[py_rel]
+    remapped["kernel.cu"] = files[cu_rel]
+    return remapped
 
 
 def _run(
@@ -229,7 +389,20 @@ def _run(
     author: str = "",
     language: str = "",
     entry_point: str = "",
+    file_base: str = "",
+    max_workloads: int = 1,
 ):
+    report_lines: list[str] = []
+
+    def log(line: str = ""):
+        print(line)
+        report_lines.append(line)
+
+    def write_report():
+        OUT_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        OUT_REPORT_PATH.write_text("\n".join(report_lines).rstrip() + "\n")
+        print(f"Saved run report: {OUT_REPORT_PATH}")
+
     selected_definition = _resolve_definition_alias(
         definition=definition,
         dsa_index=dsa_index,
@@ -246,36 +419,74 @@ def _run(
             author,
             language,
             entry_point,
+            file_base,
         ]
     )
 
-    if use_overrides:
-        print("Packing solution from source files (override mode)...")
-        solution = _pack_solution_with_overrides(
+    try:
+        if use_overrides:
+            log("Packing solution from source files (override mode)...")
+        else:
+            log("Packing solution from source files...")
+
+        solution_meta, source_dir = _resolve_solution_meta(
             definition=selected_definition,
             name=name,
             author=author,
             language=language,
             entry_point=entry_point,
         )
-    else:
-        from scripts.pack_solution import pack_solution
 
-        print("Packing solution from source files...")
-        solution_path = pack_solution()
-        print("\nLoading solution...")
-        solution = Solution.model_validate_json(solution_path.read_text())
+        source_files = _collect_source_files(source_dir)
+        source_files = _apply_file_override(
+            files=source_files,
+            source_dir=source_dir,
+            language=solution_meta["language"],
+            file_base=file_base,
+        )
 
-    print(f"Loaded: {solution.name} ({solution.definition})")
+        log(f"Loaded: {solution_meta['name']} ({solution_meta['definition']})")
+        log(f"Entry point: {solution_meta['entry_point']}")
+        if file_base:
+            log(
+                f"Override mode: using '{file_base}.py' as binding.py and '{file_base}.cu' as kernel.cu"
+            )
 
-    print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+        log("")
+        log("Running benchmark on Modal B200...")
+        payload = run_benchmark.remote(source_files, solution_meta, None, max_workloads)
 
-    if not results:
-        print("No results returned!")
-        return
+        solution_path = PROJECT_ROOT / "solution.json"
+        solution_path.write_text(payload["solution_json"])
 
-    print_results(results)
+        packed_solution = payload["solution"]
+        log(f"Solution packed: {solution_path}")
+        log(f"  Name: {packed_solution['name']}")
+        log(f"  Definition: {packed_solution['definition']}")
+        log(f"  Author: {packed_solution['author']}")
+        log(f"  Language: {packed_solution['language']}")
+
+        stats = payload.get("stats", {})
+        if stats:
+            log(
+                f"Trace stats: total={stats.get('total', 0)}, "
+                f"evaluated={stats.get('evaluated', 0)}, "
+                f"non_evaluated={stats.get('non_evaluated', 0)}"
+            )
+
+        results = payload.get("results", {})
+        if not results or all(not traces for traces in results.values()):
+            log("No evaluated trace results returned (empty evaluation set).")
+            return
+
+        print_results(results, out_lines=report_lines)
+    except Exception:
+        report_lines.append("")
+        report_lines.append("ERROR:")
+        report_lines.extend(traceback.format_exc().rstrip().splitlines())
+        raise
+    finally:
+        write_report()
 
 
 @app.local_entrypoint()
@@ -290,6 +501,8 @@ def main(
     author: str = "",
     language: str = "",
     entry_point: str = "",
+    file: str = "",
+    max_workloads: int = 1,
 ):
     """Pack solution and run benchmark on Modal."""
     _run(
@@ -303,6 +516,8 @@ def main(
         author=author,
         language=language,
         entry_point=entry_point,
+        file_base=file,
+        max_workloads=max_workloads,
     )
 
 
@@ -318,6 +533,18 @@ if __name__ == "__main__":
     parser.add_argument("--author", type=str, default="", help="Override solution author")
     parser.add_argument("--language", type=str, default="", help="Override build language: triton|cuda")
     parser.add_argument("--entry_point", type=str, default="", help="Override entry point")
+    parser.add_argument(
+        "--file",
+        type=str,
+        default="",
+        help="CUDA override base name (maps <base>.py->binding.py and <base>.cu->kernel.cu)",
+    )
+    parser.add_argument(
+        "--max_workloads",
+        type=int,
+        default=1,
+        help="Limit number of workloads to run (0 means all)",
+    )
     args = parser.parse_args()
 
     with app.run():
@@ -332,4 +559,6 @@ if __name__ == "__main__":
             author=args.author,
             language=args.language,
             entry_point=args.entry_point,
+            file_base=args.file,
+            max_workloads=args.max_workloads,
         )
