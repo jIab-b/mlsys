@@ -281,6 +281,8 @@ TASK_PATHS = {
     "sparse_attention": "test_kernels/sparse_attention",
     "sparse_index": "test_kernels/sparse_index",
     "sparse_attn": "test_kernels/sparse_attn",
+    "dsa_index_2048": "test_kernels/dsa_index_2048",
+    "dsa_attn_2048": "test_kernels/dsa_attn_2048",
 }
 
 

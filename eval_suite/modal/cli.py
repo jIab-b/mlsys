@@ -23,6 +23,9 @@ TASKS = {
     "sparse_attention": "test_kernels/sparse_attention",
     "sparse_index": "test_kernels/sparse_index",
     "sparse_attn": "test_kernels/sparse_attn",
+    # DSA topk=2048 tasks
+    "dsa_index_2048": "test_kernels/dsa_index_2048",
+    "dsa_attn_2048": "test_kernels/dsa_attn_2048",
 }
 # Add all registry definitions
 for name, info in REFS.items():
@@ -126,7 +129,7 @@ def generate_random_tests(task: str, count: int = 3, seed: int = 42) -> str:
     """Generate random test specs from FlashInfer workloads (axis values only)."""
     from common.workload_loader import generate_sparse_attention_specs
 
-    # All three tasks use the same input spec (batch, num_pages, seq_len)
+    # All three sparse tasks use the same input spec (batch, num_pages, seq_len)
     if task in ("sparse_attention", "sparse_index", "sparse_attn"):
         specs = generate_sparse_attention_specs(count=count, seed=seed)
     else:
@@ -204,6 +207,16 @@ def main():
     parser.add_argument("-o", "--output", default="out.txt", help="Output file for formatted result")
     parser.add_argument("-m", "--mode", default="benchmark", choices=["test", "benchmark", "leaderboard", "profile"])
     parser.add_argument("-t", "--task", default="sparse_attention", help="Task name (use --list-tasks to see all)")
+    parser.add_argument(
+        "--dsa_index_2048",
+        action="store_true",
+        help="Shortcut for --task dsa_index_2048",
+    )
+    parser.add_argument(
+        "--dsa_attn_2048",
+        action="store_true",
+        help="Shortcut for --task dsa_attn_2048",
+    )
     parser.add_argument("--no-sync", action="store_true", help="Skip syncing eval_suite")
     parser.add_argument(
         "--trace",
@@ -260,6 +273,21 @@ def main():
         help="Run kernel benchmark (timing against FlashInfer)",
     )
     args = parser.parse_args(_strip_eval_subcommand(sys.argv[1:]))
+
+    # Task shortcut flags
+    shortcut_tasks = []
+    if args.dsa_index_2048:
+        shortcut_tasks.append("dsa_index_2048")
+    if args.dsa_attn_2048:
+        shortcut_tasks.append("dsa_attn_2048")
+    if len(shortcut_tasks) > 1:
+        parser.error("Choose only one of --dsa_index_2048 or --dsa_attn_2048")
+    if shortcut_tasks:
+        selected_task = shortcut_tasks[0]
+        default_task = parser.get_default("task")
+        if args.task not in (default_task, selected_task):
+            parser.error(f"--task conflicts with shortcut flag (selected '{selected_task}')")
+        args.task = selected_task
 
     # Handle --list-tasks
     if args.list_tasks:

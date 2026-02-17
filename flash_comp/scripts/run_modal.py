@@ -39,12 +39,6 @@ CUDA_HOME_PATH = "/usr/local/cuda"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .env(
-        {
-            "CUDA_HOME": CUDA_HOME_PATH,
-            "CUDA_PATH": CUDA_HOME_PATH,
-        }
-    )
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
 )
 
