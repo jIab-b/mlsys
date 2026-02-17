@@ -7,19 +7,30 @@ The entry point function name should match the `entry_point` setting in config.t
 See the track definition for required function signature and semantics.
 """
 
-import ctypes
 from tvm.ffi import register_func
+from index_bindings import compile_kernel as _compile_kernel
+from index_bindings import dsa_topk_indexer
 
 
 @register_func("flashinfer.kernel")
-def kernel():
-    """
-    Python binding for your CUDA kernel.
+def kernel(
+    q_index_fp8,
+    k_index_cache_fp8,
+    weights,
+    seq_lens,
+    block_table,
+    topk_indices,
+):
+    dsa_topk_indexer(
+        q_index_fp8,
+        k_index_cache_fp8,
+        weights,
+        seq_lens,
+        block_table,
+        topk_indices,
+    )
+    return topk_indices
 
-    TODO: Implement the binding according to the track definition.
-    This function should:
-    1. Accept the inputs as specified by the track definition
-    2. Launch your CUDA kernel with appropriate grid/block dimensions
-    3. Return outputs as specified by the track definition
-    """
-    pass
+
+def compile_kernel():
+    _compile_kernel()
