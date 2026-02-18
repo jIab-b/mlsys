@@ -1,0 +1,64 @@
+{
+  "run1": {
+    "name": "run1",
+    "cache_sync": {
+      "restore": {
+        "torch_files": 0,
+        "torch_so_files": 0,
+        "cuda_files": 0
+      },
+      "save": {
+        "torch_files": 8,
+        "torch_so_files": 1,
+        "cuda_files": 0
+      },
+      "errors": []
+    },
+    "compile_markers": {
+      "ninja": false,
+      "nvcc": true,
+      "building_extension": false,
+      "torch_extensions_path": true,
+      "compile_step_1": true,
+      "compile_step_2": true,
+      "compile_step_3": true
+    },
+    "marker_lines_sample": [
+      "[1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=dsa_topk_indexer_debug_ext -DTORCH_API_INCLUDE_EXTENSION_H -isystem /usr/local/lib/python3.12/dist-packages/torch/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /usr/include/python3.12 -fPIC -std=c++17 -c /root/.cache/torch_extensions/py312_cu129/dsa_topk_indexer_debug_ext/main.cpp -o main.o ",
+      "[2/3] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=dsa_topk_indexer_debug_ext -DTORCH_API_INCLUDE_EXTENSION_H -isystem /usr/local/lib/python3.12/dist-packages/torch/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /usr/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options '-fPIC' -O0 -gencode=arch=compute_100a,code=sm_100a --threads=4 -std=c++17 -c /root/.cache/torch_extensions/py312_cu129/dsa_topk_indexer_debug_ext/cuda.cu -o cuda.cuda.o ",
+      "[3/3] c++ main.o cuda.cuda.o -shared -lcuda -L/usr/local/lib/python3.12/dist-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda/lib64 -lcudart -o dsa_topk_indexer_debug_ext.so"
+    ],
+    "stdout_len": 11902,
+    "stderr_len": 0
+  },
+  "run2": {
+    "name": "run2",
+    "cache_sync": {
+      "restore": {
+        "torch_files": 8,
+        "torch_so_files": 1,
+        "cuda_files": 0
+      },
+      "save": {
+        "torch_files": 8,
+        "torch_so_files": 1,
+        "cuda_files": 0
+      },
+      "errors": []
+    },
+    "compile_markers": {
+      "ninja": true,
+      "nvcc": false,
+      "building_extension": false,
+      "torch_extensions_path": false,
+      "compile_step_1": false,
+      "compile_step_2": false,
+      "compile_step_3": false
+    },
+    "marker_lines_sample": [
+      "ninja: no work to do."
+    ],
+    "stdout_len": 10524,
+    "stderr_len": 0
+  }
+}

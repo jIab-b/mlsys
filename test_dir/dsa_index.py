@@ -1,4 +1,4 @@
-"""Single-file DSA index submission with inlined CUDA source."""
+"""DSA index submission."""
 
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -37,10 +37,10 @@ constexpr int kPackedFp8Bytes = kPageSize * kHeadDim;  // 8192
 constexpr int kStageTokens = 64;
 constexpr int kNumStages = 10;
 
-constexpr int kProducerWarp = 0;
-constexpr int kMmaWarp = 1;
-constexpr int kEpilogueWarpBase = 2;
+constexpr int kEpilogueWarpBase = 0;
 constexpr int kNumEpilogueWarps = 2;
+constexpr int kProducerWarp = 2;
+constexpr int kMmaWarp = 3;
 constexpr int kNumWarps = 2 + kNumEpilogueWarps;
 constexpr int kThreadsPerBlock = kNumWarps * 32;
 
@@ -202,56 +202,97 @@ __device__ inline float tcgen05_ld_32x32b_1(int row, int col) {
     return val;
 }
 
-__device__ inline uint32_t read_u32_le(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
+// Warp-parallel min-scan over the unsorted top-k buffer.
+// All 32 lanes of the warp participate. Returns min value and its index in the buffer.
+// Only lane 0's min_pos/min_val outputs are authoritative (via reduction).
+__device__ inline void topk_find_min_warp(
+    const float* scores, int k, int lane,
+    float& out_min_val, int& out_min_pos
+) {
+    // Each lane scans k/32 elements
+    const int chunk = k >> 5;  // k / 32
+    const int base = lane * chunk;
+    float local_min = FLT_MAX;
+    int local_pos = -1;
+    for (int i = 0; i < chunk; ++i) {
+        float s = scores[base + i];
+        if (s < local_min) {
+            local_min = s;
+            local_pos = base + i;
+        }
+    }
+    // Warp reduction to find global min
+    for (int off = 16; off > 0; off >>= 1) {
+        float other_val = __shfl_down_sync(0xFFFFFFFF, local_min, off);
+        int other_pos = __shfl_down_sync(0xFFFFFFFF, local_pos, off);
+        if (other_val < local_min) {
+            local_min = other_val;
+            local_pos = other_pos;
+        }
+    }
+    out_min_val = local_min;
+    out_min_pos = local_pos;
 }
 
-__device__ inline void insert_topk_desc(float score, int idx, float* scores, int* ids, int& count, int k) {
-    if (k <= 0 || idx < 0) {
-        return;
-    }
+// Insert a score into the unsorted top-k buffer.
+// Called by all lanes in the warp (for the min-scan), but only lane 0 writes.
+// topk_min_val / topk_min_pos are broadcast from lane 0 to all lanes.
+__device__ inline void topk_insert_unsorted(
+    float score, int idx,
+    float* topk_scores, int* topk_ids,
+    int& count, int k, int lane,
+    float& topk_min_val, int& topk_min_pos
+) {
+    if (k <= 0 || idx < 0) return;
 
+    // Phase 1: buffer not full yet — just append
     if (count < k) {
-        int pos = count;
-        while (pos > 0 && score > scores[pos - 1]) {
-            scores[pos] = scores[pos - 1];
-            ids[pos] = ids[pos - 1];
-            --pos;
+        if (lane == 0) {
+            topk_scores[count] = score;
+            topk_ids[count] = idx;
+            ++count;
+            // When buffer just became full, need to find the min
+            if (count == k) {
+                // Will be computed below via warp scan
+            }
         }
-        scores[pos] = score;
-        ids[pos] = idx;
-        ++count;
+        // Broadcast count
+        count = __shfl_sync(0xFFFFFFFF, count, 0);
+        if (count == k) {
+            // Buffer just filled — compute initial min
+            topk_find_min_warp(topk_scores, k, lane, topk_min_val, topk_min_pos);
+            topk_min_val = __shfl_sync(0xFFFFFFFF, topk_min_val, 0);
+            topk_min_pos = __shfl_sync(0xFFFFFFFF, topk_min_pos, 0);
+        }
         return;
     }
 
-    if (score <= scores[k - 1]) {
-        return;
-    }
+    // Phase 2: buffer full — threshold check (all lanes have min_val from broadcast)
+    if (score <= topk_min_val) return;
 
-    int pos = k - 1;
-    while (pos > 0 && score > scores[pos - 1]) {
-        scores[pos] = scores[pos - 1];
-        ids[pos] = ids[pos - 1];
-        --pos;
+    // Replace the min entry
+    if (lane == 0) {
+        topk_scores[topk_min_pos] = score;
+        topk_ids[topk_min_pos] = idx;
     }
-    scores[pos] = score;
-    ids[pos] = idx;
+    __syncwarp();
+
+    // Recompute min
+    topk_find_min_warp(topk_scores, k, lane, topk_min_val, topk_min_pos);
+    topk_min_val = __shfl_sync(0xFFFFFFFF, topk_min_val, 0);
+    topk_min_pos = __shfl_sync(0xFFFFFFFF, topk_min_pos, 0);
 }
 
 // ---------------------------------------------------------------------------------
 // Kernel: 3-stage warp-specialized pipeline
 // ---------------------------------------------------------------------------------
-__global__ void dsa_topk_indexer_kernel(
+__global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
+    const __grid_constant__ CUtensorMap k_fp8_tmap,
+    const __grid_constant__ CUtensorMap k_scale_tmap,
     const uint8_t* q_index_bytes,   // [B,64,128], FP8 E4M3
-    const int8_t* k_index_cache,    // [num_pages,64,1,132], deep_gemm packed
     const float* weights,           // [B,64]
     const int* seq_lens,            // [B]
     const int* block_table,         // [B,max_num_pages]
-    const void* k_fp8_tmap,         // payload tensor map
-    const void* k_scale_tmap,       // scale tensor map
     int* topk_indices,              // [B,topk]
     int batch_size,
     int num_pages,
@@ -316,10 +357,12 @@ __global__ void dsa_topk_indexer_kernel(
     float* stage_tile_scores = smem_alloc<float>(smem_ptr, kNumStages * kStageTokens);
     int* stage_tile_ids = smem_alloc<int>(smem_ptr, kNumStages * kStageTokens);
 
-    // Global rolling top-k.
+    // Global rolling top-k (unsorted buffer).
     float* topk_scores = smem_alloc<float>(smem_ptr, topk);
     int* topk_ids = smem_alloc<int>(smem_ptr, topk);
     int* topk_count_ptr = smem_alloc<int>(smem_ptr, 1);
+    float* topk_min_val_ptr = smem_alloc<float>(smem_ptr, 1);
+    int* topk_min_pos_ptr = smem_alloc<int>(smem_ptr, 1);
 
     // TMEM scratch.
     int* tmem_addr_scratch = smem_alloc<int>(smem_ptr, 1);
@@ -354,6 +397,8 @@ __global__ void dsa_topk_indexer_kernel(
     }
     if (tid == 0) {
         topk_count_ptr[0] = 0;
+        topk_min_val_ptr[0] = -FLT_MAX;
+        topk_min_pos_ptr[0] = 0;
         tmem_addr_scratch[0] = 0;
     }
     __syncthreads();
@@ -370,7 +415,6 @@ __global__ void dsa_topk_indexer_kernel(
                               | ((uint32_t)(kNumHeads >> 4U) << 24U);
 
     const int num_tiles = (seq_len + kStageTokens - 1) / kStageTokens;
-
     // Pipeline schedule:
     // iter: producer(tile=iter), mma(tile=iter-1), epilogue(tile=iter-2).
     for (int iter = 0; iter < num_tiles + 2; ++iter) {
@@ -421,9 +465,10 @@ __global__ void dsa_topk_indexer_kernel(
                         const int mbar_addr = cvta_to_shared_u32(&tma_mbar[stage]);
                         constexpr int payload_bytes = kStageTokens * kPayloadBytesPerToken;
                         constexpr int scale_bytes = kStageTokens * kScaleBytesPerToken;
+
                         mbarrier_arrive_expect_tx(mbar_addr, payload_bytes + scale_bytes);
-                        tma_3d_gmem2smem(payload_dst, k_fp8_tmap, 0, 0, page_idx, mbar_addr, 0ULL);
-                        tma_2d_gmem2smem(scale_dst, k_scale_tmap, 0, page_idx, mbar_addr, 0ULL);
+                        tma_3d_gmem2smem(payload_dst, &k_fp8_tmap, 0, 0, page_idx, mbar_addr, 0ULL);
+                        tma_2d_gmem2smem(scale_dst, &k_scale_tmap, 0, page_idx, mbar_addr, 0ULL);
                     } else {
                         mbarrier_arrive(cvta_to_shared_u32(&tma_mbar[stage]));
                     }
@@ -523,16 +568,34 @@ __global__ void dsa_topk_indexer_kernel(
                         cand_scores[t] = total;
                         cand_ids[t] = page_idx * kPageSize + t;
                     }
+
                     asm volatile("bar.sync 1, 64;" ::: "memory");
                 }
 
-                if (epi_warp == 0 && lane == 0) {
+                // Top-k insertion: all lanes of epi_warp 0 participate for warp-parallel min-scan
+                if (epi_warp == 0) {
                     int topk_count = topk_count_ptr[0];
+                    float topk_min_val = topk_min_val_ptr[0];
+                    int topk_min_pos = topk_min_pos_ptr[0];
+
                     for (int t = 0; t < valid_tokens; ++t) {
-                        insert_topk_desc(cand_scores[t], cand_ids[t], topk_scores, topk_ids, topk_count, actual_topk);
+                        float sc = cand_scores[t];
+                        int id = cand_ids[t];
+                        // Broadcast score/id from smem (lane 0 wrote them)
+                        topk_insert_unsorted(
+                            sc, id,
+                            topk_scores, topk_ids,
+                            topk_count, actual_topk, lane,
+                            topk_min_val, topk_min_pos
+                        );
                     }
-                    topk_count_ptr[0] = topk_count;
-                    mbarrier_arrive(cvta_to_shared_u32(&epi_mbar[stage]));
+
+                    if (lane == 0) {
+                        topk_count_ptr[0] = topk_count;
+                        topk_min_val_ptr[0] = topk_min_val;
+                        topk_min_pos_ptr[0] = topk_min_pos;
+                        mbarrier_arrive(cvta_to_shared_u32(&epi_mbar[stage]));
+                    }
                 }
             }
         }
@@ -551,99 +614,37 @@ __global__ void dsa_topk_indexer_kernel(
     if (warp_id == kMmaWarp) {
         tcgen05_dealloc(0, kStageTokens);
     }
+
 }
 
 // ---------------------------------------------------------------------------------
 // Host-side tensor-map encode helpers
 // ---------------------------------------------------------------------------------
-static void* g_k_fp8_tmap_dev = nullptr;
-static void* g_k_scale_tmap_dev = nullptr;
+static bool g_kernel_attrs_set = false;
 
-static inline size_t align_up_size(size_t v, size_t a) {
-    return (v + a - 1) & ~(a - 1);
-}
-
-static size_t required_dynamic_smem_bytes(int topk) {
-    size_t off = 0;
-
-    off = align_up_size(off, alignof(uint8_t));
-    off += static_cast<size_t>(kNumStages) * kStageTokens * kPayloadBytesPerToken;
-
-    off = align_up_size(off, alignof(float));
-    off += static_cast<size_t>(kNumStages) * kStageTokens * sizeof(float);
-
-    off = align_up_size(off, alignof(uint8_t));
-    off += static_cast<size_t>(kNumHeads) * kHeadDim;
-
-    off = align_up_size(off, alignof(float));
-    off += static_cast<size_t>(kNumHeads) * sizeof(float);
-
-    off = align_up_size(off, alignof(int));
-    off += static_cast<size_t>(kNumStages) * sizeof(int);  // stage_page_idx
-    off = align_up_size(off, alignof(int));
-    off += static_cast<size_t>(kNumStages) * sizeof(int);  // stage_valid_tokens
-    off = align_up_size(off, alignof(int));
-    off += static_cast<size_t>(kNumStages) * sizeof(int);  // tma_phase
-    off = align_up_size(off, alignof(int));
-    off += static_cast<size_t>(kNumStages) * sizeof(int);  // mma_phase
-    off = align_up_size(off, alignof(int));
-    off += static_cast<size_t>(kNumStages) * sizeof(int);  // epi_phase
-
-    off = align_up_size(off, alignof(uint64_t));
-    off += static_cast<size_t>(kNumStages) * sizeof(uint64_t);  // tma_mbar
-    off = align_up_size(off, alignof(uint64_t));
-    off += static_cast<size_t>(kNumStages) * sizeof(uint64_t);  // mma_mbar
-    off = align_up_size(off, alignof(uint64_t));
-    off += static_cast<size_t>(kNumStages) * sizeof(uint64_t);  // epi_mbar
-
-    off = align_up_size(off, alignof(float));
-    off += static_cast<size_t>(kNumStages) * kStageTokens * sizeof(float);  // stage_tile_scores
-    off = align_up_size(off, alignof(int));
-    off += static_cast<size_t>(kNumStages) * kStageTokens * sizeof(int);    // stage_tile_ids
-
-    off = align_up_size(off, alignof(float));
-    off += static_cast<size_t>(topk) * sizeof(float);  // topk_scores
-    off = align_up_size(off, alignof(int));
-    off += static_cast<size_t>(topk) * sizeof(int);    // topk_ids
-    off = align_up_size(off, alignof(int));
-    off += sizeof(int);                                 // topk_count_ptr
-    off = align_up_size(off, alignof(int));
-    off += sizeof(int);                                 // tmem_addr_scratch
-
-    return off;
-}
-
-static void ensure_k_fp8_tmap_on_device(const int8_t* k_index_cache_ptr, int num_pages) {
-    if (g_k_fp8_tmap_dev == nullptr) {
-        cudaError_t alloc_st = cudaMalloc(&g_k_fp8_tmap_dev, sizeof(CUtensorMap));
-        TORCH_CHECK(alloc_st == cudaSuccess, "cudaMalloc(CUtensorMap) failed");
-    }
-
-    CUtensorMap k_fp8_tmap{};
-    cuInit(0);
-
-    constexpr cuuint32_t rank = 3;
-    const cuuint64_t globalDim[rank] = {
-        static_cast<cuuint64_t>(kPayloadBytesPerToken),
-        static_cast<cuuint64_t>(kPageSize),
-        static_cast<cuuint64_t>(num_pages),
+static CUtensorMap make_k_fp8_tmap(const int8_t* k_ptr, int num_pages) {
+    CUtensorMap tmap{};
+    constexpr uint32_t rank = 3;
+    uint64_t globalDim[rank] = {
+        (uint64_t)kPayloadBytesPerToken,
+        (uint64_t)kPageSize,
+        (uint64_t)num_pages,
     };
-    const cuuint64_t globalStrides[rank - 1] = {
-        static_cast<cuuint64_t>(kPayloadBytesPerToken),
-        static_cast<cuuint64_t>(kPageBytes),
+    uint64_t globalStrides[rank - 1] = {
+        (uint64_t)kPayloadBytesPerToken,
+        (uint64_t)kPageBytes,
     };
-    const cuuint32_t boxDim[rank] = {
-        static_cast<cuuint32_t>(kPayloadBytesPerToken),
-        static_cast<cuuint32_t>(kPageSize),
+    uint32_t boxDim[rank] = {
+        (uint32_t)kPayloadBytesPerToken,
+        (uint32_t)kPageSize,
         1U,
     };
-    const cuuint32_t elementStrides[rank] = {1U, 1U, 1U};
-
-    const CUresult st = cuTensorMapEncodeTiled(
-        &k_fp8_tmap,
+    uint32_t elementStrides[rank] = {1U, 1U, 1U};
+    auto st = cuTensorMapEncodeTiled(
+        &tmap,
         CU_TENSOR_MAP_DATA_TYPE_UINT8,
         rank,
-        const_cast<int8_t*>(k_index_cache_ptr),
+        (void*)k_ptr,
         globalDim,
         globalStrides,
         boxDim,
@@ -651,82 +652,42 @@ static void ensure_k_fp8_tmap_on_device(const int8_t* k_index_cache_ptr, int num
         CU_TENSOR_MAP_INTERLEAVE_NONE,
         CU_TENSOR_MAP_SWIZZLE_128B,
         CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-    );
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     TORCH_CHECK(st == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for payload");
+    return tmap;
+}
 
-    cudaError_t cp_st = cudaMemcpy(g_k_fp8_tmap_dev, &k_fp8_tmap, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
-    TORCH_CHECK(cp_st == cudaSuccess, "cudaMemcpy(payload CUtensorMap) failed");
-
-    // Scale tensor map: 1D over the flat scale region.
-    // Scales are at offset kPackedFp8Bytes within each page, contiguous kPageSize * 4 bytes.
-    // We treat the entire cache as a flat byte array and index by page_idx * kPageSize * 4.
-    if (g_k_scale_tmap_dev == nullptr) {
-        cudaError_t alloc_st2 = cudaMalloc(&g_k_scale_tmap_dev, sizeof(CUtensorMap));
-        TORCH_CHECK(alloc_st2 == cudaSuccess, "cudaMalloc(scale CUtensorMap) failed");
-    }
-
-    // Build a 1D tensor map over the scale bytes.
-    // Base pointer: k_index_cache_ptr + kPackedFp8Bytes (start of scales in page 0).
-    // globalDim: num_pages * kPageSize * 4 total scale bytes across all pages.
-    // BUT scales are NOT contiguous across pages — there's a gap of kPackedFp8Bytes between pages.
-    // So use a 2D map: dim0 = scale bytes per page (256), dim1 = num_pages.
-    CUtensorMap k_scale_tmap{};
-    {
-        constexpr cuuint32_t srank = 1;
-        const cuuint64_t sglobalDim[srank] = {
-            static_cast<cuuint64_t>(num_pages) * kPageSize * kScaleBytesPerToken,
-        };
-        const cuuint64_t sglobalStrides[1] = {};  // unused for rank 1
-        const cuuint32_t sboxDim[srank] = {
-            static_cast<cuuint32_t>(kPageSize * kScaleBytesPerToken),
-        };
-        const cuuint32_t selementStrides[srank] = {1U};
-
-        // Base pointer is the start of the scale region (offset kPackedFp8Bytes from page 0).
-        // Since scales are at a fixed offset per page and pages are kPageBytes apart,
-        // and kPageBytes = kPackedFp8Bytes + kPageSize*kScaleBytesPerToken = 8192 + 256 = 8448,
-        // the scales ARE contiguous across pages in the flat layout:
-        //   page0_fp8(8192) | page0_scale(256) | page1_fp8(8192) | page1_scale(256) | ...
-        // So they are NOT contiguous. We need a 2D map.
-        // Actually, let's use 2D: dim0 = 256 (scale bytes per page), dim1 = num_pages.
-        (void)sglobalDim; (void)sglobalStrides; (void)sboxDim; (void)selementStrides;
-    }
-    {
-        constexpr cuuint32_t srank = 2;
-        const uint8_t* scale_base = reinterpret_cast<const uint8_t*>(k_index_cache_ptr) + kPackedFp8Bytes;
-        const cuuint64_t sglobalDim[srank] = {
-            static_cast<cuuint64_t>(kPageSize * kScaleBytesPerToken),  // 256
-            static_cast<cuuint64_t>(num_pages),
-        };
-        const cuuint64_t sglobalStrides[srank - 1] = {
-            static_cast<cuuint64_t>(kPageBytes),  // stride between pages = 8448
-        };
-        const cuuint32_t sboxDim[srank] = {
-            static_cast<cuuint32_t>(kPageSize * kScaleBytesPerToken),  // 256
-            1U,
-        };
-        const cuuint32_t selementStrides[srank] = {1U, 1U};
-
-        const CUresult st2 = cuTensorMapEncodeTiled(
-            &k_scale_tmap,
-            CU_TENSOR_MAP_DATA_TYPE_UINT8,
-            srank,
-            const_cast<uint8_t*>(scale_base),
-            sglobalDim,
-            sglobalStrides,
-            sboxDim,
-            selementStrides,
-            CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_128B,
-            CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-        );
-        TORCH_CHECK(st2 == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for scales");
-    }
-
-    cudaError_t cp_st2 = cudaMemcpy(g_k_scale_tmap_dev, &k_scale_tmap, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
-    TORCH_CHECK(cp_st2 == cudaSuccess, "cudaMemcpy(scale CUtensorMap) failed");
+static CUtensorMap make_k_scale_tmap(const int8_t* k_ptr, int num_pages) {
+    CUtensorMap tmap{};
+    constexpr uint32_t srank = 2;
+    const uint8_t* scale_base = reinterpret_cast<const uint8_t*>(k_ptr) + kPackedFp8Bytes;
+    uint64_t sglobalDim[srank] = {
+        (uint64_t)(kPageSize * kScaleBytesPerToken),
+        (uint64_t)num_pages,
+    };
+    uint64_t sglobalStrides[srank - 1] = {
+        (uint64_t)kPageBytes,
+    };
+    uint32_t sboxDim[srank] = {
+        (uint32_t)(kPageSize * kScaleBytesPerToken),
+        1U,
+    };
+    uint32_t selementStrides[srank] = {1U, 1U};
+    auto st = cuTensorMapEncodeTiled(
+        &tmap,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        srank,
+        (void*)scale_base,
+        sglobalDim,
+        sglobalStrides,
+        sboxDim,
+        selementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(st == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for scales");
+    return tmap;
 }
 
 // ---------------------------------------------------------------------------------
@@ -749,43 +710,27 @@ void dsa_topk_indexer_launch(
         return;
     }
 
-    ensure_k_fp8_tmap_on_device(reinterpret_cast<const int8_t*>(k_index_cache_fp8.data_ptr()), num_pages);
+    if (!g_kernel_attrs_set) {
+        cudaFuncSetAttribute(
+            dsa_topk_indexer_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            kDesiredDynamicSmemBytes
+        );
+        g_kernel_attrs_set = true;
+    }
 
-    int device = -1;
-    cudaGetDevice(&device);
-
-    int max_optin_smem = 0;
-    cudaDeviceGetAttribute(&max_optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    const size_t smem_need = required_dynamic_smem_bytes(topk);
-    TORCH_CHECK(smem_need <= static_cast<size_t>(INT_MAX), "required smem does not fit int");
-
-    int dynamic_smem_bytes = kDesiredDynamicSmemBytes;
-    const int smem_need_i = static_cast<int>(smem_need);
-    if (dynamic_smem_bytes < smem_need_i) dynamic_smem_bytes = smem_need_i;
-    if (max_optin_smem > 0 && dynamic_smem_bytes > max_optin_smem) dynamic_smem_bytes = max_optin_smem;
-    TORCH_CHECK(dynamic_smem_bytes >= smem_need_i,
-                "insufficient dynamic shared memory: need ", smem_need_i, ", have ", dynamic_smem_bytes);
-
-    cudaFuncSetAttribute(
-        dsa_topk_indexer_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        dynamic_smem_bytes
-    );
-    cudaFuncSetAttribute(
-        dsa_topk_indexer_kernel,
-        cudaFuncAttributePreferredSharedMemoryCarveout,
-        100
-    );
+    const int8_t* k_ptr = reinterpret_cast<const int8_t*>(k_index_cache_fp8.data_ptr());
+    CUtensorMap k_fp8_tmap = make_k_fp8_tmap(k_ptr, num_pages);
+    CUtensorMap k_scale_tmap = make_k_scale_tmap(k_ptr, num_pages);
 
     const int blocks = batch_size;
-    dsa_topk_indexer_kernel<<<blocks, kThreadsPerBlock, dynamic_smem_bytes>>>(
+    dsa_topk_indexer_kernel<<<blocks, kThreadsPerBlock, kDesiredDynamicSmemBytes>>>(
+        k_fp8_tmap,
+        k_scale_tmap,
         reinterpret_cast<const uint8_t*>(q_index_fp8.data_ptr()),
-        reinterpret_cast<const int8_t*>(k_index_cache_fp8.data_ptr()),
         reinterpret_cast<const float*>(weights.data_ptr()),
         reinterpret_cast<const int*>(seq_lens.data_ptr()),
         reinterpret_cast<const int*>(block_table.data_ptr()),
-        g_k_fp8_tmap_dev,
-        g_k_scale_tmap_dev,
         reinterpret_cast<int*>(topk_indices.data_ptr()),
         batch_size,
         num_pages,
@@ -813,15 +758,16 @@ def _get_module():
     global _module
     if _module is None:
         _module = load_inline(
-            name="dsa_topk_indexer_singlefile_ext",
+            name="dsa_topk_indexer_ext",
             cpp_sources=cpp_decl_src,
             cuda_sources=cuda_src,
             functions=["dsa_topk_indexer_launch"],
             verbose=True,
             extra_cuda_cflags=[
-                "-O0",
+                "-O3",
                 "-gencode=arch=compute_100a,code=sm_100a",
                 "--threads=4",
+                "--relocatable-device-code=false",
             ],
             extra_ldflags=["-lcuda"],
         )

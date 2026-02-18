@@ -1,16 +1,8 @@
 import argparse
-import ctypes
-import os
-import re
-import shutil
-import subprocess
 import sys
 import tempfile
 import traceback
 from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
 
@@ -19,10 +11,12 @@ try:
 except ImportError:
     import tomli as tomllib
 
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 app = modal.App("flashinfer-bench")
 OUT_REPORT_PATH = PROJECT_ROOT / "solution" / "out.txt"
 BASE_IMAGE = "pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel"
-TVM_FFI_CUDA_ARCH_LIST = "10.0a"
 UV_PACKAGES = [
     "flashinfer-bench",
     "numpy",
@@ -52,100 +46,21 @@ WORKER_LOG_DIRS = (
     Path("/root/.cache/flashinfer_bench/cache/logs"),
     Path("/tmp/flashinfer_bench"),
 )
-GENERIC_RUNTIME_MARKERS = (
-    "Connection error during evaluation",
-    "Connection broken during evaluation",
-    "Failed to decode evaluation response",
-)
 
 
-@app.function(
-    image=image,
-    gpu="B200:1",
-    timeout=90,
-    volumes={TRACE_SET_PATH: trace_volume},
-    env={"TVM_FFI_CUDA_ARCH_LIST": TVM_FFI_CUDA_ARCH_LIST},
-)
+@app.function(image=image, gpu="B200:1", timeout=90, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(
     source_files: dict[str, bytes],
     solution_meta: dict,
     benchmark_config: dict | None = None,
     max_workloads: int = 1,
 ) -> dict:
-    os.environ.setdefault("TVM_FFI_CUDA_ARCH_LIST", TVM_FFI_CUDA_ARCH_LIST)
-
     from flashinfer_bench import Benchmark, BenchmarkConfig, BuildSpec, TraceSet
     from flashinfer_bench.agents import pack_solution_from_files
-    from flashinfer_bench.env import get_fib_cache_path
-    import tvm_ffi
-
-    def _is_tvm_ffi_cuda() -> bool:
-        binding = (solution_meta.get("binding") or "").strip().lower()
-        return solution_meta["language"] == "cuda" and binding in ("", "tvm-ffi", "tvm_ffi")
-
-    ffi_diagnostics: dict[str, object] = {}
-
-    if _is_tvm_ffi_cuda():
-        from tvm_ffi.libinfo import find_libtvm_ffi
-
-        tvm_ffi_lib = Path(find_libtvm_ffi()).resolve()
-        candidate_dirs = [
-            tvm_ffi_lib.parent,
-            Path("/usr/local/cuda/lib64"),
-            Path("/usr/local/cuda/compat"),
-            Path("/usr/local/nvidia/lib64"),
-            Path("/usr/lib/x86_64-linux-gnu"),
-        ]
-        lib_dirs = [str(p) for p in candidate_dirs if p.exists()]
-        existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
-        existing_parts = [p for p in existing_ld.split(":") if p]
-        combined = []
-        for p in lib_dirs + existing_parts:
-            if p not in combined:
-                combined.append(p)
-        os.environ["LD_LIBRARY_PATH"] = ":".join(combined)
-
-        ffi_diagnostics["binding"] = solution_meta.get("binding") or "tvm-ffi(default)"
-        ffi_diagnostics["tvm_ffi_lib"] = str(tvm_ffi_lib)
-        ffi_diagnostics["ld_library_path"] = os.environ["LD_LIBRARY_PATH"]
-        ffi_diagnostics["ffi_lib_dirs"] = lib_dirs
-
-        try:
-            ctypes.CDLL(str(tvm_ffi_lib), mode=ctypes.RTLD_GLOBAL)
-            ffi_diagnostics["tvm_ffi_load"] = "ok"
-        except OSError as exc:
-            ffi_diagnostics["tvm_ffi_load"] = f"failed: {exc}"
-            raise RuntimeError(f"Failed to load {tvm_ffi_lib} in worker: {exc}") from exc
-
-        try:
-            ctypes.CDLL("libcuda.so.1", mode=ctypes.RTLD_GLOBAL)
-            ffi_diagnostics["libcuda_load"] = "ok"
-        except OSError as exc:
-            ffi_diagnostics["libcuda_load"] = f"failed: {exc}"
-            raise RuntimeError(f"Failed to load libcuda.so.1 in worker: {exc}") from exc
-
-    if _is_tvm_ffi_cuda() and not getattr(tvm_ffi.cpp.build, "__flash_comp_lcuda_patch__", False):
-        original_build = tvm_ffi.cpp.build
-
-        def _build_with_cuda_driver(*args, **kwargs):
-            extra_ldflags = list(kwargs.get("extra_ldflags") or [])
-            if "-Wl,--no-as-needed" not in extra_ldflags:
-                extra_ldflags.append("-Wl,--no-as-needed")
-            if "-lcuda" not in extra_ldflags:
-                extra_ldflags.append("-lcuda")
-            kwargs["extra_ldflags"] = extra_ldflags
-            return original_build(*args, **kwargs)
-
-        _build_with_cuda_driver.__flash_comp_lcuda_patch__ = True
-        tvm_ffi.cpp.build = _build_with_cuda_driver
 
     config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
     if benchmark_config is not None:
         config = BenchmarkConfig(**benchmark_config)
-
-    tvm_ffi_cache_dir = Path(get_fib_cache_path()) / "tvm_ffi"
-    if _is_tvm_ffi_cuda():
-        shutil.rmtree(tvm_ffi_cache_dir, ignore_errors=True)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         source_root = Path(tmpdir) / "solution"
@@ -156,18 +71,24 @@ def run_benchmark(
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(content)
 
-        spec_kwargs = {
+        spec_kwargs: dict[str, object] = {
             "language": solution_meta["language"],
             "target_hardware": ["cuda"],
             "entry_point": solution_meta["entry_point"],
         }
-        if solution_meta["language"] == "cuda" and solution_meta.get("binding"):
-            spec_kwargs["binding"] = solution_meta["binding"]
+        binding = solution_meta.get("binding", "")
+
+        # Torch + Python entrypoint (binding.py::kernel) should use PythonBuilder.
+        entry_file = str(solution_meta["entry_point"]).split("::", 1)[0]
+        if binding == "torch" and entry_file.endswith(".py"):
+            spec_kwargs["language"] = "python"
+        elif binding:
+            spec_kwargs["binding"] = binding
 
         try:
             spec = BuildSpec(**spec_kwargs)
         except TypeError:
-            # Older flashinfer_bench builds may not expose BuildSpec.binding.
+            # Older flashinfer_bench versions may not expose BuildSpec.binding.
             spec_kwargs.pop("binding", None)
             spec = BuildSpec(**spec_kwargs)
 
@@ -200,27 +121,9 @@ def run_benchmark(
 
     result_trace_set = Benchmark(bench_trace_set, config).run_all(dump_traces=True)
     traces = result_trace_set.traces.get(definition.name, [])
+
     results = {definition.name: {}}
     stats = {"total": len(traces), "evaluated": 0, "non_evaluated": 0}
-
-    if _is_tvm_ffi_cuda():
-        so_candidates = sorted(tvm_ffi_cache_dir.glob("**/*.so"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if so_candidates:
-            so_path = so_candidates[0]
-            dyn = _run_cmd(["readelf", "-d", str(so_path)])
-            ldd = _run_cmd(["ldd", "-r", str(so_path)])
-            ffi_diagnostics["linked_module"] = str(so_path)
-            ffi_diagnostics["readelf_dynamic"] = dyn
-            ffi_diagnostics["ldd_r"] = ldd
-            ffi_diagnostics["has_needed_libtvm_ffi"] = "libtvm_ffi.so" in dyn
-            ffi_diagnostics["has_needed_libcuda"] = (
-                "libcuda.so" in dyn or "libcuda.so.1" in dyn or "-lcuda" in dyn
-            )
-            ffi_diagnostics["has_cuinit_unresolved"] = "undefined symbol: cuInit" in ldd
-            ffi_diagnostics["has_tvmffi_unresolved"] = "undefined symbol: TVMFFI" in ldd
-        else:
-            ffi_diagnostics["linked_module"] = None
-            ffi_diagnostics["link_check_error"] = f"No .so found under {tvm_ffi_cache_dir}"
 
     for i, trace in enumerate(traces):
         raw = trace.model_dump(mode="json")
@@ -251,17 +154,18 @@ def run_benchmark(
                 entry["max_abs_error"] = correctness.get("max_absolute_error")
                 entry["max_rel_error"] = correctness.get("max_relative_error")
 
-            entry.update(_extract_error_parts(raw, evaluation))
+            for key in ("message", "error", "log"):
+                value = evaluation.get(key)
+                if value:
+                    entry[f"evaluation_{key}"] = str(value)
+
             stats["evaluated"] += 1
         elif evaluation is not None:
             entry["status"] = str(evaluation)
-            entry.update(_extract_error_parts(raw, None))
-            if not any(entry.get(k) for k in ("message", "error")):
-                entry["detail"] = "Non-dict evaluation payload returned by benchmark."
+            entry["detail"] = "Non-dict evaluation payload returned by benchmark."
             stats["evaluated"] += 1
         else:
             entry["status"] = "NO_EVAL"
-            entry.update(_extract_error_parts(raw, None))
             entry["detail"] = raw.get("status") or "Trace has no evaluation object (likely build/runtime failure)."
             stats["non_evaluated"] += 1
 
@@ -276,26 +180,10 @@ def run_benchmark(
             "definition": solution.definition,
             "author": solution.author,
             "language": solution_meta["language"],
-            "binding": solution_meta.get("binding") or "tvm-ffi(default)",
+            "binding": solution_meta.get("binding") or "",
         },
         "solution_json": solution.model_dump_json(indent=2),
-        "ffi_diagnostics": ffi_diagnostics,
     }
-
-
-def _extract_error_parts(raw_trace: dict, evaluation: dict | None) -> dict[str, str]:
-    parts: dict[str, str] = {}
-    for key in ("message", "error"):
-        value = raw_trace.get(key)
-        if value:
-            parts[key] = str(value)
-
-    if isinstance(evaluation, dict):
-        for key in ("message", "error", "log"):
-            value = evaluation.get(key)
-            if value:
-                parts[f"evaluation_{key}"] = str(value)
-    return parts
 
 
 def _read_latest_worker_log(solution_name: str) -> tuple[str | None, str | None]:
@@ -317,59 +205,21 @@ def _read_latest_worker_log(solution_name: str) -> tuple[str | None, str | None]
         return str(latest), None
 
 
-def _run_cmd(cmd: list[str]) -> str:
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=20)
-        body = (proc.stdout or "").rstrip()
-        stderr = (proc.stderr or "").rstrip()
-        if stderr:
-            body = (body + "\n" + stderr).strip()
-        return f"$ {' '.join(cmd)}\n{body}".rstrip()
-    except Exception as exc:
-        return f"$ {' '.join(cmd)}\n<failed to run: {exc}>"
-
-
-def _collect_loader_diagnostics(log_text: str) -> str | None:
-    match = re.search(r"symbol lookup error:\s+(\S+): undefined symbol:\s+(\S+)", log_text)
-    if not match:
-        return None
-
-    so_path, missing_sym = match.group(1), match.group(2)
-    diagnostics = [
-        f"Detected missing symbol '{missing_sym}' while loading: {so_path}",
-        _run_cmd(["ldd", "-r", so_path]),
-        _run_cmd(["readelf", "-Ws", so_path]),
-    ]
-    return "\n\n".join(x for x in diagnostics if x).strip()
-
-
 def _attach_runtime_details(entry: dict) -> None:
     status = str(entry.get("status", "")).upper()
     if status != "NO_EVAL" and "ERROR" not in status:
         return
 
     eval_log = str(entry.get("evaluation_log", "")).strip()
-    generic_runtime = (
-        eval_log == "Evaluation failed"
-        or any(marker in eval_log for marker in GENERIC_RUNTIME_MARKERS)
-        or (status == "RUNTIME_ERROR" and not eval_log)
-    )
-
-    if not generic_runtime:
-        if eval_log:
-            entry["error_detail"] = eval_log
+    if eval_log:
+        entry["error_detail"] = eval_log
         return
 
     log_path, log_text = _read_latest_worker_log(entry.get("solution", ""))
     if log_path:
         entry["worker_log_path"] = log_path
-    if not log_text:
-        return
-
-    entry["error_detail"] = log_text.rstrip()
-    diagnostics = _collect_loader_diagnostics(log_text)
-    if diagnostics:
-        entry["loader_diagnostics"] = diagnostics
+    if log_text:
+        entry["error_detail"] = log_text.rstrip()
 
 
 def print_results(results: dict, out_lines: list[str] | None = None):
@@ -392,7 +242,7 @@ def print_results(results: dict, out_lines: list[str] | None = None):
                 line += f" | abs_err={result['max_abs_error']:.2e}, rel_err={rel_err:.2e}"
             emit(line)
 
-            for key in ("detail", "message", "error", "evaluation_message", "evaluation_error"):
+            for key in ("detail", "evaluation_message", "evaluation_error"):
                 value = result.get(key)
                 if value:
                     emit(f"    {key}: {value}")
@@ -401,18 +251,9 @@ def print_results(results: dict, out_lines: list[str] | None = None):
                 emit("    error_detail:")
                 for subline in str(result["error_detail"]).splitlines():
                     emit(f"      {subline}")
-            elif result.get("evaluation_log"):
-                emit("    evaluation_log:")
-                for subline in str(result["evaluation_log"]).splitlines():
-                    emit(f"      {subline}")
 
-            worker_log_path = result.get("worker_log_path")
-            if worker_log_path:
-                emit(f"    worker_log_path: {worker_log_path}")
-            if result.get("loader_diagnostics"):
-                emit("    loader_diagnostics:")
-                for subline in str(result["loader_diagnostics"]).splitlines():
-                    emit(f"      {subline}")
+            if result.get("worker_log_path"):
+                emit(f"    worker_log_path: {result['worker_log_path']}")
 
 
 def _load_config_best_effort() -> dict:
@@ -456,6 +297,17 @@ def _resolve_definition_alias(
     return ""
 
 
+def _normalize_binding(raw_binding: str) -> str:
+    binding = (raw_binding or "").strip().lower()
+    if not binding:
+        return ""
+    if binding in ("tvm-ffi", "tvm_ffi"):
+        return "tvm-ffi"
+    if binding == "torch":
+        return "torch"
+    raise ValueError(f"Unsupported binding: {raw_binding}. Use 'tvm-ffi' or 'torch'.")
+
+
 def _normalize_entry_point(raw_entry_point: str, language: str, source_dir: Path) -> str:
     entry_point = raw_entry_point.strip()
     if not entry_point:
@@ -468,17 +320,6 @@ def _normalize_entry_point(raw_entry_point: str, language: str, source_dir: Path
         if (source_dir / filename).exists():
             return f"{filename}::{entry_point}"
     return f"{candidates[0]}::{entry_point}"
-
-
-def _normalize_binding(raw_binding: str) -> str:
-    binding = (raw_binding or "").strip().lower()
-    if not binding:
-        return ""
-    if binding in ("tvm-ffi", "tvm_ffi"):
-        return "tvm-ffi"
-    if binding == "torch":
-        return "torch"
-    raise ValueError(f"Unsupported binding: {raw_binding}. Use 'tvm-ffi' or 'torch'.")
 
 
 def _resolve_solution_meta(
@@ -509,7 +350,11 @@ def _resolve_solution_meta(
 
     raw_entry_point = entry_point or build_cfg.get("entry_point", "kernel")
     final_entry_point = _normalize_entry_point(raw_entry_point, final_language, source_dir)
+
     final_binding = _normalize_binding(binding or build_cfg.get("binding", ""))
+    if final_language == "cuda" and not final_binding:
+        final_binding = "torch"
+
     return {
         "definition": final_definition,
         "name": final_name,
@@ -593,6 +438,7 @@ def _run(
         gdn_prefill=gdn_prefill,
         fp8_moe=fp8_moe,
     )
+
     use_overrides = any((selected_definition, name, author, language, entry_point, binding, file))
 
     try:
@@ -616,10 +462,11 @@ def _run(
 
         log(f"Loaded: {solution_meta['name']} ({solution_meta['definition']})")
         log(f"Entry point: {solution_meta['entry_point']}")
-        log(f"Binding: {solution_meta.get('binding') or 'tvm-ffi(default)'}")
+        log(f"Binding: {solution_meta.get('binding') or '(default)'}")
         if file:
             log(f"Override mode: using '{file}.py' as binding.py and '{file}.cu' as kernel.cu")
-        log(f"Source files packed ({len(source_files)}):")
+
+        log("Source files packed:")
         for rel_path in sorted(source_files):
             log(f"  - {rel_path}")
 
@@ -636,32 +483,7 @@ def _run(
         log(f"  Definition: {packed_solution['definition']}")
         log(f"  Author: {packed_solution['author']}")
         log(f"  Language: {packed_solution['language']}")
-        log(f"  Binding: {packed_solution.get('binding', solution_meta.get('binding') or 'tvm-ffi(default)')}")
-
-        ffi_diag = payload.get("ffi_diagnostics", {})
-        if ffi_diag:
-            log("FFI diagnostics:")
-            for key in ("binding", "tvm_ffi_lib", "tvm_ffi_load", "libcuda_load", "linked_module"):
-                if key in ffi_diag:
-                    log(f"  {key}: {ffi_diag[key]}")
-            for key in (
-                "has_needed_libtvm_ffi",
-                "has_needed_libcuda",
-                "has_cuinit_unresolved",
-                "has_tvmffi_unresolved",
-            ):
-                if key in ffi_diag:
-                    log(f"  {key}: {ffi_diag[key]}")
-            if ffi_diag.get("link_check_error"):
-                log(f"  link_check_error: {ffi_diag['link_check_error']}")
-            if ffi_diag.get("ldd_r"):
-                log("  ldd -r:")
-                for line in str(ffi_diag["ldd_r"]).splitlines():
-                    log(f"    {line}")
-            if ffi_diag.get("readelf_dynamic"):
-                log("  readelf -d:")
-                for line in str(ffi_diag["readelf_dynamic"]).splitlines():
-                    log(f"    {line}")
+        log(f"  Binding: {packed_solution.get('binding') or '(default)'}")
 
         stats = payload.get("stats", {})
         if stats:

@@ -1,21 +1,9 @@
-import os
 import torch
 from pathlib import Path
 from torch.utils.cpp_extension import load_inline
 
-try:
-    from tvm.ffi import register_func
-except Exception:
-    def register_func(_name):
-        def deco(fn):
-            return fn
-        return deco
-
 
 _module = None
-_op = None
-
-os.environ.setdefault("TVM_FFI_CUDA_ARCH_LIST", "10.0a")
 
 
 def _read_cuda_source() -> str:
@@ -27,34 +15,39 @@ def _read_cuda_source() -> str:
     raise FileNotFoundError(f"No CUDA source found in {here} (expected dsa_index.cu or kernel.cu)")
 
 
-def _load_extension():
-    global _module, _op
-    if _op is not None:
-        return _op
+_CPP_DECL_SRC = """
+#include <torch/extension.h>
+void dsa_topk_indexer_launch(
+    torch::Tensor q_index_fp8,
+    torch::Tensor k_index_cache_fp8,
+    torch::Tensor weights,
+    torch::Tensor seq_lens,
+    torch::Tensor block_table,
+    torch::Tensor topk_indices);
+"""
 
-    cuda_src = _read_cuda_source()
-    _module = load_inline(
-        name="dsa_topk_indexer_ext",
-        cpp_sources="",
-        cuda_sources=cuda_src,
-        verbose=True,
-        is_python_module=False,
-        no_implicit_headers=True,
-        extra_cuda_cflags=[
-            "-O3",
-            "--use_fast_math",
-            "-gencode=arch=compute_100a,code=sm_100a",
-            "--expt-relaxed-constexpr",
-            "--relocatable-device-code=false",
-        ],
-        extra_ldflags=["-lcuda"],
-    )
-    _op = torch.ops.index_bindings.dsa_topk_indexer_launch
-    return _op
+
+def _get_module():
+    global _module
+    if _module is None:
+        _module = load_inline(
+            name="dsa_topk_indexer_ext",
+            cpp_sources=_CPP_DECL_SRC,
+            cuda_sources=_read_cuda_source(),
+            functions=["dsa_topk_indexer_launch"],
+            verbose=True,
+            extra_cuda_cflags=[
+                "-O0",
+                "-gencode=arch=compute_100a,code=sm_100a",
+                "--threads=4",
+            ],
+            extra_ldflags=["-lcuda"],
+        )
+    return _module
 
 
 def compile_kernel() -> None:
-    _load_extension()
+    _get_module()
 
 
 def dsa_topk_indexer(
@@ -65,8 +58,8 @@ def dsa_topk_indexer(
     block_table: torch.Tensor,
     topk_indices: torch.Tensor,
 ) -> torch.Tensor:
-    op = _load_extension()
-    op(
+    mod = _get_module()
+    mod.dsa_topk_indexer_launch(
         q_index_fp8,
         k_index_cache_fp8,
         weights,
@@ -77,7 +70,6 @@ def dsa_topk_indexer(
     return topk_indices
 
 
-@register_func("flashinfer.kernel")
 def kernel(
     q_index_fp8,
     k_index_cache_fp8,
@@ -86,7 +78,7 @@ def kernel(
     block_table,
     topk_indices,
 ):
-    dsa_topk_indexer(
+    return dsa_topk_indexer(
         q_index_fp8,
         k_index_cache_fp8,
         weights,
@@ -94,4 +86,3 @@ def kernel(
         block_table,
         topk_indices,
     )
-    return topk_indices
