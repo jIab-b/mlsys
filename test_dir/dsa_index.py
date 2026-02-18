@@ -127,13 +127,25 @@ __device__ inline void tma_3d_gmem2smem(
     int mbar_addr,
     uint64_t cache_policy
 ) {
-    if (!elect_lane0()) {
-        return;
-    }
     asm volatile(
         "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
         "[%0], [%1, {%2, %3, %4}], [%5], %6;"
         :: "r"(dst_smem_addr), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr), "l"(cache_policy)
+        : "memory");
+}
+
+__device__ inline void tma_2d_gmem2smem(
+    int dst_smem_addr,
+    const void* tmap_ptr,
+    int x,
+    int y,
+    int mbar_addr,
+    uint64_t cache_policy
+) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
+        "[%0], [%1, {%2, %3}], [%4], %5;"
+        :: "r"(dst_smem_addr), "l"(tmap_ptr), "r"(x), "r"(y), "r"(mbar_addr), "l"(cache_policy)
         : "memory");
 }
 
@@ -239,6 +251,7 @@ __global__ void dsa_topk_indexer_kernel(
     const int* seq_lens,            // [B]
     const int* block_table,         // [B,max_num_pages]
     const void* k_fp8_tmap,         // payload tensor map
+    const void* k_scale_tmap,       // scale tensor map
     int* topk_indices,              // [B,topk]
     int batch_size,
     int num_pages,
@@ -392,26 +405,25 @@ __global__ void dsa_topk_indexer_kernel(
                 }
                 __syncwarp();
 
+                // Zero out scale padding for invalid tokens.
                 float* stage_scale = k_stage_scale + stage * kStageTokens;
-                for (int tok = lane; tok < valid_tokens; tok += 32) {
-                    const uint8_t* page_ptr = reinterpret_cast<const uint8_t*>(k_index_cache) +
-                                              static_cast<int64_t>(page_idx) * kPageBytes;
-                    const int scale_off = kPackedFp8Bytes + tok * kScaleBytesPerToken;
-                    stage_scale[tok] = __uint_as_float(read_u32_le(page_ptr + scale_off));
-                }
                 for (int tok = lane + valid_tokens; tok < kStageTokens; tok += 32) {
                     stage_scale[tok] = 0.0f;
                 }
                 __syncwarp();
 
-                // Payload uses strict TMA path; invalid stages send explicit arrive signal.
+                // TMA both payload and scales to the same mbarrier.
                 if (lane == 0) {
                     if (valid_tokens > 0) {
-                        const int dst = cvta_to_shared_u32(
+                        const int payload_dst = cvta_to_shared_u32(
                             k_stage_payload + stage * kStageTokens * kPayloadBytesPerToken);
+                        const int scale_dst = cvta_to_shared_u32(stage_scale);
                         const int mbar_addr = cvta_to_shared_u32(&tma_mbar[stage]);
-                        mbarrier_arrive_expect_tx(mbar_addr, kStageTokens * kPayloadBytesPerToken);
-                        tma_3d_gmem2smem(dst, k_fp8_tmap, 0, 0, page_idx, mbar_addr, 0ULL);
+                        constexpr int payload_bytes = kStageTokens * kPayloadBytesPerToken;
+                        constexpr int scale_bytes = kStageTokens * kScaleBytesPerToken;
+                        mbarrier_arrive_expect_tx(mbar_addr, payload_bytes + scale_bytes);
+                        tma_3d_gmem2smem(payload_dst, k_fp8_tmap, 0, 0, page_idx, mbar_addr, 0ULL);
+                        tma_2d_gmem2smem(scale_dst, k_scale_tmap, 0, page_idx, mbar_addr, 0ULL);
                     } else {
                         mbarrier_arrive(cvta_to_shared_u32(&tma_mbar[stage]));
                     }
@@ -477,32 +489,42 @@ __global__ void dsa_topk_indexer_kernel(
                 float* cand_scores = stage_tile_scores + stage * kStageTokens;
                 int* cand_ids = stage_tile_ids + stage * kStageTokens;
 
-                for (int t = epi_warp; t < valid_tokens; t += kNumEpilogueWarps) {
-                    float d0 = tcgen05_ld_32x32b_1(0, t);
-                    float d1 = tcgen05_ld_32x32b_1(1, t);
+                // epi_warp 0 reads TMEM rows 0-31 (heads 0..31)
+                // epi_warp 1 reads TMEM rows 32-63 (heads 32..63)
+                const int tmem_row_base = epi_warp * 32;
+
+                for (int t = 0; t < valid_tokens; ++t) {
+                    // Each warp loads its 32 heads for token t
+                    float d = tcgen05_ld_32x32b_1(tmem_row_base, t);
                     tcgen05_wait_ld();
 
                     const float scale = stage_scale[t];
-                    const float v0 = d0 * scale;
-                    const float v1 = d1 * scale;
+                    const float v = d * scale;
 
-                    const float w0 = w_stage[lane];
-                    const float w1 = w_stage[lane + 32];
+                    // weight for this lane's head
+                    const float w = w_stage[tmem_row_base + lane];
 
-                    float my_sum = (v0 > 0.0f ? (v0 * w0) : 0.0f) +
-                                   (v1 > 0.0f ? (v1 * w1) : 0.0f);
+                    // ReLU + weighted
+                    float my_sum = (v > 0.0f) ? (v * w) : 0.0f;
 
+                    // Warp reduction: partial sum over 32 heads
                     for (int off = 16; off > 0; off >>= 1) {
                         my_sum += __shfl_down_sync(0xFFFFFFFF, my_sum, off);
                     }
 
-                    if (lane == 0) {
+                    // epi_warp 1 writes partial sum to smem for epi_warp 0 to read
+                    if (epi_warp == 1 && lane == 0) {
                         cand_scores[t] = my_sum;
+                    }
+                    asm volatile("bar.sync 1, 64;" ::: "memory");
+
+                    if (epi_warp == 0 && lane == 0) {
+                        float total = my_sum + cand_scores[t];
+                        cand_scores[t] = total;
                         cand_ids[t] = page_idx * kPageSize + t;
                     }
+                    asm volatile("bar.sync 1, 64;" ::: "memory");
                 }
-
-                asm volatile("bar.sync 1, 64;" ::: "memory");
 
                 if (epi_warp == 0 && lane == 0) {
                     int topk_count = topk_count_ptr[0];
@@ -535,6 +557,7 @@ __global__ void dsa_topk_indexer_kernel(
 // Host-side tensor-map encode helpers
 // ---------------------------------------------------------------------------------
 static void* g_k_fp8_tmap_dev = nullptr;
+static void* g_k_scale_tmap_dev = nullptr;
 
 static inline size_t align_up_size(size_t v, size_t a) {
     return (v + a - 1) & ~(a - 1);
@@ -626,14 +649,84 @@ static void ensure_k_fp8_tmap_on_device(const int8_t* k_index_cache_ptr, int num
         boxDim,
         elementStrides,
         CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B,
         CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
-    TORCH_CHECK(st == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed");
+    TORCH_CHECK(st == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for payload");
 
     cudaError_t cp_st = cudaMemcpy(g_k_fp8_tmap_dev, &k_fp8_tmap, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
-    TORCH_CHECK(cp_st == cudaSuccess, "cudaMemcpy(CUtensorMap) failed");
+    TORCH_CHECK(cp_st == cudaSuccess, "cudaMemcpy(payload CUtensorMap) failed");
+
+    // Scale tensor map: 1D over the flat scale region.
+    // Scales are at offset kPackedFp8Bytes within each page, contiguous kPageSize * 4 bytes.
+    // We treat the entire cache as a flat byte array and index by page_idx * kPageSize * 4.
+    if (g_k_scale_tmap_dev == nullptr) {
+        cudaError_t alloc_st2 = cudaMalloc(&g_k_scale_tmap_dev, sizeof(CUtensorMap));
+        TORCH_CHECK(alloc_st2 == cudaSuccess, "cudaMalloc(scale CUtensorMap) failed");
+    }
+
+    // Build a 1D tensor map over the scale bytes.
+    // Base pointer: k_index_cache_ptr + kPackedFp8Bytes (start of scales in page 0).
+    // globalDim: num_pages * kPageSize * 4 total scale bytes across all pages.
+    // BUT scales are NOT contiguous across pages — there's a gap of kPackedFp8Bytes between pages.
+    // So use a 2D map: dim0 = scale bytes per page (256), dim1 = num_pages.
+    CUtensorMap k_scale_tmap{};
+    {
+        constexpr cuuint32_t srank = 1;
+        const cuuint64_t sglobalDim[srank] = {
+            static_cast<cuuint64_t>(num_pages) * kPageSize * kScaleBytesPerToken,
+        };
+        const cuuint64_t sglobalStrides[1] = {};  // unused for rank 1
+        const cuuint32_t sboxDim[srank] = {
+            static_cast<cuuint32_t>(kPageSize * kScaleBytesPerToken),
+        };
+        const cuuint32_t selementStrides[srank] = {1U};
+
+        // Base pointer is the start of the scale region (offset kPackedFp8Bytes from page 0).
+        // Since scales are at a fixed offset per page and pages are kPageBytes apart,
+        // and kPageBytes = kPackedFp8Bytes + kPageSize*kScaleBytesPerToken = 8192 + 256 = 8448,
+        // the scales ARE contiguous across pages in the flat layout:
+        //   page0_fp8(8192) | page0_scale(256) | page1_fp8(8192) | page1_scale(256) | ...
+        // So they are NOT contiguous. We need a 2D map.
+        // Actually, let's use 2D: dim0 = 256 (scale bytes per page), dim1 = num_pages.
+        (void)sglobalDim; (void)sglobalStrides; (void)sboxDim; (void)selementStrides;
+    }
+    {
+        constexpr cuuint32_t srank = 2;
+        const uint8_t* scale_base = reinterpret_cast<const uint8_t*>(k_index_cache_ptr) + kPackedFp8Bytes;
+        const cuuint64_t sglobalDim[srank] = {
+            static_cast<cuuint64_t>(kPageSize * kScaleBytesPerToken),  // 256
+            static_cast<cuuint64_t>(num_pages),
+        };
+        const cuuint64_t sglobalStrides[srank - 1] = {
+            static_cast<cuuint64_t>(kPageBytes),  // stride between pages = 8448
+        };
+        const cuuint32_t sboxDim[srank] = {
+            static_cast<cuuint32_t>(kPageSize * kScaleBytesPerToken),  // 256
+            1U,
+        };
+        const cuuint32_t selementStrides[srank] = {1U, 1U};
+
+        const CUresult st2 = cuTensorMapEncodeTiled(
+            &k_scale_tmap,
+            CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            srank,
+            const_cast<uint8_t*>(scale_base),
+            sglobalDim,
+            sglobalStrides,
+            sboxDim,
+            selementStrides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        TORCH_CHECK(st2 == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for scales");
+    }
+
+    cudaError_t cp_st2 = cudaMemcpy(g_k_scale_tmap_dev, &k_scale_tmap, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+    TORCH_CHECK(cp_st2 == cudaSuccess, "cudaMemcpy(scale CUtensorMap) failed");
 }
 
 // ---------------------------------------------------------------------------------
@@ -692,6 +785,7 @@ void dsa_topk_indexer_launch(
         reinterpret_cast<const int*>(seq_lens.data_ptr()),
         reinterpret_cast<const int*>(block_table.data_ptr()),
         g_k_fp8_tmap_dev,
+        g_k_scale_tmap_dev,
         reinterpret_cast<int*>(topk_indices.data_ptr()),
         batch_size,
         num_pages,
