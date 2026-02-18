@@ -473,174 +473,169 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                               | ((uint32_t)(kNumHeads >> 4U) << 24U);
 
     const int num_tiles = (seq_len + kStageTokens - 1) / kStageTokens;
-    // Pipeline schedule:
-    // iter: producer(tile=iter), mma(tile=iter-1), epilogue(tile=iter-2).
-    for (int iter = 0; iter < num_tiles + 2; ++iter) {
-        // ---------------- Producer warp ----------------
-        if (warp_id == kProducerWarp && elect_sync()) {
-            const int tile_id = iter;
-            if (tile_id < num_tiles) {
-                const int stage = tile_id % kNumStages;
 
-                // Stage reuse requires prior epilogue completion on the same stage slot.
-                if (tile_id >= kNumStages && lane == 0) {
-                    mbarrier_wait_parity(
-                        epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
-                        epi_phase[stage]);
-                    epi_phase[stage] ^= 1;
+    // ---------------- Producer warp ----------------
+    if (warp_id == kProducerWarp && elect_sync()) {
+        for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
+            const int stage = tile_id % kNumStages;
+
+            // Stage reuse requires prior epilogue completion on the same stage slot.
+            if (tile_id >= kNumStages) {
+                mbarrier_wait_parity(
+                    epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
+                    epi_phase[stage]);
+                epi_phase[stage] ^= 1;
+            }
+
+            int page_idx, valid_tokens;
+            prepare_stage_metadata_and_scale_tail(
+                tile_id, stage, seq_len, max_num_pages, num_pages, block_table_b,
+                stage_page_idx, stage_valid_tokens, k_stage_scale, lane,
+                page_idx, valid_tokens);
+            
+
+
+            if (valid_tokens > 0) {
+                const int payload_dst = k_stage_payload_addr + stage * kStageTokens * kPayloadBytesPerToken;
+                const int scale_dst = k_stage_scale_addr + stage * kStageTokens * static_cast<int>(sizeof(float));
+                const int mbar_addr = tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t));
+                constexpr int payload_bytes = kStageTokens * kPayloadBytesPerToken;
+                constexpr int scale_bytes = kStageTokens * kScaleBytesPerToken;
+
+                mbarrier_arrive_expect_tx(mbar_addr, payload_bytes + scale_bytes);
+                tma_3d_gmem2smem(payload_dst, &k_fp8_tmap, 0, 0, page_idx, mbar_addr, 0ULL);
+                tma_2d_gmem2smem(scale_dst, &k_scale_tmap, 0, page_idx, mbar_addr, 0ULL);
+            } else {
+                mbarrier_arrive(tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
+            }
+
+        }
+    }
+
+    // ---------------- MMA warp ----------------
+    if (warp_id == kMmaWarp && elect_sync()) {
+        for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
+            const int stage = tile_id % kNumStages;
+
+ 
+            mbarrier_wait_parity(
+                tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
+                tma_phase[stage]);
+            tma_phase[stage] ^= 1;
+            
+        
+
+            const int valid_tokens = stage_valid_tokens[stage];
+            if (valid_tokens > 0) {
+                const int q_addr = q_stage_addr;
+                const int k_addr = k_stage_payload_addr + stage * kStageTokens * kPayloadBytesPerToken;
+
+                uint64_t a_desc = make_desc_kmajor_128b(q_addr);
+                uint64_t b_desc = make_desc_kmajor_128b(k_addr);
+
+                for (int ki = 0; ki < kMmaIters; ++ki) {
+                    tcgen05_mma_f8f6f4(0, a_desc, b_desc, kIdesc, (ki > 0));
+                    a_desc += (kMmaK >> 4);
+                    b_desc += (kMmaK >> 4);
                 }
 
-                int page_idx, valid_tokens;
-                prepare_stage_metadata_and_scale_tail(
-                    tile_id, stage, seq_len, max_num_pages, num_pages, block_table_b,
-                    stage_page_idx, stage_valid_tokens, k_stage_scale, lane,
-                    page_idx, valid_tokens);
-
-
-                    if (valid_tokens > 0) {
-                        const int payload_dst = k_stage_payload_addr + stage * kStageTokens * kPayloadBytesPerToken;
-                        const int scale_dst = k_stage_scale_addr + stage * kStageTokens * static_cast<int>(sizeof(float));
-                        const int mbar_addr = tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t));
-                        constexpr int payload_bytes = kStageTokens * kPayloadBytesPerToken;
-                        constexpr int scale_bytes = kStageTokens * kScaleBytesPerToken;
-
-                        mbarrier_arrive_expect_tx(mbar_addr, payload_bytes + scale_bytes);
-                        tma_3d_gmem2smem(payload_dst, &k_fp8_tmap, 0, 0, page_idx, mbar_addr, 0ULL);
-                        tma_2d_gmem2smem(scale_dst, &k_scale_tmap, 0, page_idx, mbar_addr, 0ULL);
-                    } else {
-                        mbarrier_arrive(tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
-                    }
-                }
+                tcgen05_commit(mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
+            } else if (lane == 0) {
+                mbarrier_arrive(mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
             }
         }
+    }
 
-        // ---------------- MMA warp ----------------
-        if (warp_id == kMmaWarp) {
-            const int tile_id = iter - 1;
-            if (tile_id >= 0 && tile_id < num_tiles) {
-                const int stage = tile_id % kNumStages;
+    // ---------------- Epilogue warps ----------------
+    if (warp_id >= kEpilogueWarpBase && warp_id < kEpilogueWarpBase + kNumEpilogueWarps) {
+        const int epi_warp = warp_id - kEpilogueWarpBase;
 
-                if (lane == 0) {
-                    mbarrier_wait_parity(
-                        tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
-                        tma_phase[stage]);
-                    tma_phase[stage] ^= 1;
-                }
-                __syncwarp();
+        for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
+            const int stage = tile_id % kNumStages;
 
-                const int valid_tokens = stage_valid_tokens[stage];
-                if (valid_tokens > 0 && lane == 0) {
-                    const int q_addr = q_stage_addr;
-                    const int k_addr = k_stage_payload_addr + stage * kStageTokens * kPayloadBytesPerToken;
-
-                    uint64_t a_desc = make_desc_kmajor_128b(q_addr);
-                    uint64_t b_desc = make_desc_kmajor_128b(k_addr);
-
-                    for (int ki = 0; ki < kMmaIters; ++ki) {
-                        tcgen05_mma_f8f6f4(0, a_desc, b_desc, kIdesc, (ki > 0));
-                        a_desc += (kMmaK >> 4);
-                        b_desc += (kMmaK >> 4);
-                    }
-
-                    tcgen05_commit(mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
-                } else if (lane == 0) {
-                    mbarrier_arrive(mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
-                }
+            if (epi_warp == 0 && elect_sync()) {
+                mbarrier_wait_parity(
+                    mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
+                    mma_phase[stage]);
+                mma_phase[stage] ^= 1;
             }
-        }
 
-        // ---------------- Epilogue warps ----------------
-        if (warp_id >= kEpilogueWarpBase && warp_id < kEpilogueWarpBase + kNumEpilogueWarps) {
-            const int epi_warp = warp_id - kEpilogueWarpBase;
-            const int tile_id = iter - 2;
+            // Epilogue warps synchronize before/after TMEM reads and candidate writes.
+            asm volatile("bar.sync 1, 64;" ::: "memory");
 
-            if (tile_id >= 0 && tile_id < num_tiles) {
-                const int stage = tile_id % kNumStages;
+            tcgen05_fence_after_thread_sync();
 
-                if (epi_warp == 0 && lane == 0) {
-                    mbarrier_wait_parity(
-                        mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
-                        mma_phase[stage]);
-                    mma_phase[stage] ^= 1;
+            const int valid_tokens = stage_valid_tokens[stage];
+            const int page_idx = stage_page_idx[stage];
+            const float* stage_scale = k_stage_scale + stage * kStageTokens;
+            float* cand_scores = stage_tile_scores + stage * kStageTokens;
+            int* cand_ids = stage_tile_ids + stage * kStageTokens;
+
+            // epi_warp 0 reads TMEM rows 0-31 (heads 0..31)
+            // epi_warp 1 reads TMEM rows 32-63 (heads 32..63)
+            const int tmem_row_base = epi_warp * 32;
+
+            for (int t = 0; t < valid_tokens; ++t) {
+                // Each warp loads its 32 heads for token t
+                float d = tcgen05_ld_32x32b_1(tmem_row_base, t);
+                tcgen05_wait_ld();
+
+                const float scale = stage_scale[t];
+                const float v = d * scale;
+
+                // weight for this lane's head
+                const float w = w_stage[tmem_row_base + lane];
+
+                // ReLU + weighted
+                float my_sum = (v > 0.0f) ? (v * w) : 0.0f;
+
+                // Warp reduction: partial sum over 32 heads
+                for (int off = 16; off > 0; off >>= 1) {
+                    my_sum += __shfl_down_sync(0xFFFFFFFF, my_sum, off);
                 }
 
-                // Epilogue warps synchronize before/after TMEM reads and candidate writes.
+                // epi_warp 1 writes partial sum to smem for epi_warp 0 to read
+                if (epi_warp == 1 && lane == 0) {
+                    cand_scores[t] = my_sum;
+                }
                 asm volatile("bar.sync 1, 64;" ::: "memory");
 
-                tcgen05_fence_after_thread_sync();
-
-                const int valid_tokens = stage_valid_tokens[stage];
-                const int page_idx = stage_page_idx[stage];
-                const float* stage_scale = k_stage_scale + stage * kStageTokens;
-                float* cand_scores = stage_tile_scores + stage * kStageTokens;
-                int* cand_ids = stage_tile_ids + stage * kStageTokens;
-
-                // epi_warp 0 reads TMEM rows 0-31 (heads 0..31)
-                // epi_warp 1 reads TMEM rows 32-63 (heads 32..63)
-                const int tmem_row_base = epi_warp * 32;
-
-                for (int t = 0; t < valid_tokens; ++t) {
-                    // Each warp loads its 32 heads for token t
-                    float d = tcgen05_ld_32x32b_1(tmem_row_base, t);
-                    tcgen05_wait_ld();
-
-                    const float scale = stage_scale[t];
-                    const float v = d * scale;
-
-                    // weight for this lane's head
-                    const float w = w_stage[tmem_row_base + lane];
-
-                    // ReLU + weighted
-                    float my_sum = (v > 0.0f) ? (v * w) : 0.0f;
-
-                    // Warp reduction: partial sum over 32 heads
-                    for (int off = 16; off > 0; off >>= 1) {
-                        my_sum += __shfl_down_sync(0xFFFFFFFF, my_sum, off);
-                    }
-
-                    // epi_warp 1 writes partial sum to smem for epi_warp 0 to read
-                    if (epi_warp == 1 && lane == 0) {
-                        cand_scores[t] = my_sum;
-                    }
-                    asm volatile("bar.sync 1, 64;" ::: "memory");
-
-                    if (epi_warp == 0 && lane == 0) {
-                        float total = my_sum + cand_scores[t];
-                        cand_scores[t] = total;
-                        cand_ids[t] = page_idx * kPageSize + t;
-                    }
-
-                    asm volatile("bar.sync 1, 64;" ::: "memory");
-                }
-
-                // Top-k insertion: all lanes of epi_warp 0 participate for warp-parallel min-scan
-                // if (epi_warp == 0) {
-                //     int topk_count = topk_count_ptr[0];
-                //     float topk_min_val = topk_min_val_ptr[0];
-                //     int topk_min_pos = topk_min_pos_ptr[0];
-                //
-                //     for (int t = 0; t < valid_tokens; ++t) {
-                //         float sc = cand_scores[t];
-                //         int id = cand_ids[t];
-                //         // Broadcast score/id from smem (lane 0 wrote them)
-                //         topk_insert_unsorted(
-                //             sc, id,
-                //             topk_scores, topk_ids,
-                //             topk_count, actual_topk, lane,
-                //             topk_min_val, topk_min_pos
-                //         );
-                //     }
-                //
-                //     if (lane == 0) {
-                //         topk_count_ptr[0] = topk_count;
-                //         topk_min_val_ptr[0] = topk_min_val;
-                //         topk_min_pos_ptr[0] = topk_min_pos;
-                //         mbarrier_arrive(epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
-                //     }
-                // }
                 if (epi_warp == 0 && lane == 0) {
-                    mbarrier_arrive(epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
+                    float total = my_sum + cand_scores[t];
+                    cand_scores[t] = total;
+                    cand_ids[t] = page_idx * kPageSize + t;
                 }
+
+                asm volatile("bar.sync 1, 64;" ::: "memory");
+            }
+
+            // Top-k insertion: all lanes of epi_warp 0 participate for warp-parallel min-scan
+            // if (epi_warp == 0) {
+            //     int topk_count = topk_count_ptr[0];
+            //     float topk_min_val = topk_min_val_ptr[0];
+            //     int topk_min_pos = topk_min_pos_ptr[0];
+            //
+            //     for (int t = 0; t < valid_tokens; ++t) {
+            //         float sc = cand_scores[t];
+            //         int id = cand_ids[t];
+            //         // Broadcast score/id from smem (lane 0 wrote them)
+            //         topk_insert_unsorted(
+            //             sc, id,
+            //             topk_scores, topk_ids,
+            //             topk_count, actual_topk, lane,
+            //             topk_min_val, topk_min_pos
+            //         );
+            //     }
+            //
+            //     if (lane == 0) {
+            //         topk_count_ptr[0] = topk_count;
+            //         topk_min_val_ptr[0] = topk_min_val;
+            //         topk_min_pos_ptr[0] = topk_min_pos;
+            //         mbarrier_arrive(epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
+            //     }
+            // }
+            if (epi_warp == 0 && lane == 0) {
+                mbarrier_arrive(epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
             }
         }
     }
