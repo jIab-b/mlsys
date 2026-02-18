@@ -1,7 +1,0 @@
-command=python eval_suite/modal/cli.py -m benchmark test_dir/debug.py --dsa_index_2048 -o test_dir/debug.txt
-start_utc=2026-02-18T08:11:46.560269073Z
-end_utc=2026-02-18T08:13:28.979964254Z
-duration_ns=102419338862
-duration_s=102.419338862
-exit_code=0
-log_path=/tmp/time_python_cli_benchmark.log

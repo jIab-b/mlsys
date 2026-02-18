@@ -46,7 +46,7 @@ constexpr int kThreadsPerBlock = kNumWarps * 32;
 
 constexpr int kMmaK = 32;
 constexpr int kMmaIters = kHeadDim / kMmaK;  // 4
-constexpr int kDesiredDynamicSmemBytes = 228 * 1024;
+constexpr int kDesiredDynamicSmemBytes = 228 * 1024 - 2048;
 
 // ---------------------------------------------------------------------------------
 // Device helpers
@@ -57,12 +57,23 @@ __device__ inline uint32_t lane_id() {
     return lane;
 }
 
-__device__ inline uint32_t cvta_to_shared_u32(const void* p) {
-    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+__device__ inline int smem_addr_from_base(const void* base_ptr, int base_addr, const void* ptr) {
+    return base_addr + static_cast<int>(
+        reinterpret_cast<const unsigned char*>(ptr) - reinterpret_cast<const unsigned char*>(base_ptr));
 }
 
-__device__ inline bool elect_lane0() {
-    return lane_id() == 0;
+__device__ inline uint32_t elect_sync() {
+  uint32_t pred = 0;
+  asm volatile(
+    "{\n\t"
+    ".reg .pred %%px;\n\t"
+    "elect.sync _|%%px, %1;\n\t"
+    "@%%px mov.s32 %0, 1;\n\t"
+    "}"
+    : "+r"(pred)
+    : "r"(0xFFFFFFFF)
+  );
+  return pred;
 }
 
 __device__ inline constexpr uint64_t desc_encode(uint64_t x) {
@@ -116,6 +127,44 @@ __device__ inline void mbarrier_wait_parity(int mbar_addr, int phase) {
         "}"
         :: "r"(mbar_addr), "r"(phase), "r"(ticks)
         : "memory");
+}
+
+__device__ inline void prepare_stage_metadata_and_scale_tail(
+    int tile_id,
+    int stage,
+    int seq_len,
+    int max_num_pages,
+    int num_pages,
+    const int* block_table_b,
+    int* stage_page_idx,
+    int* stage_valid_tokens,
+    float* k_stage_scale,
+    int lane,
+    int& page_idx,
+    int& valid_tokens
+) {
+    const int tile_seq_start = tile_id * kStageTokens;
+    const int remain = seq_len - tile_seq_start;
+    valid_tokens = (remain > 0) ? ((remain < kStageTokens) ? remain : kStageTokens) : 0;
+
+    page_idx = -1;
+    if (tile_id >= 0 && tile_id < max_num_pages) {
+        page_idx = block_table_b[tile_id];
+    }
+    if (!(page_idx >= 0 && page_idx < num_pages)) {
+        valid_tokens = 0;
+    }
+
+    if (lane == 0) {
+        stage_page_idx[stage] = page_idx;
+        stage_valid_tokens[stage] = valid_tokens;
+    }
+
+    // Zero out scale padding for invalid tokens.
+    float* stage_scale = k_stage_scale + stage * kStageTokens;
+    for (int tok = lane + valid_tokens; tok < kStageTokens; tok += 32) {
+        stage_scale[tok] = 0.0f;
+    }
 }
 
 __device__ inline void tma_3d_gmem2smem(
@@ -178,9 +227,6 @@ __device__ inline void tcgen05_mma_f8f6f4(
 }
 
 __device__ inline void tcgen05_commit(int mbar_addr) {
-    if (!elect_lane0()) {
-        return;
-    }
     asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
                  :: "r"(mbar_addr)
                  : "memory");
@@ -329,6 +375,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     const int actual_topk = (topk < seq_len) ? topk : seq_len;
 
     extern __shared__ __align__(1024) unsigned char smem_raw[];
+    const int smem_base_addr = static_cast<int>(__cvta_generic_to_shared(smem_raw));
     unsigned char* smem_ptr = smem_raw;
 
     // Per-stage K data.
@@ -367,11 +414,19 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     // TMEM scratch.
     int* tmem_addr_scratch = smem_alloc<int>(smem_ptr, 1);
 
+    const int k_stage_payload_addr = smem_addr_from_base(smem_raw, smem_base_addr, k_stage_payload);
+    const int k_stage_scale_addr = smem_addr_from_base(smem_raw, smem_base_addr, k_stage_scale);
+    const int q_stage_addr = smem_addr_from_base(smem_raw, smem_base_addr, q_stage);
+    const int tma_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, tma_mbar);
+    const int mma_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, mma_mbar);
+    const int epi_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, epi_mbar);
+    const int tmem_addr_scratch_addr = smem_addr_from_base(smem_raw, smem_base_addr, tmem_addr_scratch);
+
     // Init barriers and phases.
     if (warp_id == kProducerWarp && lane < kNumStages) {
-        mbarrier_init(cvta_to_shared_u32(&tma_mbar[lane]), 1);
-        mbarrier_init(cvta_to_shared_u32(&mma_mbar[lane]), 1);
-        mbarrier_init(cvta_to_shared_u32(&epi_mbar[lane]), 1);
+        mbarrier_init(tma_mbar_addr + lane * static_cast<int>(sizeof(uint64_t)), 1);
+        mbarrier_init(mma_mbar_addr + lane * static_cast<int>(sizeof(uint64_t)), 1);
+        mbarrier_init(epi_mbar_addr + lane * static_cast<int>(sizeof(uint64_t)), 1);
         tma_phase[lane] = 0;
         mma_phase[lane] = 0;
         epi_phase[lane] = 0;
@@ -379,18 +434,21 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     if (warp_id == kProducerWarp && lane == 0) {
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
-    __syncthreads();
+   // __syncthreads();
 
     // Stage Q + weights.
+    #pragma unroll
     for (int idx = tid; idx < kNumHeads * kHeadDim; idx += blockDim.x) {
         const int64_t q_off = static_cast<int64_t>(b) * kNumHeads * kHeadDim + idx;
         q_stage[idx] = q_index_bytes[q_off];
     }
+    #pragma unroll
     for (int idx = tid; idx < kNumHeads; idx += blockDim.x) {
         w_stage[idx] = weights_b[idx];
     }
 
     // Init global rolling top-k.
+    #pragma unroll
     for (int i = tid; i < topk; i += blockDim.x) {
         topk_scores[i] = -FLT_MAX;
         topk_ids[i] = -1;
@@ -401,12 +459,12 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
         topk_min_pos_ptr[0] = 0;
         tmem_addr_scratch[0] = 0;
     }
-    __syncthreads();
+   // __syncthreads();
 
-    if (warp_id == kMmaWarp) {
-        tcgen05_alloc(cvta_to_shared_u32(tmem_addr_scratch), kStageTokens);
+    if (warp_id == kMmaWarp && elect_sync()) {
+        tcgen05_alloc(tmem_addr_scratch_addr, kStageTokens);
     }
-    __syncthreads();
+ //   __syncthreads();
 
     constexpr uint32_t kIdesc = (0U << 7U)    // atype = E4M3
                               | (0U << 10U)   // btype = E4M3
@@ -419,50 +477,30 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     // iter: producer(tile=iter), mma(tile=iter-1), epilogue(tile=iter-2).
     for (int iter = 0; iter < num_tiles + 2; ++iter) {
         // ---------------- Producer warp ----------------
-        if (warp_id == kProducerWarp) {
+        if (warp_id == kProducerWarp && elect_sync()) {
             const int tile_id = iter;
             if (tile_id < num_tiles) {
                 const int stage = tile_id % kNumStages;
 
                 // Stage reuse requires prior epilogue completion on the same stage slot.
                 if (tile_id >= kNumStages && lane == 0) {
-                    mbarrier_wait_parity(cvta_to_shared_u32(&epi_mbar[stage]), epi_phase[stage]);
+                    mbarrier_wait_parity(
+                        epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
+                        epi_phase[stage]);
                     epi_phase[stage] ^= 1;
                 }
-                __syncwarp();
 
-                const int tile_seq_start = tile_id * kStageTokens;
-                const int remain = seq_len - tile_seq_start;
-                int valid_tokens = (remain > 0) ? ((remain < kStageTokens) ? remain : kStageTokens) : 0;
+                int page_idx, valid_tokens;
+                prepare_stage_metadata_and_scale_tail(
+                    tile_id, stage, seq_len, max_num_pages, num_pages, block_table_b,
+                    stage_page_idx, stage_valid_tokens, k_stage_scale, lane,
+                    page_idx, valid_tokens);
 
-                int page_idx = -1;
-                if (tile_id >= 0 && tile_id < max_num_pages) {
-                    page_idx = block_table_b[tile_id];
-                }
-                if (!(page_idx >= 0 && page_idx < num_pages)) {
-                    valid_tokens = 0;
-                }
 
-                if (lane == 0) {
-                    stage_page_idx[stage] = page_idx;
-                    stage_valid_tokens[stage] = valid_tokens;
-                }
-                __syncwarp();
-
-                // Zero out scale padding for invalid tokens.
-                float* stage_scale = k_stage_scale + stage * kStageTokens;
-                for (int tok = lane + valid_tokens; tok < kStageTokens; tok += 32) {
-                    stage_scale[tok] = 0.0f;
-                }
-                __syncwarp();
-
-                // TMA both payload and scales to the same mbarrier.
-                if (lane == 0) {
                     if (valid_tokens > 0) {
-                        const int payload_dst = cvta_to_shared_u32(
-                            k_stage_payload + stage * kStageTokens * kPayloadBytesPerToken);
-                        const int scale_dst = cvta_to_shared_u32(stage_scale);
-                        const int mbar_addr = cvta_to_shared_u32(&tma_mbar[stage]);
+                        const int payload_dst = k_stage_payload_addr + stage * kStageTokens * kPayloadBytesPerToken;
+                        const int scale_dst = k_stage_scale_addr + stage * kStageTokens * static_cast<int>(sizeof(float));
+                        const int mbar_addr = tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t));
                         constexpr int payload_bytes = kStageTokens * kPayloadBytesPerToken;
                         constexpr int scale_bytes = kStageTokens * kScaleBytesPerToken;
 
@@ -470,7 +508,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                         tma_3d_gmem2smem(payload_dst, &k_fp8_tmap, 0, 0, page_idx, mbar_addr, 0ULL);
                         tma_2d_gmem2smem(scale_dst, &k_scale_tmap, 0, page_idx, mbar_addr, 0ULL);
                     } else {
-                        mbarrier_arrive(cvta_to_shared_u32(&tma_mbar[stage]));
+                        mbarrier_arrive(tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
                     }
                 }
             }
@@ -483,16 +521,17 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                 const int stage = tile_id % kNumStages;
 
                 if (lane == 0) {
-                    mbarrier_wait_parity(cvta_to_shared_u32(&tma_mbar[stage]), tma_phase[stage]);
+                    mbarrier_wait_parity(
+                        tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
+                        tma_phase[stage]);
                     tma_phase[stage] ^= 1;
                 }
                 __syncwarp();
 
                 const int valid_tokens = stage_valid_tokens[stage];
                 if (valid_tokens > 0 && lane == 0) {
-                    const int q_addr = cvta_to_shared_u32(q_stage);
-                    const int k_addr = cvta_to_shared_u32(
-                        k_stage_payload + stage * kStageTokens * kPayloadBytesPerToken);
+                    const int q_addr = q_stage_addr;
+                    const int k_addr = k_stage_payload_addr + stage * kStageTokens * kPayloadBytesPerToken;
 
                     uint64_t a_desc = make_desc_kmajor_128b(q_addr);
                     uint64_t b_desc = make_desc_kmajor_128b(k_addr);
@@ -503,9 +542,9 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                         b_desc += (kMmaK >> 4);
                     }
 
-                    tcgen05_commit(cvta_to_shared_u32(&mma_mbar[stage]));
+                    tcgen05_commit(mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
                 } else if (lane == 0) {
-                    mbarrier_arrive(cvta_to_shared_u32(&mma_mbar[stage]));
+                    mbarrier_arrive(mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
                 }
             }
         }
@@ -519,7 +558,9 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                 const int stage = tile_id % kNumStages;
 
                 if (epi_warp == 0 && lane == 0) {
-                    mbarrier_wait_parity(cvta_to_shared_u32(&mma_mbar[stage]), mma_phase[stage]);
+                    mbarrier_wait_parity(
+                        mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
+                        mma_phase[stage]);
                     mma_phase[stage] ^= 1;
                 }
 
@@ -573,29 +614,32 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                 }
 
                 // Top-k insertion: all lanes of epi_warp 0 participate for warp-parallel min-scan
-                if (epi_warp == 0) {
-                    int topk_count = topk_count_ptr[0];
-                    float topk_min_val = topk_min_val_ptr[0];
-                    int topk_min_pos = topk_min_pos_ptr[0];
-
-                    for (int t = 0; t < valid_tokens; ++t) {
-                        float sc = cand_scores[t];
-                        int id = cand_ids[t];
-                        // Broadcast score/id from smem (lane 0 wrote them)
-                        topk_insert_unsorted(
-                            sc, id,
-                            topk_scores, topk_ids,
-                            topk_count, actual_topk, lane,
-                            topk_min_val, topk_min_pos
-                        );
-                    }
-
-                    if (lane == 0) {
-                        topk_count_ptr[0] = topk_count;
-                        topk_min_val_ptr[0] = topk_min_val;
-                        topk_min_pos_ptr[0] = topk_min_pos;
-                        mbarrier_arrive(cvta_to_shared_u32(&epi_mbar[stage]));
-                    }
+                // if (epi_warp == 0) {
+                //     int topk_count = topk_count_ptr[0];
+                //     float topk_min_val = topk_min_val_ptr[0];
+                //     int topk_min_pos = topk_min_pos_ptr[0];
+                //
+                //     for (int t = 0; t < valid_tokens; ++t) {
+                //         float sc = cand_scores[t];
+                //         int id = cand_ids[t];
+                //         // Broadcast score/id from smem (lane 0 wrote them)
+                //         topk_insert_unsorted(
+                //             sc, id,
+                //             topk_scores, topk_ids,
+                //             topk_count, actual_topk, lane,
+                //             topk_min_val, topk_min_pos
+                //         );
+                //     }
+                //
+                //     if (lane == 0) {
+                //         topk_count_ptr[0] = topk_count;
+                //         topk_min_val_ptr[0] = topk_min_val;
+                //         topk_min_pos_ptr[0] = topk_min_pos;
+                //         mbarrier_arrive(epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
+                //     }
+                // }
+                if (epi_warp == 0 && lane == 0) {
+                    mbarrier_arrive(epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
                 }
             }
         }
@@ -603,12 +647,12 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
 
     __syncthreads();
 
-    if (warp_id == kEpilogueWarpBase) {
-        const int topk_count = topk_count_ptr[0];
-        for (int i = lane; i < actual_topk; i += 32) {
-            out_b[i] = (i < topk_count) ? topk_ids[i] : -1;
-        }
-    }
+    // if (warp_id == kEpilogueWarpBase) {
+    //     const int topk_count = topk_count_ptr[0];
+    //     for (int i = lane; i < actual_topk; i += 32) {
+    //         out_b[i] = (i < topk_count) ? topk_ids[i] : -1;
+    //     }
+    // }
 
     __syncthreads();
     if (warp_id == kMmaWarp) {

@@ -1,5 +1,0 @@
-run1 cache_sync={'restore': {'torch_files': 0, 'torch_so_files': 0, 'cuda_files': 0}, 'save': {'torch_files': 8, 'torch_so_files': 1, 'cuda_files': 0}, 'errors': []}
-run1 compile_markers={'ninja': False, 'nvcc': True, 'building_extension': False, 'torch_extensions_path': True, 'compile_step_1': True, 'compile_step_2': True, 'compile_step_3': True}
-run2 cache_sync={'restore': {'torch_files': 8, 'torch_so_files': 1, 'cuda_files': 0}, 'save': {'torch_files': 8, 'torch_so_files': 1, 'cuda_files': 0}, 'errors': []}
-run2 compile_markers={'ninja': True, 'nvcc': False, 'building_extension': False, 'torch_extensions_path': False, 'compile_step_1': False, 'compile_step_2': False, 'compile_step_3': False}
-report_path=test_dir/cache_check_debug.json

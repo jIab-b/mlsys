@@ -1,8 +1,0 @@
-command=app_reuse.run_eval(debug.py, dsa_index_2048, mode=test)
-start_utc=2026-02-18T08:42:58.836117085Z
-end_utc=2026-02-18T08:43:21.583724893Z
-duration_ns=22747607808
-duration_s=22.747607808
-ok=True
-error=
-cache_sync={'restore': {'torch_files': 8, 'torch_so_files': 1, 'cuda_files': 0}, 'save': {'torch_files': 8, 'torch_so_files': 1, 'cuda_files': 0}, 'errors': []}

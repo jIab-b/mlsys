@@ -1,8 +1,0 @@
-[solution]
-name = "dsa-topk-ref-v1"         # Solution name
-definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
-author = "team-name"              # Team/author name
-
-[build]
-language = "triton"               # triton | cuda (override with --language cuda --file dsa_index)
-entry_point = "kernel"            # Kernel function name

@@ -1,7 +1,0 @@
-command=modal run eval_suite/modal/app.py::run_eval --submission-code <debug.py> --tests-content <dsa_index_2048/tests.txt> --mode test --task dsa_index_2048 --definition-name dsa_index_2048 --solution-name debug --op-type dsa_index_2048
-start_utc=2026-02-18T08:10:32.468470088Z
-end_utc=2026-02-18T08:11:27.546203705Z
-duration_ns=55077527696
-duration_s=55.077527696
-exit_code=1
-log_path=/tmp/time_modal_run_cli.log
