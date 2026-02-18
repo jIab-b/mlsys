@@ -14,6 +14,7 @@ Setup (one-time):
 """
 
 import argparse
+import os
 import sys
 import tempfile
 import traceback
@@ -32,14 +33,15 @@ except ImportError:
 
 app = modal.App("flashinfer-bench")
 OUT_REPORT_PATH = PROJECT_ROOT / "solution" / "out.txt"
+BASE_IMAGE = "pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel"
+TVM_FFI_CUDA_ARCH_LIST = "10.0a"
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
-CUDA_HOME_PATH = "/usr/local/cuda"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry(BASE_IMAGE)
+    .pip_install("flashinfer-bench", "numpy")
 )
 
 DEFINITION_ALIASES = {
@@ -51,7 +53,13 @@ DEFINITION_ALIASES = {
 }
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(
+    image=image,
+    gpu="B200:1",
+    timeout=90,
+    volumes={TRACE_SET_PATH: trace_volume},
+    env={"TVM_FFI_CUDA_ARCH_LIST": TVM_FFI_CUDA_ARCH_LIST},
+)
 def run_benchmark(
     source_files: dict[str, bytes],
     solution_meta: dict,
@@ -59,6 +67,7 @@ def run_benchmark(
     max_workloads: int = 1,
 ) -> dict:
     """Pack solution and run benchmark on Modal B200, returning results + packed solution."""
+    os.environ.setdefault("TVM_FFI_CUDA_ARCH_LIST", TVM_FFI_CUDA_ARCH_LIST)
     from flashinfer_bench import Benchmark, BenchmarkConfig, BuildSpec, TraceSet
     from flashinfer_bench.agents import pack_solution_from_files
 
@@ -118,6 +127,22 @@ def run_benchmark(
     results = {definition.name: {}}
     stats = {"total": len(traces), "evaluated": 0, "non_evaluated": 0}
 
+    def _extract_error_parts(raw_trace: dict, eval_obj: dict | None) -> dict:
+        parts: dict[str, str] = {}
+
+        for key in ("message", "error"):
+            value = raw_trace.get(key)
+            if value:
+                parts[key] = str(value)
+
+        if isinstance(eval_obj, dict):
+            for key in ("message", "error", "log"):
+                value = eval_obj.get(key)
+                if value:
+                    parts[f"evaluation_{key}"] = str(value)
+
+        return parts
+
     for i, trace in enumerate(traces):
         raw = trace.model_dump(mode="json")
         workload_obj = raw.get("workload")
@@ -148,24 +173,20 @@ def run_benchmark(
                 if isinstance(correctness, dict):
                     entry["max_abs_error"] = correctness.get("max_absolute_error")
                     entry["max_rel_error"] = correctness.get("max_relative_error")
+
+                entry.update(_extract_error_parts(raw, evaluation))
             else:
                 # Some bench versions serialize evaluation directly as a status string.
                 entry["status"] = str(evaluation)
-                entry["detail"] = (
-                    raw.get("message")
-                    or raw.get("error")
-                    or "Non-dict evaluation payload returned by benchmark."
-                )
+                entry.update(_extract_error_parts(raw, None))
+                if not any(entry.get(k) for k in ("message", "error")):
+                    entry["detail"] = "Non-dict evaluation payload returned by benchmark."
 
             stats["evaluated"] += 1
         else:
             entry["status"] = "NO_EVAL"
-            entry["detail"] = (
-                raw.get("status")
-                or raw.get("message")
-                or raw.get("error")
-                or "Trace has no evaluation object (likely build/runtime failure)."
-            )
+            entry.update(_extract_error_parts(raw, None))
+            entry["detail"] = raw.get("status") or "Trace has no evaluation object (likely build/runtime failure)."
             stats["non_evaluated"] += 1
 
         results[definition.name][workload_uuid] = entry
@@ -208,10 +229,14 @@ def print_results(results: dict, out_lines: list[str] | None = None):
                 rel_err = result.get("max_rel_error", 0)
                 line += f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}"
 
-            if result.get("detail"):
-                line += f" | detail={result['detail']}"
-
             emit(line)
+            for detail_key in ("detail", "message", "error", "evaluation_message", "evaluation_error"):
+                if result.get(detail_key):
+                    emit(f"    {detail_key}: {result[detail_key]}")
+            if result.get("evaluation_log"):
+                emit("    evaluation_log:")
+                for log_line in str(result["evaluation_log"]).splitlines():
+                    emit(f"      {log_line}")
 
 
 def _load_config_best_effort() -> dict:
@@ -366,7 +391,8 @@ def _apply_file_override(
             f"--file override expected '{cu_rel}' under {source_dir}, but it was not found"
         )
 
-    remapped = dict(files)
+    # Keep helper Python files, but ensure only one CUDA TU is submitted.
+    remapped = {path: content for path, content in files.items() if not path.endswith(".cu")}
     remapped["binding.py"] = files[py_rel]
     remapped["kernel.cu"] = files[cu_rel]
     return remapped
@@ -406,16 +432,7 @@ def _run(
         fp8_moe=fp8_moe,
     )
 
-    use_overrides = any(
-        [
-            selected_definition,
-            name,
-            author,
-            language,
-            entry_point,
-            file_base,
-        ]
-    )
+    use_overrides = any((selected_definition, name, author, language, entry_point, file_base))
 
     try:
         if use_overrides:
@@ -483,6 +500,23 @@ def _run(
         write_report()
 
 
+def _run_from_mapping(args: dict):
+    _run(
+        definition=args.get("definition", ""),
+        dsa_index=args.get("dsa_index", False),
+        dsa_attn=args.get("dsa_attn", False),
+        gdn_decode=args.get("gdn_decode", False),
+        gdn_prefill=args.get("gdn_prefill", False),
+        fp8_moe=args.get("fp8_moe", False),
+        name=args.get("name", ""),
+        author=args.get("author", ""),
+        language=args.get("language", ""),
+        entry_point=args.get("entry_point", ""),
+        file_base=args.get("file", ""),
+        max_workloads=args.get("max_workloads", 1),
+    )
+
+
 @app.local_entrypoint()
 def main(
     definition: str = "",
@@ -499,20 +533,7 @@ def main(
     max_workloads: int = 1,
 ):
     """Pack solution and run benchmark on Modal."""
-    _run(
-        definition=definition,
-        dsa_index=dsa_index,
-        dsa_attn=dsa_attn,
-        gdn_decode=gdn_decode,
-        gdn_prefill=gdn_prefill,
-        fp8_moe=fp8_moe,
-        name=name,
-        author=author,
-        language=language,
-        entry_point=entry_point,
-        file_base=file,
-        max_workloads=max_workloads,
-    )
+    _run_from_mapping(locals())
 
 
 if __name__ == "__main__":
@@ -542,17 +563,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     with app.run():
-        _run(
-            definition=args.definition,
-            dsa_index=args.dsa_index,
-            dsa_attn=args.dsa_attn,
-            gdn_decode=args.gdn_decode,
-            gdn_prefill=args.gdn_prefill,
-            fp8_moe=args.fp8_moe,
-            name=args.name,
-            author=args.author,
-            language=args.language,
-            entry_point=args.entry_point,
-            file_base=args.file,
-            max_workloads=args.max_workloads,
-        )
+        _run_from_mapping(vars(args))

@@ -59,7 +59,7 @@ def _run_reference(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_tabl
 
     for b in range(batch_size):
         seq_len = int(seq_lens[b].item())
-        if seq_len <= 0:
+        if seq_len == 0:
             continue
 
         num_pages_for_seq = (seq_len + page_size - 1) // page_size
@@ -100,7 +100,7 @@ def generate_input(batch=1, num_pages=16, seq_len=2048, seed=42, __real_workload
     if seq_len > total_tokens:
         raise ValueError(f"seq_len ({seq_len}) exceeds total tokens ({total_tokens}).")
 
-    q_index_fp8 = torch.randn((batch, NUM_INDEX_HEADS, INDEX_HEAD_DIM), device=device, dtype=torch.float16)
+    q_index_fp8 = torch.randn((batch, NUM_INDEX_HEADS, INDEX_HEAD_DIM), device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
     k_index_cache_fp8 = _make_k_index_cache_fp8(num_pages, device)
     weights = torch.rand((batch, NUM_INDEX_HEADS), device=device, dtype=torch.float32)
     seq_lens = torch.full((batch,), seq_len, device=device, dtype=torch.int32)

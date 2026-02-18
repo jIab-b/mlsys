@@ -6,6 +6,7 @@ Reads configuration from config.toml and packs the appropriate source files
 """
 
 import sys
+import tempfile
 from pathlib import Path
 
 # Add project root to path for imports
@@ -31,7 +32,10 @@ def load_config() -> dict:
         return tomllib.load(f)
 
 
-def pack_solution(output_path: Path = None) -> Path:
+def pack_solution(
+    output_path: Path | None = None,
+    file_base: str = "",
+) -> Path:
     """Pack solution files into a Solution JSON."""
     config = load_config()
 
@@ -41,7 +45,6 @@ def pack_solution(output_path: Path = None) -> Path:
     language = build_config["language"]
     entry_point = build_config["entry_point"]
 
-    # Determine source directory based on language
     if language == "triton":
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
@@ -52,21 +55,55 @@ def pack_solution(output_path: Path = None) -> Path:
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
-    # Create build spec
-    spec = BuildSpec(
-        language=language,
-        target_hardware=["cuda"],
-        entry_point=entry_point,
-    )
+    spec = BuildSpec(language=language, target_hardware=["cuda"], entry_point=entry_point)
 
-    # Pack the solution
-    solution = pack_solution_from_files(
-        path=str(source_dir),
-        spec=spec,
-        name=solution_config["name"],
-        definition=solution_config["definition"],
-        author=solution_config["author"],
-    )
+    pack_path = source_dir
+    tmp_ctx = tempfile.TemporaryDirectory() if (file_base and language == "cuda") else None
+    try:
+        if file_base:
+            if language != "cuda":
+                raise ValueError("--file override is only supported for CUDA solutions")
+
+            base = Path(file_base)
+            if base.suffix in (".py", ".cu"):
+                base = base.with_suffix("")
+
+            py_src = source_dir / base.with_suffix(".py")
+            cu_src = source_dir / base.with_suffix(".cu")
+            if not py_src.is_file():
+                raise FileNotFoundError(f"Missing override file: {py_src}")
+            if not cu_src.is_file():
+                raise FileNotFoundError(f"Missing override file: {cu_src}")
+
+            tmpdir = Path(tmp_ctx.name)
+            staged = tmpdir / "solution"
+            staged.mkdir(parents=True, exist_ok=True)
+
+            # Copy non-CUDA helper files and remap selected binding/kernel names.
+            for path in source_dir.rglob("*"):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(source_dir)
+                if "__pycache__" in rel.parts or path.suffix == ".cu":
+                    continue
+                dst = staged / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(path.read_bytes())
+
+            (staged / "binding.py").write_bytes(py_src.read_bytes())
+            (staged / "kernel.cu").write_bytes(cu_src.read_bytes())
+            pack_path = staged
+
+        solution = pack_solution_from_files(
+            path=str(pack_path),
+            spec=spec,
+            name=solution_config["name"],
+            definition=solution_config["definition"],
+            author=solution_config["author"],
+        )
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
 
     # Write to output file
     if output_path is None:
@@ -93,10 +130,19 @@ def main():
         default=None,
         help="Output path for solution.json (default: ./solution.json)"
     )
+    parser.add_argument(
+        "--file",
+        type=str,
+        default="",
+        help="CUDA override base name (maps <base>.py->binding.py and <base>.cu->kernel.cu)",
+    )
     args = parser.parse_args()
 
     try:
-        pack_solution(args.output)
+        pack_solution(
+            output_path=args.output,
+            file_base=args.file,
+        )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

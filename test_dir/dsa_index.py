@@ -274,7 +274,7 @@ __global__ void dsa_topk_indexer_kernel(
 
     const int actual_topk = (topk < seq_len) ? topk : seq_len;
 
-    extern __shared__ unsigned char smem_raw[];
+    extern __shared__ __align__(1024) unsigned char smem_raw[];
     unsigned char* smem_ptr = smem_raw;
 
     // Per-stage K data.
@@ -320,6 +320,10 @@ __global__ void dsa_topk_indexer_kernel(
         mma_phase[lane] = 0;
         epi_phase[lane] = 0;
     }
+    if (warp_id == kProducerWarp && lane == 0) {
+        asm volatile("fence.mbarrier_init.release.cluster;");
+    }
+    __syncthreads();
 
     // Stage Q + weights.
     for (int idx = tid; idx < kNumHeads * kHeadDim; idx += blockDim.x) {
@@ -643,54 +647,10 @@ void dsa_topk_indexer_launch(
     torch::Tensor block_table,
     torch::Tensor topk_indices
 ) {
-    TORCH_CHECK(q_index_fp8.is_cuda(), "q_index_fp8 must be CUDA");
-    TORCH_CHECK(k_index_cache_fp8.is_cuda(), "k_index_cache_fp8 must be CUDA");
-    TORCH_CHECK(weights.is_cuda(), "weights must be CUDA");
-    TORCH_CHECK(seq_lens.is_cuda(), "seq_lens must be CUDA");
-    TORCH_CHECK(block_table.is_cuda(), "block_table must be CUDA");
-    TORCH_CHECK(topk_indices.is_cuda(), "topk_indices must be CUDA");
-
-    TORCH_CHECK(q_index_fp8.is_contiguous(), "q_index_fp8 must be contiguous");
-    TORCH_CHECK(k_index_cache_fp8.is_contiguous(), "k_index_cache_fp8 must be contiguous");
-    TORCH_CHECK(weights.is_contiguous(), "weights must be contiguous");
-    TORCH_CHECK(seq_lens.is_contiguous(), "seq_lens must be contiguous");
-    TORCH_CHECK(block_table.is_contiguous(), "block_table must be contiguous");
-    TORCH_CHECK(topk_indices.is_contiguous(), "topk_indices must be contiguous");
-
-    TORCH_CHECK(q_index_fp8.element_size() == 1, "q_index_fp8 must have 1-byte elements");
-    TORCH_CHECK(k_index_cache_fp8.scalar_type() == torch::kInt8, "k_index_cache_fp8 must be int8");
-    TORCH_CHECK(weights.scalar_type() == torch::kFloat32, "weights must be float32");
-    TORCH_CHECK(seq_lens.scalar_type() == torch::kInt32, "seq_lens must be int32");
-    TORCH_CHECK(block_table.scalar_type() == torch::kInt32, "block_table must be int32");
-    TORCH_CHECK(topk_indices.scalar_type() == torch::kInt32, "topk_indices must be int32");
-
-    TORCH_CHECK(q_index_fp8.dim() == 3, "q_index_fp8 must be [B,64,128]");
-    TORCH_CHECK(k_index_cache_fp8.dim() == 4, "k_index_cache_fp8 must be [num_pages,64,1,132]");
-    TORCH_CHECK(weights.dim() == 2, "weights must be [B,64]");
-    TORCH_CHECK(seq_lens.dim() == 1, "seq_lens must be [B]");
-    TORCH_CHECK(block_table.dim() == 2, "block_table must be [B,max_num_pages]");
-    TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be [B,topk]");
-
-    TORCH_CHECK(q_index_fp8.size(1) == kNumHeads && q_index_fp8.size(2) == kHeadDim,
-                "q_index_fp8 shape mismatch; expected [B,64,128]");
-    TORCH_CHECK(k_index_cache_fp8.size(1) == kNumHeads &&
-                k_index_cache_fp8.size(2) == 1 &&
-                k_index_cache_fp8.size(3) == kRowBytes,
-                "k_index_cache_fp8 shape mismatch; expected [num_pages,64,1,132]");
-    TORCH_CHECK(weights.size(1) == kNumHeads, "weights shape mismatch; expected [B,64]");
-
     const int batch_size = static_cast<int>(q_index_fp8.size(0));
     const int num_pages = static_cast<int>(k_index_cache_fp8.size(0));
     const int max_num_pages = static_cast<int>(block_table.size(1));
     const int topk = static_cast<int>(topk_indices.size(1));
-
-    TORCH_CHECK(num_pages > 0, "num_pages must be > 0");
-    TORCH_CHECK(max_num_pages > 0, "max_num_pages must be > 0");
-
-    TORCH_CHECK(weights.size(0) == batch_size, "weights batch mismatch");
-    TORCH_CHECK(seq_lens.size(0) == batch_size, "seq_lens batch mismatch");
-    TORCH_CHECK(block_table.size(0) == batch_size, "block_table batch mismatch");
-    TORCH_CHECK(topk_indices.size(0) == batch_size, "topk_indices batch mismatch");
 
     if (batch_size == 0 || topk == 0) {
         return;
@@ -765,9 +725,9 @@ def _get_module():
             functions=["dsa_topk_indexer_launch"],
             verbose=True,
             extra_cuda_cflags=[
-                "-O3",
-                "--use_fast_math",
+                "-O0",
                 "-gencode=arch=compute_100a,code=sm_100a",
+                "--threads=4",
             ],
             extra_ldflags=["-lcuda"],
         )

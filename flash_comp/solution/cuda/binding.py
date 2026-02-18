@@ -1,15 +1,13 @@
 """
-TVM FFI Bindings Template for CUDA Kernels.
+TVM FFI bindings for CUDA kernel.
 
-This file provides Python bindings for your CUDA kernel using TVM FFI.
-The entry point function name should match the `entry_point` setting in config.toml.
-
-See the track definition for required function signature and semantics.
+This follows the starter-kit format: expose a `flashinfer.kernel`
+entrypoint and optional compile helper.
 """
 
 from tvm.ffi import register_func
-from index_bindings import compile_kernel as _compile_kernel
-from index_bindings import dsa_topk_indexer
+from dsa_index import compile_kernel as _compile_kernel
+from dsa_index import dsa_topk_indexer
 
 
 @register_func("flashinfer.kernel")

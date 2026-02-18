@@ -1,10 +1,13 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/error.h>
+#include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/function.h>
 #include <cuda.h>
-#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
+#include <climits>
 #include <cfloat>
 #include <cstdint>
 
@@ -14,7 +17,6 @@
 constexpr int kNumHeads = 64;
 constexpr int kHeadDim = 128;
 constexpr int kPageSize = 64;
-constexpr int kTopKDefault = 2048;
 
 constexpr int kPayloadBytesPerToken = 128;
 constexpr int kScaleBytesPerToken = 4;
@@ -24,15 +26,17 @@ constexpr int kPackedFp8Bytes = kPageSize * kHeadDim;  // 8192
 
 constexpr int kStageTokens = 64;
 constexpr int kNumStages = 10;
-constexpr int kProducerWarp = 0;
-constexpr int kConsumerWarp = 1;
-constexpr int kThreadsPerBlock = 64;  // 2 warps exactly
-constexpr int kDesiredDynamicSmemBytes = 228 * 1024;
 
-// Safety toggles for bring-up:
-// Keep async PTX paths off until descriptor/idesc/barrier protocol is fully validated.
-constexpr bool kEnableAsyncTma = false;
-constexpr bool kEnableTcgenMma = false;
+constexpr int kProducerWarp = 0;
+constexpr int kMmaWarp = 1;
+constexpr int kEpilogueWarpBase = 2;
+constexpr int kNumEpilogueWarps = 2;
+constexpr int kNumWarps = 2 + kNumEpilogueWarps;
+constexpr int kThreadsPerBlock = kNumWarps * 32;
+
+constexpr int kMmaK = 32;
+constexpr int kMmaIters = kHeadDim / kMmaK;  // 4
+constexpr int kDesiredDynamicSmemBytes = 228 * 1024;
 
 // ---------------------------------------------------------------------------------
 // Device helpers
@@ -44,9 +48,7 @@ __device__ inline uint32_t lane_id() {
 }
 
 __device__ inline uint32_t cvta_to_shared_u32(const void* p) {
-    uint32_t out;
-    asm volatile("cvta.to.shared.u32 %0, %1;" : "=r"(out) : "l"(p));
-    return out;
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
 __device__ inline bool elect_lane0() {
@@ -58,7 +60,6 @@ __device__ inline constexpr uint64_t desc_encode(uint64_t x) {
 }
 
 __device__ inline uint64_t make_desc_kmajor_128b(int smem_addr) {
-    // Shared-memory descriptor, K-major, 128B swizzle.
     const int sbo = 8 * 128;
     return desc_encode(static_cast<uint64_t>(smem_addr)) |
            (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
@@ -86,16 +87,22 @@ __device__ inline void mbarrier_arrive_expect_tx(int mbar_addr, int size_bytes) 
                  : "memory");
 }
 
+__device__ inline void mbarrier_arrive(int mbar_addr) {
+    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                 :: "r"(mbar_addr)
+                 : "memory");
+}
+
 __device__ inline void mbarrier_wait_parity(int mbar_addr, int phase) {
     const uint32_t ticks = 0x989680;
     asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "L_WAIT_%=: \n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%0], %1, %2;\n\t"
-        "@p bra.uni L_DONE_%=;\n\t"
-        "bra.uni L_WAIT_%=;\n\t"
-        "L_DONE_%=: \n\t"
+        "{\\n\\t"
+        ".reg .pred p;\\n\\t"
+        "L_WAIT_%=: \\n\\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%0], %1, %2;\\n\\t"
+        "@p bra.uni L_DONE_%=;\\n\\t"
+        "bra.uni L_WAIT_%=;\\n\\t"
+        "L_DONE_%=: \\n\\t"
         "}"
         :: "r"(mbar_addr), "r"(phase), "r"(ticks)
         : "memory");
@@ -120,24 +127,31 @@ __device__ inline void tma_3d_gmem2smem(
         : "memory");
 }
 
-__device__ inline void tcgen05_mma_f16_ss(
-    uint32_t tmem_c,
+__device__ inline void tcgen05_alloc(int smem_addr, int num_cols) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                 :: "r"(smem_addr), "r"(num_cols));
+}
+
+__device__ inline void tcgen05_dealloc(int base_tmem, int num_cols) {
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                 :: "r"(base_tmem), "r"(num_cols));
+}
+
+__device__ inline void tcgen05_mma_f8f6f4(
+    uint32_t tmem_d,
     uint64_t desc_a,
     uint64_t desc_b,
     uint32_t idesc,
     int accumulate
 ) {
-    if (!elect_lane0()) {
-        return;
-    }
     uint32_t mask[4] = {0, 0, 0, 0};
     asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
+        "{\\n\\t"
+        ".reg .pred p;\\n\\t"
+        "setp.ne.b32 p, %4, 0;\\n\\t"
+        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, {%5, %6, %7, %8}, p;\\n\\t"
         "}"
-        :: "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(idesc), "r"(accumulate),
+        :: "r"(tmem_d), "l"(desc_a), "l"(desc_b), "r"(idesc), "r"(accumulate),
            "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
 }
 
@@ -154,14 +168,16 @@ __device__ inline void tcgen05_wait_ld() {
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
 
-__device__ inline void tcgen05_fence_before_thread_sync() {
-    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+__device__ inline void tcgen05_fence_after_thread_sync() {
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 }
 
-__device__ inline float fp8_byte_to_float(uint8_t x) {
-    __nv_fp8_e4m3 v;
-    v.__x = x;
-    return static_cast<float>(v);
+__device__ inline float tcgen05_ld_32x32b_1(int row, int col) {
+    float val;
+    int addr = (row << 16) | col;
+    asm volatile("tcgen05.ld.sync.aligned.32x32b.x1.b32 {%0}, [%1];"
+                 : "=f"(val) : "r"(addr));
+    return val;
 }
 
 __device__ inline uint32_t read_u32_le(const uint8_t* p) {
@@ -204,36 +220,27 @@ __device__ inline void insert_topk_desc(float score, int idx, float* scores, int
 }
 
 // ---------------------------------------------------------------------------------
-// Kernel: warp-specialized (2 warps)
+// Kernel: 3-stage warp-specialized pipeline
 // ---------------------------------------------------------------------------------
 __global__ void dsa_topk_indexer_kernel(
-    const uint8_t* q_index_bytes,   // [B,64,128], elem_size in {1,2,4}
+    const uint8_t* q_index_bytes,   // [B,64,128], FP8 E4M3
     const int8_t* k_index_cache,    // [num_pages,64,1,132], deep_gemm packed
     const float* weights,           // [B,64]
     const int* seq_lens,            // [B]
     const int* block_table,         // [B,max_num_pages]
-    const void* k_fp8_tmap,         // CUtensorMap in global memory
-    float* spill_scores,            // [B,spill_stride]
+    const void* k_fp8_tmap,         // payload tensor map
     int* topk_indices,              // [B,topk]
     int batch_size,
     int num_pages,
     int max_num_pages,
-    int spill_stride,
-    int topk,
-    int q_elem_size,
-    int dynamic_smem_bytes
+    int topk
 ) {
     const int b = blockIdx.x;
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
 
-    if (b >= batch_size) {
-        return;
-    }
-
-    // Exactly two warps by contract.
-    if (warp_id > kConsumerWarp) {
+    if (b >= batch_size || warp_id >= kNumWarps) {
         return;
     }
 
@@ -241,12 +248,10 @@ __global__ void dsa_topk_indexer_kernel(
     const float* weights_b = weights + static_cast<int64_t>(b) * kNumHeads;
     int* out_b = topk_indices + static_cast<int64_t>(b) * topk;
 
-    const int max_seq_by_pages = max_num_pages * kPageSize;
-    const int max_seq_by_spill = spill_stride;
     int seq_len = seq_lens[b];
     if (seq_len < 0) seq_len = 0;
+    const int max_seq_by_pages = max_num_pages * kPageSize;
     if (seq_len > max_seq_by_pages) seq_len = max_seq_by_pages;
-    if (seq_len > max_seq_by_spill) seq_len = max_seq_by_spill;
 
     for (int i = tid; i < topk; i += blockDim.x) {
         out_b[i] = -1;
@@ -257,235 +262,258 @@ __global__ void dsa_topk_indexer_kernel(
         return;
     }
 
+    const int actual_topk = (topk < seq_len) ? topk : seq_len;
+
     extern __shared__ unsigned char smem_raw[];
     unsigned char* smem_ptr = smem_raw;
 
-    // Producer-owned staged K buffers.
+    // Per-stage K data.
     uint8_t* k_stage_payload = smem_alloc<uint8_t>(smem_ptr, kNumStages * kStageTokens * kPayloadBytesPerToken);
     float* k_stage_scale = smem_alloc<float>(smem_ptr, kNumStages * kStageTokens);
 
-    // Shared Q/weights and metadata.
+    // Q + weights.
     uint8_t* q_stage = smem_alloc<uint8_t>(smem_ptr, kNumHeads * kHeadDim);
     float* w_stage = smem_alloc<float>(smem_ptr, kNumHeads);
 
+    // Stage metadata.
     int* stage_page_idx = smem_alloc<int>(smem_ptr, kNumStages);
     int* stage_valid_tokens = smem_alloc<int>(smem_ptr, kNumStages);
-    int* stage_phase = smem_alloc<int>(smem_ptr, kNumStages);
-    uint64_t* stage_mbar = smem_alloc<uint64_t>(smem_ptr, kNumStages);
 
+    // Per-stage phase counters.
+    int* tma_phase = smem_alloc<int>(smem_ptr, kNumStages);
+    int* mma_phase = smem_alloc<int>(smem_ptr, kNumStages);
+    int* epi_phase = smem_alloc<int>(smem_ptr, kNumStages);
+
+    // Three mbar arrays (tma_done, mma_done, epi_done).
+    uint64_t* tma_mbar = smem_alloc<uint64_t>(smem_ptr, kNumStages);
+    uint64_t* mma_mbar = smem_alloc<uint64_t>(smem_ptr, kNumStages);
+    uint64_t* epi_mbar = smem_alloc<uint64_t>(smem_ptr, kNumStages);
+
+    // Per-stage epilogue candidates (requested per-stage top-k buffer).
+    float* stage_tile_scores = smem_alloc<float>(smem_ptr, kNumStages * kStageTokens);
+    int* stage_tile_ids = smem_alloc<int>(smem_ptr, kNumStages * kStageTokens);
+
+    // Global rolling top-k.
     float* topk_scores = smem_alloc<float>(smem_ptr, topk);
     int* topk_ids = smem_alloc<int>(smem_ptr, topk);
+    int* topk_count_ptr = smem_alloc<int>(smem_ptr, 1);
 
-    const int used_bytes = static_cast<int>(smem_ptr - smem_raw);
-    const int seq_cap_smem = (dynamic_smem_bytes > used_bytes)
-                                 ? (dynamic_smem_bytes - used_bytes) / static_cast<int>(sizeof(float))
-                                 : 0;
-    float* final_scores_smem = reinterpret_cast<float*>(smem_ptr);
-    const bool use_smem_scores = (seq_len <= seq_cap_smem);
-    float* spill_b = spill_scores + static_cast<int64_t>(b) * spill_stride;
+    // TMEM scratch.
+    int* tmem_addr_scratch = smem_alloc<int>(smem_ptr, 1);
 
-    // Initialize mbarriers + phase.
-    if (kEnableAsyncTma && warp_id == kProducerWarp && lane < kNumStages) {
-        const int mbar_addr = cvta_to_shared_u32(&stage_mbar[lane]);
-        mbarrier_init(mbar_addr, 1);
-        stage_phase[lane] = 0;
+    // Init barriers and phases.
+    if (warp_id == kProducerWarp && lane < kNumStages) {
+        mbarrier_init(cvta_to_shared_u32(&tma_mbar[lane]), 1);
+        mbarrier_init(cvta_to_shared_u32(&mma_mbar[lane]), 1);
+        mbarrier_init(cvta_to_shared_u32(&epi_mbar[lane]), 1);
+        tma_phase[lane] = 0;
+        mma_phase[lane] = 0;
+        epi_phase[lane] = 0;
+    }
+
+    // Stage Q + weights.
+    for (int idx = tid; idx < kNumHeads * kHeadDim; idx += blockDim.x) {
+        const int64_t q_off = static_cast<int64_t>(b) * kNumHeads * kHeadDim + idx;
+        q_stage[idx] = q_index_bytes[q_off];
+    }
+    for (int idx = tid; idx < kNumHeads; idx += blockDim.x) {
+        w_stage[idx] = weights_b[idx];
+    }
+
+    // Init global rolling top-k.
+    for (int i = tid; i < topk; i += blockDim.x) {
+        topk_scores[i] = -FLT_MAX;
+        topk_ids[i] = -1;
+    }
+    if (tid == 0) {
+        topk_count_ptr[0] = 0;
+        tmem_addr_scratch[0] = 0;
     }
     __syncthreads();
 
-    // Stage Q and weights once.
-    if (warp_id == kConsumerWarp) {
-        for (int idx = lane; idx < kNumHeads; idx += 32) {
-            w_stage[idx] = weights_b[idx];
-        }
-        if (q_elem_size == 1) {
-            for (int idx = lane; idx < kNumHeads * kHeadDim; idx += 32) {
-                const int64_t q_off = static_cast<int64_t>(b) * kNumHeads * kHeadDim + idx;
-                q_stage[idx] = q_index_bytes[q_off];
-            }
-        }
+    if (warp_id == kMmaWarp) {
+        tcgen05_alloc(cvta_to_shared_u32(tmem_addr_scratch), kStageTokens);
     }
     __syncthreads();
 
-    const uint8_t* k_bytes = reinterpret_cast<const uint8_t*>(k_index_cache);
+    constexpr uint32_t kIdesc = (0U << 7U)    // atype = E4M3
+                              | (0U << 10U)   // btype = E4M3
+                              | (1U << 4U)    // dtype = F32
+                              | ((uint32_t)(kStageTokens >> 3U) << 17U)
+                              | ((uint32_t)(kNumHeads >> 4U) << 24U);
+
     const int num_tiles = (seq_len + kStageTokens - 1) / kStageTokens;
 
-    for (int tile_base = 0; tile_base < num_tiles; tile_base += kNumStages) {
-        // ---------------- Producer warp: all loads ----------------
+    // Pipeline schedule:
+    // iter: producer(tile=iter), mma(tile=iter-1), epilogue(tile=iter-2).
+    for (int iter = 0; iter < num_tiles + 2; ++iter) {
+        // ---------------- Producer warp ----------------
         if (warp_id == kProducerWarp) {
-            for (int s = 0; s < kNumStages; ++s) {
-                const int tile_id = tile_base + s;
-                const int tile_seq_start = tile_id * kStageTokens;
-                const int remain = seq_len - tile_seq_start;
-                const int valid_tokens = (remain > 0) ? ((remain < kStageTokens) ? remain : kStageTokens) : 0;
+            const int tile_id = iter;
+            if (tile_id < num_tiles) {
+                const int stage = tile_id % kNumStages;
 
-                if (lane == 0) {
-                    stage_valid_tokens[s] = valid_tokens;
-                    int page_idx = -1;
-                    if (tile_id >= 0 && tile_id < max_num_pages) {
-                        page_idx = block_table_b[tile_id];
-                    }
-                    stage_page_idx[s] = page_idx;
+                // Stage reuse requires prior epilogue completion on the same stage slot.
+                if (tile_id >= kNumStages && lane == 0) {
+                    mbarrier_wait_parity(cvta_to_shared_u32(&epi_mbar[stage]), epi_phase[stage]);
+                    epi_phase[stage] ^= 1;
                 }
                 __syncwarp();
 
-                const int page_idx = stage_page_idx[s];
-                uint8_t* stage_payload = k_stage_payload + s * kStageTokens * kPayloadBytesPerToken;
-                float* stage_scale = k_stage_scale + s * kStageTokens;
+                const int tile_seq_start = tile_id * kStageTokens;
+                const int remain = seq_len - tile_seq_start;
+                int valid_tokens = (remain > 0) ? ((remain < kStageTokens) ? remain : kStageTokens) : 0;
 
-                // 1) Issue TMA payload load (best-effort tensor-map path).
-                if (kEnableAsyncTma && k_fp8_tmap != nullptr && page_idx >= 0 && page_idx < num_pages && lane == 0) {
-                    const int dst = cvta_to_shared_u32(stage_payload);
-                    const int mbar_addr = cvta_to_shared_u32(&stage_mbar[s]);
-                    mbarrier_arrive_expect_tx(mbar_addr, kStageTokens * kPayloadBytesPerToken);
-                    tma_3d_gmem2smem(dst, k_fp8_tmap, 0, 0, page_idx, mbar_addr, 0ULL);
+                int page_idx = -1;
+                if (tile_id >= 0 && tile_id < max_num_pages) {
+                    page_idx = block_table_b[tile_id];
+                }
+                if (!(page_idx >= 0 && page_idx < num_pages)) {
+                    valid_tokens = 0;
                 }
 
-                // 2) Manual fallback copy for payload + scales (ground-truth data path).
-                if (page_idx >= 0 && page_idx < num_pages && valid_tokens > 0) {
-                    const uint8_t* page_ptr = k_bytes + static_cast<int64_t>(page_idx) * kPageBytes;
-
-                    for (int i = lane; i < valid_tokens * kPayloadBytesPerToken; i += 32) {
-                        const int tok = i / kPayloadBytesPerToken;
-                        const int d = i % kPayloadBytesPerToken;
-                        stage_payload[i] = page_ptr[tok * kPayloadBytesPerToken + d];
-                    }
-
-                    for (int tok = lane; tok < valid_tokens; tok += 32) {
-                        const int scale_off = kPackedFp8Bytes + tok * kScaleBytesPerToken;
-                        const uint32_t bits = read_u32_le(page_ptr + scale_off);
-                        stage_scale[tok] = __uint_as_float(bits);
-                    }
+                if (lane == 0) {
+                    stage_page_idx[stage] = page_idx;
+                    stage_valid_tokens[stage] = valid_tokens;
                 }
+                __syncwarp();
 
-                for (int i = lane + valid_tokens * kPayloadBytesPerToken;
-                     i < kStageTokens * kPayloadBytesPerToken;
-                     i += 32) {
-                    stage_payload[i] = 0;
+                float* stage_scale = k_stage_scale + stage * kStageTokens;
+                for (int tok = lane; tok < valid_tokens; tok += 32) {
+                    const uint8_t* page_ptr = reinterpret_cast<const uint8_t*>(k_index_cache) +
+                                              static_cast<int64_t>(page_idx) * kPageBytes;
+                    const int scale_off = kPackedFp8Bytes + tok * kScaleBytesPerToken;
+                    stage_scale[tok] = __uint_as_float(read_u32_le(page_ptr + scale_off));
                 }
                 for (int tok = lane + valid_tokens; tok < kStageTokens; tok += 32) {
                     stage_scale[tok] = 0.0f;
                 }
-
-                __syncwarp();
-            }
-        }
-
-        __syncthreads();
-
-        // ---------------- Consumer warp: all compute ----------------
-        if (warp_id == kConsumerWarp) {
-            // tcgen path setup (placeholder descriptors / idesc; kept explicit by design).
-            const uint32_t i_desc = (1U << 7U)   // placeholder atype field
-                                  | (1U << 10U)  // placeholder btype field
-                                  | ((uint32_t)kStageTokens >> 3U << 17U)
-                                  | ((uint32_t)128 >> 7U << 27U);
-
-            for (int s = 0; s < kNumStages; ++s) {
-                const int tile_id = tile_base + s;
-                if (tile_id >= num_tiles) {
-                    continue;
-                }
-
-                const int valid_tokens = stage_valid_tokens[s];
-                const int page_idx = stage_page_idx[s];
-                if (valid_tokens <= 0 || page_idx < 0 || page_idx >= num_pages) {
-                    continue;
-                }
-
-                // Wait for producer-issued TMA transaction for this stage.
-                if (kEnableAsyncTma && k_fp8_tmap != nullptr && lane == 0) {
-                    const int mbar_addr = cvta_to_shared_u32(&stage_mbar[s]);
-                    mbarrier_wait_parity(mbar_addr, stage_phase[s]);
-                    stage_phase[s] ^= 1;
-                }
                 __syncwarp();
 
-                // Explicit tcgen issue point in consumer warp.
-                if (kEnableTcgenMma && lane == 0) {
-                    const int q_addr = cvta_to_shared_u32(q_stage);
-                    const int k_addr = cvta_to_shared_u32(k_stage_payload + s * kStageTokens * kPayloadBytesPerToken);
-                    const uint64_t desc_a = make_desc_kmajor_128b(q_addr);
-                    const uint64_t desc_b = make_desc_kmajor_128b(k_addr);
-                    tcgen05_mma_f16_ss(/*tmem_c=*/0, desc_a, desc_b, i_desc, /*accumulate=*/0);
-                    tcgen05_commit(cvta_to_shared_u32(&stage_mbar[s]));
-                    tcgen05_wait_ld();
-                    tcgen05_fence_before_thread_sync();
-                }
-                __syncwarp();
-
-                // Scalar reduce path (kept as correctness anchor while tcgen path is refined).
-                const uint8_t* stage_payload = k_stage_payload + s * kStageTokens * kPayloadBytesPerToken;
-                const float* stage_scale = k_stage_scale + s * kStageTokens;
-
-                for (int t = lane; t < valid_tokens; t += 32) {
-                    const int seq_token = tile_id * kStageTokens + t;
-                    float reduced = 0.0f;
-                    const uint8_t* row = stage_payload + t * kPayloadBytesPerToken;
-                    const float scale = stage_scale[t];
-
-                    for (int h = 0; h < kNumHeads; ++h) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < kHeadDim; ++d) {
-                            const int64_t q_off = (static_cast<int64_t>(b) * kNumHeads + h) * kHeadDim + d;
-                            float qv;
-                            if (q_elem_size == 1) {
-                                qv = fp8_byte_to_float(q_stage[h * kHeadDim + d]);
-                            } else if (q_elem_size == 2) {
-                                const __half* q_half = reinterpret_cast<const __half*>(q_index_bytes);
-                                qv = __half2float(q_half[q_off]);
-                            } else {
-                                const float* q_f32 = reinterpret_cast<const float*>(q_index_bytes);
-                                qv = q_f32[q_off];
-                            }
-                            const float kv = fp8_byte_to_float(row[d]) * scale;
-                            dot += qv * kv;
-                        }
-                        if (dot > 0.0f) {
-                            reduced += dot * w_stage[h];
-                        }
-                    }
-
-                    if (use_smem_scores) {
-                        final_scores_smem[seq_token] = reduced;
+                // Payload uses strict TMA path; invalid stages send explicit arrive signal.
+                if (lane == 0) {
+                    if (valid_tokens > 0) {
+                        const int dst = cvta_to_shared_u32(
+                            k_stage_payload + stage * kStageTokens * kPayloadBytesPerToken);
+                        const int mbar_addr = cvta_to_shared_u32(&tma_mbar[stage]);
+                        mbarrier_arrive_expect_tx(mbar_addr, kStageTokens * kPayloadBytesPerToken);
+                        tma_3d_gmem2smem(dst, k_fp8_tmap, 0, 0, page_idx, mbar_addr, 0ULL);
                     } else {
-                        spill_b[seq_token] = reduced;
+                        mbarrier_arrive(cvta_to_shared_u32(&tma_mbar[stage]));
                     }
                 }
             }
         }
 
-        __syncthreads();
+        // ---------------- MMA warp ----------------
+        if (warp_id == kMmaWarp) {
+            const int tile_id = iter - 1;
+            if (tile_id >= 0 && tile_id < num_tiles) {
+                const int stage = tile_id % kNumStages;
+
+                if (lane == 0) {
+                    mbarrier_wait_parity(cvta_to_shared_u32(&tma_mbar[stage]), tma_phase[stage]);
+                    tma_phase[stage] ^= 1;
+                }
+                __syncwarp();
+
+                const int valid_tokens = stage_valid_tokens[stage];
+                if (valid_tokens > 0 && lane == 0) {
+                    const int q_addr = cvta_to_shared_u32(q_stage);
+                    const int k_addr = cvta_to_shared_u32(
+                        k_stage_payload + stage * kStageTokens * kPayloadBytesPerToken);
+
+                    uint64_t a_desc = make_desc_kmajor_128b(q_addr);
+                    uint64_t b_desc = make_desc_kmajor_128b(k_addr);
+
+                    for (int ki = 0; ki < kMmaIters; ++ki) {
+                        tcgen05_mma_f8f6f4(0, a_desc, b_desc, kIdesc, (ki > 0));
+                        a_desc += (kMmaK >> 4);
+                        b_desc += (kMmaK >> 4);
+                    }
+
+                    tcgen05_commit(cvta_to_shared_u32(&mma_mbar[stage]));
+                } else if (lane == 0) {
+                    mbarrier_arrive(cvta_to_shared_u32(&mma_mbar[stage]));
+                }
+            }
+        }
+
+        // ---------------- Epilogue warps ----------------
+        if (warp_id >= kEpilogueWarpBase && warp_id < kEpilogueWarpBase + kNumEpilogueWarps) {
+            const int epi_warp = warp_id - kEpilogueWarpBase;
+            const int tile_id = iter - 2;
+
+            if (tile_id >= 0 && tile_id < num_tiles) {
+                const int stage = tile_id % kNumStages;
+
+                if (epi_warp == 0 && lane == 0) {
+                    mbarrier_wait_parity(cvta_to_shared_u32(&mma_mbar[stage]), mma_phase[stage]);
+                    mma_phase[stage] ^= 1;
+                }
+
+                // Epilogue warps synchronize before/after TMEM reads and candidate writes.
+                asm volatile("bar.sync 1, 64;" ::: "memory");
+
+                tcgen05_fence_after_thread_sync();
+
+                const int valid_tokens = stage_valid_tokens[stage];
+                const int page_idx = stage_page_idx[stage];
+                const float* stage_scale = k_stage_scale + stage * kStageTokens;
+                float* cand_scores = stage_tile_scores + stage * kStageTokens;
+                int* cand_ids = stage_tile_ids + stage * kStageTokens;
+
+                for (int t = epi_warp; t < valid_tokens; t += kNumEpilogueWarps) {
+                    float d0 = tcgen05_ld_32x32b_1(0, t);
+                    float d1 = tcgen05_ld_32x32b_1(1, t);
+                    tcgen05_wait_ld();
+
+                    const float scale = stage_scale[t];
+                    const float v0 = d0 * scale;
+                    const float v1 = d1 * scale;
+
+                    const float w0 = w_stage[lane];
+                    const float w1 = w_stage[lane + 32];
+
+                    float my_sum = (v0 > 0.0f ? (v0 * w0) : 0.0f) +
+                                   (v1 > 0.0f ? (v1 * w1) : 0.0f);
+
+                    for (int off = 16; off > 0; off >>= 1) {
+                        my_sum += __shfl_down_sync(0xFFFFFFFF, my_sum, off);
+                    }
+
+                    if (lane == 0) {
+                        cand_scores[t] = my_sum;
+                        cand_ids[t] = page_idx * kPageSize + t;
+                    }
+                }
+
+                asm volatile("bar.sync 1, 64;" ::: "memory");
+
+                if (epi_warp == 0 && lane == 0) {
+                    int topk_count = topk_count_ptr[0];
+                    for (int t = 0; t < valid_tokens; ++t) {
+                        insert_topk_desc(cand_scores[t], cand_ids[t], topk_scores, topk_ids, topk_count, actual_topk);
+                    }
+                    topk_count_ptr[0] = topk_count;
+                    mbarrier_arrive(cvta_to_shared_u32(&epi_mbar[stage]));
+                }
+            }
+        }
     }
 
-    // Final exact top-k in consumer lane 0.
-    if (warp_id == kConsumerWarp && lane == 0) {
-        const int actual_topk = (topk < seq_len) ? topk : seq_len;
-        for (int i = 0; i < actual_topk; ++i) {
-            topk_scores[i] = -FLT_MAX;
-            topk_ids[i] = -1;
-        }
+    __syncthreads();
 
-        int topk_count = 0;
-        for (int seq_token = 0; seq_token < seq_len; ++seq_token) {
-            const float score = use_smem_scores ? final_scores_smem[seq_token] : spill_b[seq_token];
-            const int page_slot = seq_token / kPageSize;
-            const int offset = seq_token % kPageSize;
-
-            int page_idx = -1;
-            if (page_slot >= 0 && page_slot < max_num_pages) {
-                page_idx = block_table_b[page_slot];
-            }
-            if (page_idx < 0 || page_idx >= num_pages) {
-                continue;
-            }
-
-            const int token_idx = page_idx * kPageSize + offset;
-            insert_topk_desc(score, token_idx, topk_scores, topk_ids, topk_count, actual_topk);
-        }
-
-        for (int i = 0; i < actual_topk; ++i) {
+    if (warp_id == kEpilogueWarpBase) {
+        const int topk_count = topk_count_ptr[0];
+        for (int i = lane; i < actual_topk; i += 32) {
             out_b[i] = (i < topk_count) ? topk_ids[i] : -1;
         }
+    }
+
+    __syncthreads();
+    if (warp_id == kMmaWarp) {
+        tcgen05_dealloc(0, kStageTokens);
     }
 }
 
@@ -494,13 +522,82 @@ __global__ void dsa_topk_indexer_kernel(
 // ---------------------------------------------------------------------------------
 static void* g_k_fp8_tmap_dev = nullptr;
 
+static inline size_t align_up_size(size_t v, size_t a) {
+    return (v + a - 1) & ~(a - 1);
+}
+
+static size_t required_dynamic_smem_bytes(int topk) {
+    size_t off = 0;
+
+    off = align_up_size(off, alignof(uint8_t));
+    off += static_cast<size_t>(kNumStages) * kStageTokens * kPayloadBytesPerToken;
+
+    off = align_up_size(off, alignof(float));
+    off += static_cast<size_t>(kNumStages) * kStageTokens * sizeof(float);
+
+    off = align_up_size(off, alignof(uint8_t));
+    off += static_cast<size_t>(kNumHeads) * kHeadDim;
+
+    off = align_up_size(off, alignof(float));
+    off += static_cast<size_t>(kNumHeads) * sizeof(float);
+
+    off = align_up_size(off, alignof(int));
+    off += static_cast<size_t>(kNumStages) * sizeof(int);  // stage_page_idx
+    off = align_up_size(off, alignof(int));
+    off += static_cast<size_t>(kNumStages) * sizeof(int);  // stage_valid_tokens
+    off = align_up_size(off, alignof(int));
+    off += static_cast<size_t>(kNumStages) * sizeof(int);  // tma_phase
+    off = align_up_size(off, alignof(int));
+    off += static_cast<size_t>(kNumStages) * sizeof(int);  // mma_phase
+    off = align_up_size(off, alignof(int));
+    off += static_cast<size_t>(kNumStages) * sizeof(int);  // epi_phase
+
+    off = align_up_size(off, alignof(uint64_t));
+    off += static_cast<size_t>(kNumStages) * sizeof(uint64_t);  // tma_mbar
+    off = align_up_size(off, alignof(uint64_t));
+    off += static_cast<size_t>(kNumStages) * sizeof(uint64_t);  // mma_mbar
+    off = align_up_size(off, alignof(uint64_t));
+    off += static_cast<size_t>(kNumStages) * sizeof(uint64_t);  // epi_mbar
+
+    off = align_up_size(off, alignof(float));
+    off += static_cast<size_t>(kNumStages) * kStageTokens * sizeof(float);  // stage_tile_scores
+    off = align_up_size(off, alignof(int));
+    off += static_cast<size_t>(kNumStages) * kStageTokens * sizeof(int);    // stage_tile_ids
+
+    off = align_up_size(off, alignof(float));
+    off += static_cast<size_t>(topk) * sizeof(float);  // topk_scores
+    off = align_up_size(off, alignof(int));
+    off += static_cast<size_t>(topk) * sizeof(int);    // topk_ids
+    off = align_up_size(off, alignof(int));
+    off += sizeof(int);                                 // topk_count_ptr
+    off = align_up_size(off, alignof(int));
+    off += sizeof(int);                                 // tmem_addr_scratch
+
+    return off;
+}
+
+static inline bool is_dtype(DLDataType dtype, uint8_t code, uint8_t bits, uint16_t lanes = 1) {
+    return dtype.code == code && dtype.bits == bits && dtype.lanes == lanes;
+}
+
+static inline int dtype_nbytes(DLDataType dtype) {
+    return static_cast<int>((static_cast<int>(dtype.bits) * static_cast<int>(dtype.lanes) + 7) / 8);
+}
+
 static void ensure_k_fp8_tmap_on_device(const int8_t* k_index_cache_ptr, int num_pages) {
     if (g_k_fp8_tmap_dev == nullptr) {
-        cudaMalloc(&g_k_fp8_tmap_dev, sizeof(CUtensorMap));
+        cudaError_t alloc_st = cudaMalloc(&g_k_fp8_tmap_dev, sizeof(CUtensorMap));
+        if (alloc_st != cudaSuccess) {
+            TVM_FFI_THROW(RuntimeError)
+                << "cudaMalloc(CUtensorMap) failed: " << cudaGetErrorString(alloc_st);
+        }
     }
 
     CUtensorMap k_fp8_tmap{};
-    cuInit(0);
+    CUresult init_st = cuInit(0);
+    if (init_st != CUDA_SUCCESS) {
+        TVM_FFI_THROW(RuntimeError) << "cuInit failed with error code " << static_cast<int>(init_st);
+    }
 
     constexpr cuuint32_t rank = 3;
     const cuuint64_t globalDim[rank] = {
@@ -533,12 +630,15 @@ static void ensure_k_fp8_tmap_on_device(const int8_t* k_index_cache_ptr, int num
         CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
+    if (st != CUDA_SUCCESS) {
+        TVM_FFI_THROW(RuntimeError)
+            << "cuTensorMapEncodeTiled failed with error code " << static_cast<int>(st);
+    }
 
-    if (st == CUDA_SUCCESS) {
-        cudaMemcpy(g_k_fp8_tmap_dev, &k_fp8_tmap, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
-    } else {
-        // Best-effort mode: keep pointer null to skip TMA path if encode fails.
-        g_k_fp8_tmap_dev = nullptr;
+    cudaError_t cp_st = cudaMemcpy(g_k_fp8_tmap_dev, &k_fp8_tmap, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+    if (cp_st != cudaSuccess) {
+        TVM_FFI_THROW(RuntimeError)
+            << "cudaMemcpy(CUtensorMap) failed: " << cudaGetErrorString(cp_st);
     }
 }
 
@@ -546,20 +646,94 @@ static void ensure_k_fp8_tmap_on_device(const int8_t* k_index_cache_ptr, int num
 // Launch entry
 // ---------------------------------------------------------------------------------
 void dsa_topk_indexer_launch(
-    torch::Tensor q_index_fp8,
-    torch::Tensor k_index_cache_fp8,
-    torch::Tensor weights,
-    torch::Tensor seq_lens,
-    torch::Tensor block_table,
-    torch::Tensor spill_scores,
-    torch::Tensor topk_indices
+    tvm::ffi::TensorView q_index_fp8,
+    tvm::ffi::TensorView k_index_cache_fp8,
+    tvm::ffi::TensorView weights,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView block_table,
+    tvm::ffi::TensorView topk_indices
 ) {
+    if (q_index_fp8.device().device_type != kDLCUDA) {
+        TVM_FFI_THROW(ValueError) << "q_index_fp8 must be CUDA";
+    }
+    if (k_index_cache_fp8.device().device_type != kDLCUDA) {
+        TVM_FFI_THROW(ValueError) << "k_index_cache_fp8 must be CUDA";
+    }
+    if (weights.device().device_type != kDLCUDA) {
+        TVM_FFI_THROW(ValueError) << "weights must be CUDA";
+    }
+    if (seq_lens.device().device_type != kDLCUDA) {
+        TVM_FFI_THROW(ValueError) << "seq_lens must be CUDA";
+    }
+    if (block_table.device().device_type != kDLCUDA) {
+        TVM_FFI_THROW(ValueError) << "block_table must be CUDA";
+    }
+    if (topk_indices.device().device_type != kDLCUDA) {
+        TVM_FFI_THROW(ValueError) << "topk_indices must be CUDA";
+    }
+
+    TVM_FFI_ICHECK(q_index_fp8.IsContiguous()) << "q_index_fp8 must be contiguous";
+    TVM_FFI_ICHECK(k_index_cache_fp8.IsContiguous()) << "k_index_cache_fp8 must be contiguous";
+    TVM_FFI_ICHECK(weights.IsContiguous()) << "weights must be contiguous";
+    TVM_FFI_ICHECK(seq_lens.IsContiguous()) << "seq_lens must be contiguous";
+    TVM_FFI_ICHECK(block_table.IsContiguous()) << "block_table must be contiguous";
+    TVM_FFI_ICHECK(topk_indices.IsContiguous()) << "topk_indices must be contiguous";
+
+    const DLDataType q_dtype = q_index_fp8.dtype();
+    const DLDataType k_dtype = k_index_cache_fp8.dtype();
+    const DLDataType w_dtype = weights.dtype();
+    const DLDataType s_dtype = seq_lens.dtype();
+    const DLDataType bt_dtype = block_table.dtype();
+    const DLDataType out_dtype = topk_indices.dtype();
+
+    const int q_nbytes = dtype_nbytes(q_dtype);
+    if (q_nbytes != 1 && q_nbytes != 2) {
+        TVM_FFI_THROW(TypeError)
+            << "q_index_fp8 must have 1-byte (fp8-bytes) or 2-byte (fp16) elements";
+    }
+    if (!is_dtype(k_dtype, kDLInt, 8)) {
+        TVM_FFI_THROW(TypeError) << "k_index_cache_fp8 must be int8";
+    }
+    if (!is_dtype(w_dtype, kDLFloat, 32)) {
+        TVM_FFI_THROW(TypeError) << "weights must be float32";
+    }
+    if (!is_dtype(s_dtype, kDLInt, 32)) {
+        TVM_FFI_THROW(TypeError) << "seq_lens must be int32";
+    }
+    if (!is_dtype(bt_dtype, kDLInt, 32)) {
+        TVM_FFI_THROW(TypeError) << "block_table must be int32";
+    }
+    if (!is_dtype(out_dtype, kDLInt, 32)) {
+        TVM_FFI_THROW(TypeError) << "topk_indices must be int32";
+    }
+
+    TVM_FFI_ICHECK_EQ(q_index_fp8.ndim(), 3) << "q_index_fp8 must be [B,64,128]";
+    TVM_FFI_ICHECK_EQ(k_index_cache_fp8.ndim(), 4) << "k_index_cache_fp8 must be [num_pages,64,1,132]";
+    TVM_FFI_ICHECK_EQ(weights.ndim(), 2) << "weights must be [B,64]";
+    TVM_FFI_ICHECK_EQ(seq_lens.ndim(), 1) << "seq_lens must be [B]";
+    TVM_FFI_ICHECK_EQ(block_table.ndim(), 2) << "block_table must be [B,max_num_pages]";
+    TVM_FFI_ICHECK_EQ(topk_indices.ndim(), 2) << "topk_indices must be [B,topk]";
+
+    TVM_FFI_ICHECK(q_index_fp8.size(1) == kNumHeads && q_index_fp8.size(2) == kHeadDim)
+        << "q_index_fp8 shape mismatch; expected [B,64,128]";
+    TVM_FFI_ICHECK(k_index_cache_fp8.size(1) == kNumHeads &&
+                   k_index_cache_fp8.size(2) == 1 &&
+                   k_index_cache_fp8.size(3) == kRowBytes)
+        << "k_index_cache_fp8 shape mismatch; expected [num_pages,64,1,132]";
+    TVM_FFI_ICHECK_EQ(weights.size(1), kNumHeads) << "weights shape mismatch; expected [B,64]";
+
     const int batch_size = static_cast<int>(q_index_fp8.size(0));
     const int num_pages = static_cast<int>(k_index_cache_fp8.size(0));
     const int max_num_pages = static_cast<int>(block_table.size(1));
-    const int spill_stride = static_cast<int>(spill_scores.size(1));
     const int topk = static_cast<int>(topk_indices.size(1));
-    const int q_elem_size = static_cast<int>(q_index_fp8.element_size());
+
+    TVM_FFI_ICHECK_GT(num_pages, 0) << "num_pages must be > 0";
+    TVM_FFI_ICHECK_GT(max_num_pages, 0) << "max_num_pages must be > 0";
+
+    TVM_FFI_ICHECK_EQ(weights.size(0), batch_size) << "weights batch mismatch";
+    TVM_FFI_ICHECK_EQ(seq_lens.size(0), batch_size) << "seq_lens batch mismatch";
+    TVM_FFI_ICHECK_EQ(block_table.size(0), batch_size) << "block_table batch mismatch";
+    TVM_FFI_ICHECK_EQ(topk_indices.size(0), batch_size) << "topk_indices batch mismatch";
 
     if (batch_size == 0 || topk == 0) {
         return;
@@ -568,42 +742,87 @@ void dsa_topk_indexer_launch(
     ensure_k_fp8_tmap_on_device(reinterpret_cast<const int8_t*>(k_index_cache_fp8.data_ptr()), num_pages);
 
     int device = -1;
-    cudaGetDevice(&device);
-
-    int max_optin_smem = 0;
-    cudaDeviceGetAttribute(&max_optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    int dynamic_smem_bytes = kDesiredDynamicSmemBytes;
-    if (max_optin_smem > 0 && dynamic_smem_bytes > max_optin_smem) {
-        dynamic_smem_bytes = max_optin_smem;
+    cudaError_t device_st = cudaGetDevice(&device);
+    if (device_st != cudaSuccess) {
+        TVM_FFI_THROW(RuntimeError) << "cudaGetDevice failed: " << cudaGetErrorString(device_st);
     }
 
-    cudaFuncSetAttribute(
+    int max_optin_smem = 0;
+    cudaError_t attr_st = cudaDeviceGetAttribute(&max_optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (attr_st != cudaSuccess) {
+        TVM_FFI_THROW(RuntimeError)
+            << "cudaDeviceGetAttribute failed: " << cudaGetErrorString(attr_st);
+    }
+    const size_t smem_need = required_dynamic_smem_bytes(topk);
+    TVM_FFI_ICHECK(smem_need <= static_cast<size_t>(INT_MAX)) << "required smem does not fit int";
+
+    int dynamic_smem_bytes = kDesiredDynamicSmemBytes;
+    const int smem_need_i = static_cast<int>(smem_need);
+    if (dynamic_smem_bytes < smem_need_i) dynamic_smem_bytes = smem_need_i;
+    if (max_optin_smem > 0 && dynamic_smem_bytes > max_optin_smem) dynamic_smem_bytes = max_optin_smem;
+    TVM_FFI_ICHECK(dynamic_smem_bytes >= smem_need_i)
+        << "insufficient dynamic shared memory: need " << smem_need_i << ", have " << dynamic_smem_bytes;
+
+    cudaError_t max_smem_st = cudaFuncSetAttribute(
         dsa_topk_indexer_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         dynamic_smem_bytes
     );
-    cudaFuncSetAttribute(
+    if (max_smem_st != cudaSuccess) {
+        TVM_FFI_THROW(RuntimeError)
+            << "cudaFuncSetAttribute(MaxDynamicSharedMemorySize) failed: "
+            << cudaGetErrorString(max_smem_st);
+    }
+    cudaError_t carveout_st = cudaFuncSetAttribute(
         dsa_topk_indexer_kernel,
         cudaFuncAttributePreferredSharedMemoryCarveout,
         100
     );
+    if (carveout_st != cudaSuccess) {
+        TVM_FFI_THROW(RuntimeError)
+            << "cudaFuncSetAttribute(PreferredSharedMemoryCarveout) failed: "
+            << cudaGetErrorString(carveout_st);
+    }
+
+    DLDevice dev = q_index_fp8.device();
+    cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
 
     const int blocks = batch_size;
-    dsa_topk_indexer_kernel<<<blocks, kThreadsPerBlock, dynamic_smem_bytes>>>(
+    dsa_topk_indexer_kernel<<<blocks, kThreadsPerBlock, dynamic_smem_bytes, stream>>>(
         reinterpret_cast<const uint8_t*>(q_index_fp8.data_ptr()),
         reinterpret_cast<const int8_t*>(k_index_cache_fp8.data_ptr()),
         reinterpret_cast<const float*>(weights.data_ptr()),
         reinterpret_cast<const int*>(seq_lens.data_ptr()),
         reinterpret_cast<const int*>(block_table.data_ptr()),
         g_k_fp8_tmap_dev,
-        reinterpret_cast<float*>(spill_scores.data_ptr()),
         reinterpret_cast<int*>(topk_indices.data_ptr()),
         batch_size,
         num_pages,
         max_num_pages,
-        spill_stride,
-        topk,
-        q_elem_size,
-        dynamic_smem_bytes
+        topk
+    );
+    cudaError_t launch_st = cudaGetLastError();
+    if (launch_st != cudaSuccess) {
+        TVM_FFI_THROW(RuntimeError) << "kernel launch failed: " << cudaGetErrorString(launch_st);
+    }
+}
+
+void kernel(
+    tvm::ffi::TensorView q_index_fp8,
+    tvm::ffi::TensorView k_index_cache_fp8,
+    tvm::ffi::TensorView weights,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView block_table,
+    tvm::ffi::TensorView topk_indices
+) {
+    dsa_topk_indexer_launch(
+        q_index_fp8,
+        k_index_cache_fp8,
+        weights,
+        seq_lens,
+        block_table,
+        topk_indices
     );
 }
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(kernel, kernel);

@@ -1,0 +1,73 @@
+Packing solution from source files (override mode)...
+Loaded: dsa-topk-ref-v1 (dsa_topk_indexer_fp8_h64_d128_topk2048_ps64)
+Entry point: binding.py::kernel
+Override mode: using 'dsa_index.py' as binding.py and 'dsa_index.cu' as kernel.cu
+
+Running benchmark on Modal B200...
+Solution packed: /home/beed/mlsys/flash_comp/solution.json
+  Name: dsa-topk-ref-v1
+  Definition: dsa_topk_indexer_fp8_h64_d128_topk2048_ps64
+  Author: team-name
+  Language: cuda
+Trace stats: total=1, evaluated=1, non_evaluated=0
+
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64:
+  Workload 30cecff1...: COMPILE_ERROR
+    evaluation_log:
+      BuildError: TVM-FFI compilation failed for 'dsa-topk-ref-v1': ninja exited with status 1
+      stdout:
+      [1/2] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda_0.o.d -Xcompiler -fPIC -std=c++17 -O2 -gencode=arch=compute_100a,code=sm_100a -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0 -c /root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0/kernel.cu -o cuda_0.o
+      FAILED: [code=1] cuda_0.o 
+      /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda_0.o.d -Xcompiler -fPIC -std=c++17 -O2 -gencode=arch=compute_100a,code=sm_100a -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0 -c /root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0/kernel.cu -o cuda_0.o
+      /root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0/kernel.cu:1:10: fatal error: ATen/cuda/CUDAContext.h: No such file or directory
+          1 | #include <ATen/cuda/CUDAContext.h>
+            |          ^~~~~~~~~~~~~~~~~~~~~~~~~
+      compilation terminated.
+      ninja: build stopped: subcommand failed.
+      
+      
+      Traceback:
+      Traceback (most recent call last):
+        File "/opt/conda/lib/python3.11/site-packages/flashinfer_bench/compile/builders/tvm_ffi_builder.py", line 264, in build
+          output_lib_path = tvm_ffi.cpp.build(
+                            ^^^^^^^^^^^^^^^^^^
+        File "/opt/conda/lib/python3.11/site-packages/tvm_ffi/cpp/extension.py", line 1034, in build
+          return _build_impl(
+                 ^^^^^^^^^^^^
+        File "/opt/conda/lib/python3.11/site-packages/tvm_ffi/cpp/extension.py", line 540, in _build_impl
+          build_ninja(str(build_dir))
+        File "/opt/conda/lib/python3.11/site-packages/tvm_ffi/cpp/extension.py", line 412, in build_ninja
+          raise RuntimeError("\n".join(msg))
+      RuntimeError: ninja exited with status 1
+      stdout:
+      [1/2] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda_0.o.d -Xcompiler -fPIC -std=c++17 -O2 -gencode=arch=compute_100a,code=sm_100a -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0 -c /root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0/kernel.cu -o cuda_0.o
+      FAILED: [code=1] cuda_0.o 
+      /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda_0.o.d -Xcompiler -fPIC -std=c++17 -O2 -gencode=arch=compute_100a,code=sm_100a -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0 -c /root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0/kernel.cu -o cuda_0.o
+      /root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0/kernel.cu:1:10: fatal error: ATen/cuda/CUDAContext.h: No such file or directory
+          1 | #include <ATen/cuda/CUDAContext.h>
+            |          ^~~~~~~~~~~~~~~~~~~~~~~~~
+      compilation terminated.
+      ninja: build stopped: subcommand failed.
+      
+      
+      The above exception was the direct cause of the following exception:
+      
+      Traceback (most recent call last):
+        File "/opt/conda/lib/python3.11/site-packages/flashinfer_bench/bench/runner/persistent_runner.py", line 712, in _persistent_worker_main
+          runnable_sol = registry.build(definition, solution)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/opt/conda/lib/python3.11/site-packages/flashinfer_bench/compile/registry.py", line 148, in build
+          runnable = builder.build(definition, solution)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/opt/conda/lib/python3.11/site-packages/flashinfer_bench/compile/builders/tvm_ffi_builder.py", line 272, in build
+          raise BuildError(
+      flashinfer_bench.compile.builder.BuildError: TVM-FFI compilation failed for 'dsa-topk-ref-v1': ninja exited with status 1
+      stdout:
+      [1/2] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda_0.o.d -Xcompiler -fPIC -std=c++17 -O2 -gencode=arch=compute_100a,code=sm_100a -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0 -c /root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0/kernel.cu -o cuda_0.o
+      FAILED: [code=1] cuda_0.o 
+      /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda_0.o.d -Xcompiler -fPIC -std=c++17 -O2 -gencode=arch=compute_100a,code=sm_100a -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/opt/conda/lib/python3.11/site-packages/tvm_ffi/include -I/root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0 -c /root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0/kernel.cu -o cuda_0.o
+      /root/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_dsa_topk_ref_v1_ca92c0/kernel.cu:1:10: fatal error: ATen/cuda/CUDAContext.h: No such file or directory
+          1 | #include <ATen/cuda/CUDAContext.h>
+            |          ^~~~~~~~~~~~~~~~~~~~~~~~~
+      compilation terminated.
+      ninja: build stopped: subcommand failed.
