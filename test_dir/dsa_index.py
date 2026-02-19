@@ -18,8 +18,8 @@ cuda_src = """
 
 #include <cstddef>
 #include <climits>
-#include <cfloat>
 #include <cstdint>
+#include <cstdio>
 
 // ---------------------------------------------------------------------------------
 // Constants
@@ -36,6 +36,8 @@ constexpr int kPackedFp8Bytes = kPageSize * kHeadDim;  // 8192
 
 constexpr int kStageTokens = 64;
 constexpr int kNumStages = 10;
+constexpr int kNumTmemSlots = 8;
+static_assert(kNumTmemSlots * kStageTokens <= 512, "TMEM columns exceed hardware limit");
 
 constexpr int kEpilogueWarpBase = 0;
 constexpr int kNumEpilogueWarps = 2;
@@ -51,12 +53,6 @@ constexpr int kDesiredDynamicSmemBytes = 228 * 1024 - 2048;
 // ---------------------------------------------------------------------------------
 // Device helpers
 // ---------------------------------------------------------------------------------
-__device__ inline uint32_t lane_id() {
-    uint32_t lane;
-    asm volatile("mov.u32 %0, %laneid;" : "=r"(lane));
-    return lane;
-}
-
 __device__ inline int smem_addr_from_base(const void* base_ptr, int base_addr, const void* ptr) {
     return base_addr + static_cast<int>(
         reinterpret_cast<const unsigned char*>(ptr) - reinterpret_cast<const unsigned char*>(base_ptr));
@@ -65,11 +61,7 @@ __device__ inline int smem_addr_from_base(const void* base_ptr, int base_addr, c
 __device__ inline uint32_t elect_sync() {
   uint32_t pred = 0;
   asm volatile(
-    "{\n\t"
-    ".reg .pred %%px;\n\t"
-    "elect.sync _|%%px, %1;\n\t"
-    "@%%px mov.s32 %0, 1;\n\t"
-    "}"
+    "{ .reg .pred %%px; elect.sync _|%%px, %1; @%%px mov.s32 %0, 1; }"
     : "+r"(pred)
     : "r"(0xFFFFFFFF)
   );
@@ -80,12 +72,19 @@ __device__ inline constexpr uint64_t desc_encode(uint64_t x) {
     return (x & 0x3'FFFFULL) >> 4ULL;
 }
 
-__device__ inline uint64_t make_desc_kmajor_128b(int smem_addr) {
+__device__ inline uint64_t make_desc_kmajor_swizzle_128b(int smem_addr) {
     const int sbo = 8 * 128;
     return desc_encode(static_cast<uint64_t>(smem_addr)) |
            (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
            (1ULL << 46ULL) |
            (2ULL << 61ULL);
+}
+
+__device__ inline uint64_t make_desc_kmajor_noswizzle(int smem_addr) {
+    const int sbo = 8 * 128;
+    return desc_encode(static_cast<uint64_t>(smem_addr)) |
+           (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
+           (1ULL << 46ULL);
 }
 
 template <typename T>
@@ -115,18 +114,36 @@ __device__ inline void mbarrier_arrive(int mbar_addr) {
 }
 
 __device__ inline void mbarrier_wait_parity(int mbar_addr, int phase) {
-    const uint32_t ticks = 0x989680;
-    asm volatile(
-        "{\\n\\t"
-        ".reg .pred p;\\n\\t"
-        "L_WAIT_%=: \\n\\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%0], %1, %2;\\n\\t"
-        "@p bra.uni L_DONE_%=;\\n\\t"
-        "bra.uni L_WAIT_%=;\\n\\t"
-        "L_DONE_%=: \\n\\t"
-        "}"
-        :: "r"(mbar_addr), "r"(phase), "r"(ticks)
-        : "memory");
+    constexpr uint32_t kSuspendNs = 1000000U;  // 1 ms per try_wait attempt
+    constexpr uint64_t kTimeoutNs = 5000000000ULL;  // 5 s total timeout
+    uint64_t start_ns = 0;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start_ns));
+
+    while (true) {
+        uint32_t complete = 0;
+        asm volatile(
+            "{\\n\\t"
+            ".reg .pred p;\\n\\t"
+            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2, %3;\\n\\t"
+            "selp.u32 %0, 1, 0, p;\\n\\t"
+            "}"
+            : "=r"(complete)
+            : "r"(mbar_addr), "r"(phase), "r"(kSuspendNs)
+            : "memory");
+        if (complete) {
+            return;
+        }
+
+        uint64_t now_ns = 0;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now_ns));
+        if (now_ns - start_ns > kTimeoutNs) {
+            if (threadIdx.x == 0) {
+                printf("MBAR timeout: addr=%d phase=%d waited_ns=%llu\\n",
+                       mbar_addr, phase, (unsigned long long)(now_ns - start_ns));
+            }
+            asm volatile("trap;");
+        }
+    }
 }
 
 __device__ inline void prepare_stage_metadata_and_scale_tail(
@@ -139,7 +156,6 @@ __device__ inline void prepare_stage_metadata_and_scale_tail(
     int* stage_page_idx,
     int* stage_valid_tokens,
     float* k_stage_scale,
-    int lane,
     int& page_idx,
     int& valid_tokens
 ) {
@@ -155,14 +171,12 @@ __device__ inline void prepare_stage_metadata_and_scale_tail(
         valid_tokens = 0;
     }
 
-    if (lane == 0) {
-        stage_page_idx[stage] = page_idx;
-        stage_valid_tokens[stage] = valid_tokens;
-    }
+    stage_page_idx[stage] = page_idx;
+    stage_valid_tokens[stage] = valid_tokens;
 
     // Zero out scale padding for invalid tokens.
     float* stage_scale = k_stage_scale + stage * kStageTokens;
-    for (int tok = lane + valid_tokens; tok < kStageTokens; tok += 32) {
+    for (int tok = valid_tokens; tok < kStageTokens; ++tok) {
         stage_scale[tok] = 0.0f;
     }
 }
@@ -248,85 +262,68 @@ __device__ inline float tcgen05_ld_32x32b_1(int row, int col) {
     return val;
 }
 
-// Warp-parallel min-scan over the unsorted top-k buffer.
-// All 32 lanes of the warp participate. Returns min value and its index in the buffer.
-// Only lane 0's min_pos/min_val outputs are authoritative (via reduction).
-__device__ inline void topk_find_min_warp(
-    const float* scores, int k, int lane,
-    float& out_min_val, int& out_min_pos
+constexpr int kEpiTokenBlock = 8;
+
+__device__ inline void ep_compute_warp_partial_block8(
+    int tmem_row_base,
+    int tmem_slot,
+    int token_base,
+    int token_count,
+    const float* stage_scale,
+    const float* w_stage,
+    float out_partial[kEpiTokenBlock]
 ) {
-    // Each lane scans k/32 elements
-    const int chunk = k >> 5;  // k / 32
-    const int base = lane * chunk;
-    float local_min = FLT_MAX;
-    int local_pos = -1;
-    for (int i = 0; i < chunk; ++i) {
-        float s = scores[base + i];
-        if (s < local_min) {
-            local_min = s;
-            local_pos = base + i;
+    const int lane = static_cast<int>(threadIdx.x & 31);
+    const float w = w_stage[tmem_row_base + lane];
+    #pragma unroll
+    for (int i = 0; i < kEpiTokenBlock; ++i) {
+        float lane_val = 0.0f;
+        if (i < token_count) {
+            const int token = token_base + i;
+            const int col = tmem_slot * kStageTokens + token;
+            const float d = tcgen05_ld_32x32b_1(tmem_row_base + lane, col);
+            tcgen05_wait_ld();
+            const float v = d * stage_scale[token];
+            lane_val = (v > 0.0f) ? (v * w) : 0.0f;
         }
-    }
-    // Warp reduction to find global min
-    for (int off = 16; off > 0; off >>= 1) {
-        float other_val = __shfl_down_sync(0xFFFFFFFF, local_min, off);
-        int other_pos = __shfl_down_sync(0xFFFFFFFF, local_pos, off);
-        if (other_val < local_min) {
-            local_min = other_val;
-            local_pos = other_pos;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            lane_val += __shfl_down_sync(0xFFFFFFFF, lane_val, off);
         }
+        out_partial[i] = lane_val;
     }
-    out_min_val = local_min;
-    out_min_pos = local_pos;
 }
 
-// Insert a score into the unsorted top-k buffer.
-// Called by all lanes in the warp (for the min-scan), but only lane 0 writes.
-// topk_min_val / topk_min_pos are broadcast from lane 0 to all lanes.
-__device__ inline void topk_insert_unsorted(
-    float score, int idx,
-    float* topk_scores, int* topk_ids,
-    int& count, int k, int lane,
-    float& topk_min_val, int& topk_min_pos
+__device__ inline void ep_finalize_two_warp_block8(
+    int epi_warp,
+    int lane,
+    int token_base,
+    int token_count,
+    int page_idx,
+    const float warp_partial[kEpiTokenBlock],
+    float* cand_scores,
+    int* cand_ids
 ) {
-    if (k <= 0 || idx < 0) return;
-
-    // Phase 1: buffer not full yet — just append
-    if (count < k) {
-        if (lane == 0) {
-            topk_scores[count] = score;
-            topk_ids[count] = idx;
-            ++count;
-            // When buffer just became full, need to find the min
-            if (count == k) {
-                // Will be computed below via warp scan
+    if (epi_warp == 1 && lane == 0) {
+        #pragma unroll
+        for (int i = 0; i < kEpiTokenBlock; ++i) {
+            if (i < token_count) {
+                cand_scores[token_base + i] = warp_partial[i];
             }
         }
-        // Broadcast count
-        count = __shfl_sync(0xFFFFFFFF, count, 0);
-        if (count == k) {
-            // Buffer just filled — compute initial min
-            topk_find_min_warp(topk_scores, k, lane, topk_min_val, topk_min_pos);
-            topk_min_val = __shfl_sync(0xFFFFFFFF, topk_min_val, 0);
-            topk_min_pos = __shfl_sync(0xFFFFFFFF, topk_min_pos, 0);
+    }
+    asm volatile("bar.sync 1, 64;" ::: "memory");
+
+    if (epi_warp == 0 && lane == 0) {
+        #pragma unroll
+        for (int i = 0; i < kEpiTokenBlock; ++i) {
+            if (i < token_count) {
+                const int token = token_base + i;
+                cand_scores[token] = warp_partial[i] + cand_scores[token];
+                cand_ids[token] = page_idx * kPageSize + token;
+            }
         }
-        return;
     }
-
-    // Phase 2: buffer full — threshold check (all lanes have min_val from broadcast)
-    if (score <= topk_min_val) return;
-
-    // Replace the min entry
-    if (lane == 0) {
-        topk_scores[topk_min_pos] = score;
-        topk_ids[topk_min_pos] = idx;
-    }
-    __syncwarp();
-
-    // Recompute min
-    topk_find_min_warp(topk_scores, k, lane, topk_min_val, topk_min_pos);
-    topk_min_val = __shfl_sync(0xFFFFFFFF, topk_min_val, 0);
-    topk_min_pos = __shfl_sync(0xFFFFFFFF, topk_min_pos, 0);
 }
 
 // ---------------------------------------------------------------------------------
@@ -347,8 +344,8 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
 ) {
     const int b = blockIdx.x;
     const int tid = threadIdx.x;
-    const int warp_id = tid >> 5;
     const int lane = tid & 31;
+    const int warp_id = tid >> 5;
 
     if (b >= batch_size || warp_id >= kNumWarps) {
         return;
@@ -372,8 +369,6 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
         return;
     }
 
-    const int actual_topk = (topk < seq_len) ? topk : seq_len;
-
     extern __shared__ __align__(1024) unsigned char smem_raw[];
     const int smem_base_addr = static_cast<int>(__cvta_generic_to_shared(smem_raw));
     unsigned char* smem_ptr = smem_raw;
@@ -394,22 +389,17 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     int* tma_phase = smem_alloc<int>(smem_ptr, kNumStages);
     int* mma_phase = smem_alloc<int>(smem_ptr, kNumStages);
     int* epi_phase = smem_alloc<int>(smem_ptr, kNumStages);
+    int* tmem_reuse_phase_mma = smem_alloc<int>(smem_ptr, kNumTmemSlots);
 
     // Three mbar arrays (tma_done, mma_done, epi_done).
     uint64_t* tma_mbar = smem_alloc<uint64_t>(smem_ptr, kNumStages);
     uint64_t* mma_mbar = smem_alloc<uint64_t>(smem_ptr, kNumStages);
     uint64_t* epi_mbar = smem_alloc<uint64_t>(smem_ptr, kNumStages);
+    uint64_t* tmem_reuse_mbar = smem_alloc<uint64_t>(smem_ptr, kNumTmemSlots);
 
     // Per-stage epilogue candidates (requested per-stage top-k buffer).
     float* stage_tile_scores = smem_alloc<float>(smem_ptr, kNumStages * kStageTokens);
     int* stage_tile_ids = smem_alloc<int>(smem_ptr, kNumStages * kStageTokens);
-
-    // Global rolling top-k (unsorted buffer).
-    float* topk_scores = smem_alloc<float>(smem_ptr, topk);
-    int* topk_ids = smem_alloc<int>(smem_ptr, topk);
-    int* topk_count_ptr = smem_alloc<int>(smem_ptr, 1);
-    float* topk_min_val_ptr = smem_alloc<float>(smem_ptr, 1);
-    int* topk_min_pos_ptr = smem_alloc<int>(smem_ptr, 1);
 
     // TMEM scratch.
     int* tmem_addr_scratch = smem_alloc<int>(smem_ptr, 1);
@@ -420,18 +410,23 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     const int tma_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, tma_mbar);
     const int mma_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, mma_mbar);
     const int epi_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, epi_mbar);
+    const int tmem_reuse_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, tmem_reuse_mbar);
     const int tmem_addr_scratch_addr = smem_addr_from_base(smem_raw, smem_base_addr, tmem_addr_scratch);
 
     // Init barriers and phases.
-    if (warp_id == kProducerWarp && lane < kNumStages) {
-        mbarrier_init(tma_mbar_addr + lane * static_cast<int>(sizeof(uint64_t)), 1);
-        mbarrier_init(mma_mbar_addr + lane * static_cast<int>(sizeof(uint64_t)), 1);
-        mbarrier_init(epi_mbar_addr + lane * static_cast<int>(sizeof(uint64_t)), 1);
-        tma_phase[lane] = 0;
-        mma_phase[lane] = 0;
-        epi_phase[lane] = 0;
-    }
-    if (warp_id == kProducerWarp && lane == 0) {
+    if (warp_id == kProducerWarp && elect_sync()) {
+        for (int i = 0; i < kNumStages; ++i) {
+            mbarrier_init(tma_mbar_addr + i * static_cast<int>(sizeof(uint64_t)), 1);
+            mbarrier_init(mma_mbar_addr + i * static_cast<int>(sizeof(uint64_t)), 1);
+            mbarrier_init(epi_mbar_addr + i * static_cast<int>(sizeof(uint64_t)), 1);
+            tma_phase[i] = 0;
+            mma_phase[i] = 0;
+            epi_phase[i] = 0;
+        }
+        for (int i = 0; i < kNumTmemSlots; ++i) {
+            mbarrier_init(tmem_reuse_mbar_addr + i * static_cast<int>(sizeof(uint64_t)), 1);
+            tmem_reuse_phase_mma[i] = 0;
+        }
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
    // __syncthreads();
@@ -447,24 +442,10 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
         w_stage[idx] = weights_b[idx];
     }
 
-    // Init global rolling top-k.
-    #pragma unroll
-    for (int i = tid; i < topk; i += blockDim.x) {
-        topk_scores[i] = -FLT_MAX;
-        topk_ids[i] = -1;
-    }
     if (tid == 0) {
-        topk_count_ptr[0] = 0;
-        topk_min_val_ptr[0] = -FLT_MAX;
-        topk_min_pos_ptr[0] = 0;
         tmem_addr_scratch[0] = 0;
     }
-   // __syncthreads();
-
-    if (warp_id == kMmaWarp && elect_sync()) {
-        tcgen05_alloc(tmem_addr_scratch_addr, kStageTokens);
-    }
- //   __syncthreads();
+    __syncthreads();
 
     constexpr uint32_t kIdesc = (0U << 7U)    // atype = E4M3
                               | (0U << 10U)   // btype = E4M3
@@ -490,7 +471,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
             int page_idx, valid_tokens;
             prepare_stage_metadata_and_scale_tail(
                 tile_id, stage, seq_len, max_num_pages, num_pages, block_table_b,
-                stage_page_idx, stage_valid_tokens, k_stage_scale, lane,
+                stage_page_idx, stage_valid_tokens, k_stage_scale,
                 page_idx, valid_tokens);
             
 
@@ -514,14 +495,23 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
 
     // ---------------- MMA warp ----------------
     if (warp_id == kMmaWarp && elect_sync()) {
+        tcgen05_alloc(tmem_addr_scratch_addr, kNumTmemSlots * kStageTokens);
         for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
             const int stage = tile_id % kNumStages;
+            const int tmem_slot = tile_id % kNumTmemSlots;
 
  
             mbarrier_wait_parity(
                 tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
                 tma_phase[stage]);
             tma_phase[stage] ^= 1;
+
+            if (tile_id >= kNumTmemSlots) {
+                mbarrier_wait_parity(
+                    tmem_reuse_mbar_addr + tmem_slot * static_cast<int>(sizeof(uint64_t)),
+                    tmem_reuse_phase_mma[tmem_slot]);
+                tmem_reuse_phase_mma[tmem_slot] ^= 1;
+            }
             
         
 
@@ -530,17 +520,18 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                 const int q_addr = q_stage_addr;
                 const int k_addr = k_stage_payload_addr + stage * kStageTokens * kPayloadBytesPerToken;
 
-                uint64_t a_desc = make_desc_kmajor_128b(q_addr);
-                uint64_t b_desc = make_desc_kmajor_128b(k_addr);
+                uint64_t q_desc = make_desc_kmajor_noswizzle(q_addr);
+                uint64_t k_desc = make_desc_kmajor_swizzle_128b(k_addr);
+                const uint32_t tmem_d = static_cast<uint32_t>(tmem_slot * kStageTokens);
 
                 for (int ki = 0; ki < kMmaIters; ++ki) {
-                    tcgen05_mma_f8f6f4(0, a_desc, b_desc, kIdesc, (ki > 0));
-                    a_desc += (kMmaK >> 4);
-                    b_desc += (kMmaK >> 4);
+                    tcgen05_mma_f8f6f4(tmem_d, q_desc, k_desc, kIdesc, (ki > 0));
+                    q_desc += (kMmaK >> 4);
+                    k_desc += (kMmaK >> 4);
                 }
 
                 tcgen05_commit(mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
-            } else if (lane == 0) {
+            } else {
                 mbarrier_arrive(mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
             }
         }
@@ -552,8 +543,9 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
 
         for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
             const int stage = tile_id % kNumStages;
+            const int tmem_slot = tile_id % kNumTmemSlots;
 
-            if (epi_warp == 0 && elect_sync()) {
+            if (epi_warp == 0 && lane == 0) {
                 mbarrier_wait_parity(
                     mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
                     mma_phase[stage]);
@@ -562,7 +554,6 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
 
             // Epilogue warps synchronize before/after TMEM reads and candidate writes.
             asm volatile("bar.sync 1, 64;" ::: "memory");
-
             tcgen05_fence_after_thread_sync();
 
             const int valid_tokens = stage_valid_tokens[stage];
@@ -571,87 +562,47 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
             float* cand_scores = stage_tile_scores + stage * kStageTokens;
             int* cand_ids = stage_tile_ids + stage * kStageTokens;
 
-            // epi_warp 0 reads TMEM rows 0-31 (heads 0..31)
-            // epi_warp 1 reads TMEM rows 32-63 (heads 32..63)
             const int tmem_row_base = epi_warp * 32;
 
-            for (int t = 0; t < valid_tokens; ++t) {
-                // Each warp loads its 32 heads for token t
-                float d = tcgen05_ld_32x32b_1(tmem_row_base, t);
-                tcgen05_wait_ld();
+            for (int token_base = 0; token_base < valid_tokens; token_base += kEpiTokenBlock) {
+                const int rem = valid_tokens - token_base;
+                const int token_count = (rem < kEpiTokenBlock) ? rem : kEpiTokenBlock;
 
-                const float scale = stage_scale[t];
-                const float v = d * scale;
+                float warp_partial[kEpiTokenBlock];
+                ep_compute_warp_partial_block8(
+                    tmem_row_base,
+                    tmem_slot,
+                    token_base,
+                    token_count,
+                    stage_scale,
+                    w_stage,
+                    warp_partial
+                );
 
-                // weight for this lane's head
-                const float w = w_stage[tmem_row_base + lane];
-
-                // ReLU + weighted
-                float my_sum = (v > 0.0f) ? (v * w) : 0.0f;
-
-                // Warp reduction: partial sum over 32 heads
-                for (int off = 16; off > 0; off >>= 1) {
-                    my_sum += __shfl_down_sync(0xFFFFFFFF, my_sum, off);
-                }
-
-                // epi_warp 1 writes partial sum to smem for epi_warp 0 to read
-                if (epi_warp == 1 && lane == 0) {
-                    cand_scores[t] = my_sum;
-                }
-                asm volatile("bar.sync 1, 64;" ::: "memory");
-
-                if (epi_warp == 0 && lane == 0) {
-                    float total = my_sum + cand_scores[t];
-                    cand_scores[t] = total;
-                    cand_ids[t] = page_idx * kPageSize + t;
-                }
-
-                asm volatile("bar.sync 1, 64;" ::: "memory");
+                ep_finalize_two_warp_block8(
+                    epi_warp,
+                    lane,
+                    token_base,
+                    token_count,
+                    page_idx,
+                    warp_partial,
+                    cand_scores,
+                    cand_ids
+                );
             }
 
-            // Top-k insertion: all lanes of epi_warp 0 participate for warp-parallel min-scan
-            // if (epi_warp == 0) {
-            //     int topk_count = topk_count_ptr[0];
-            //     float topk_min_val = topk_min_val_ptr[0];
-            //     int topk_min_pos = topk_min_pos_ptr[0];
-            //
-            //     for (int t = 0; t < valid_tokens; ++t) {
-            //         float sc = cand_scores[t];
-            //         int id = cand_ids[t];
-            //         // Broadcast score/id from smem (lane 0 wrote them)
-            //         topk_insert_unsorted(
-            //             sc, id,
-            //             topk_scores, topk_ids,
-            //             topk_count, actual_topk, lane,
-            //             topk_min_val, topk_min_pos
-            //         );
-            //     }
-            //
-            //     if (lane == 0) {
-            //         topk_count_ptr[0] = topk_count;
-            //         topk_min_val_ptr[0] = topk_min_val;
-            //         topk_min_pos_ptr[0] = topk_min_pos;
-            //         mbarrier_arrive(epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
-            //     }
-            // }
+            // Both epilogue warps must finish all reads from this slot before signaling reuse.
+            asm volatile("bar.sync 1, 64;" ::: "memory");
             if (epi_warp == 0 && lane == 0) {
+                mbarrier_arrive(tmem_reuse_mbar_addr + tmem_slot * static_cast<int>(sizeof(uint64_t)));
                 mbarrier_arrive(epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
             }
         }
     }
 
     __syncthreads();
-
-    // if (warp_id == kEpilogueWarpBase) {
-    //     const int topk_count = topk_count_ptr[0];
-    //     for (int i = lane; i < actual_topk; i += 32) {
-    //         out_b[i] = (i < topk_count) ? topk_ids[i] : -1;
-    //     }
-    // }
-
-    __syncthreads();
-    if (warp_id == kMmaWarp) {
-        tcgen05_dealloc(0, kStageTokens);
+    if (warp_id == kMmaWarp && elect_sync()) {
+        tcgen05_dealloc(0, kNumTmemSlots * kStageTokens);
     }
 
 }

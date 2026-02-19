@@ -5,7 +5,7 @@ import sys
 import subprocess
 from pathlib import Path
 
-from app import app, sync_sglang, run_eval, run_kernel_test
+from app_reuse import app, sync_sglang, run_eval, run_eval_reuse_ephemeral, run_kernel_test
 from format import format_result
 
 EVAL_ROOT = Path(__file__).parent.parent  # eval_suite/
@@ -160,6 +160,7 @@ def run_single(
     random_tests: int | None = None,
     real_tests: int | None = None,
     random_seed: int = 42,
+    ephemeral_reuse: bool = False,
 ):
     task_dir = get_task_dir(task)
 
@@ -183,7 +184,8 @@ def run_single(
     _log(f"Running {mode} for task '{task}' on Modal...")
     solution_name = submission.stem
     with app.run():
-        result = run_eval.remote(
+        run_fn = run_eval_reuse_ephemeral if ephemeral_reuse else run_eval
+        result = run_fn.remote(
             submission_code,
             tests_content,
             mode,
@@ -217,7 +219,23 @@ def main():
         action="store_true",
         help="Shortcut for --task dsa_attn_2048",
     )
-    parser.add_argument("--no-sync", action="store_true", help="Skip syncing eval_suite")
+    parser.add_argument(
+        "--sync",
+        dest="no_sync",
+        action="store_false",
+        help="Sync eval_suite before running (disabled by default)",
+    )
+    parser.add_argument(
+        "--no-sync",
+        dest="no_sync",
+        action="store_true",
+        help="Skip syncing eval_suite (default)",
+    )
+    parser.add_argument(
+        "--ephemeral-reuse",
+        action="store_true",
+        help="Use ephemeral reuse eval entrypoint (no persistent cache sync)",
+    )
     parser.add_argument(
         "--trace",
         nargs="?",
@@ -317,7 +335,7 @@ def main():
 
     # Handle sync-only mode (no GPU needed)
     if args.sync_only:
-        from app import _sync_directory, LOCAL_EVAL_SUITE, VOLUME_EVAL_SUITE, SGLANG_MANIFEST_PATH, SYNC_EXTENSIONS
+        from app_reuse import _sync_directory, LOCAL_EVAL_SUITE, VOLUME_EVAL_SUITE, SGLANG_MANIFEST_PATH, SYNC_EXTENSIONS
         _log("Syncing eval_suite to Modal volume (including safetensors)...")
         changed = _sync_directory(
             local_root=LOCAL_EVAL_SUITE,
@@ -340,6 +358,9 @@ def main():
 
     output = Path(args.output)
     trace_dir = Path(args.trace) if args.trace else None
+    if args.no_sync is None:
+        args.no_sync = True
+
     run_single(
         submission,
         output,
@@ -350,6 +371,7 @@ def main():
         random_tests=args.random,
         real_tests=args.real,
         random_seed=args.seed,
+        ephemeral_reuse=args.ephemeral_reuse,
     )
 
 

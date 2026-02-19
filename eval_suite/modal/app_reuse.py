@@ -39,14 +39,6 @@ VOLUME_EVAL_SUITE = PurePosixPath("/eval_suite")
 REMOTE_OUTPUTS = PurePosixPath("/outputs")  # Volume path for output sync
 SGLANG_MANIFEST_PATH = "/manifest.json"
 
-# Compile-cache paths (system paths are ephemeral; volume paths are persistent).
-SYS_TORCH_EXTENSIONS_DIR = Path("/root/.cache/torch_extensions")
-SYS_CUDA_COMPUTE_CACHE_DIR = Path("/root/.nv/ComputeCache")
-VOL_CACHE_ROOT = Path("/kernel_data/kernel_cache")
-VOL_TORCH_EXTENSIONS_DIR = VOL_CACHE_ROOT / "torch_extensions"
-VOL_CUDA_COMPUTE_CACHE_DIR = VOL_CACHE_ROOT / "cuda_compute"
-
-
 ADDITIONAL_DEPS = [
     "transformers==5.0.0",
     "safetensors",
@@ -54,58 +46,6 @@ ADDITIONAL_DEPS = [
 
 
 LLM_MODEL_DEFAULT = os.environ.get("LLM_MODEL", "zai-org/GLM-4.7-Flash")
-
-
-def _count_files(root: Path) -> int:
-    if not root.exists():
-        return 0
-    return sum(1 for p in root.rglob("*") if p.is_file())
-
-
-def _count_so_files(root: Path) -> int:
-    if not root.exists():
-        return 0
-    return sum(1 for p in root.rglob("*.so") if p.is_file())
-
-
-def _copy_tree_replace(src: Path, dst: Path) -> None:
-    if dst.exists():
-        shutil.rmtree(dst)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if src.exists():
-        shutil.copytree(src, dst)
-    else:
-        dst.mkdir(parents=True, exist_ok=True)
-
-
-def _restore_compile_cache_from_volume() -> dict[str, int]:
-    VOL_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-    VOL_TORCH_EXTENSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    VOL_CUDA_COMPUTE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    _copy_tree_replace(VOL_TORCH_EXTENSIONS_DIR, SYS_TORCH_EXTENSIONS_DIR)
-    _copy_tree_replace(VOL_CUDA_COMPUTE_CACHE_DIR, SYS_CUDA_COMPUTE_CACHE_DIR)
-
-    return {
-        "torch_files": _count_files(SYS_TORCH_EXTENSIONS_DIR),
-        "torch_so_files": _count_so_files(SYS_TORCH_EXTENSIONS_DIR),
-        "cuda_files": _count_files(SYS_CUDA_COMPUTE_CACHE_DIR),
-    }
-
-
-def _save_compile_cache_to_volume() -> dict[str, int]:
-    VOL_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-    VOL_TORCH_EXTENSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    VOL_CUDA_COMPUTE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    _copy_tree_replace(SYS_TORCH_EXTENSIONS_DIR, VOL_TORCH_EXTENSIONS_DIR)
-    _copy_tree_replace(SYS_CUDA_COMPUTE_CACHE_DIR, VOL_CUDA_COMPUTE_CACHE_DIR)
-
-    return {
-        "torch_files": _count_files(VOL_TORCH_EXTENSIONS_DIR),
-        "torch_so_files": _count_so_files(VOL_TORCH_EXTENSIONS_DIR),
-        "cuda_files": _count_files(VOL_CUDA_COMPUTE_CACHE_DIR),
-    }
 
 
 def _build_image() -> modal.Image:
@@ -362,81 +302,119 @@ def run_eval(
     op_type: str | None = None,
     task: str = "sparse_attention",
 ) -> dict:
-    """Run eval_suite task eval remotely."""
+    """Run eval_suite task eval remotely with minimal GPU-side overhead."""
+    return _run_eval_impl(
+        submission_code=submission_code,
+        tests_content=tests_content,
+        mode=mode,
+        trace_dir=trace_dir,
+        definition_name=definition_name,
+        solution_name=solution_name,
+        op_type=op_type,
+        task=task,
+    )
+
+
+@app.function(
+    image=image,
+    volumes={str(VOLUME_MOUNT_PATH): volume},
+    gpu=_gpu_type(),
+    timeout=1200,
+)
+def run_eval_reuse_ephemeral(
+    submission_code: str,
+    tests_content: str,
+    mode: str = "test",
+    trace_dir: str | None = None,
+    definition_name: str | None = None,
+    solution_name: str | None = None,
+    op_type: str | None = None,
+    task: str = "sparse_attention",
+) -> dict:
+    """Run eval with ephemeral reuse only (warm-container local caches; no volume cache sync)."""
+    return _run_eval_impl(
+        submission_code=submission_code,
+        tests_content=tests_content,
+        mode=mode,
+        trace_dir=trace_dir,
+        definition_name=definition_name,
+        solution_name=solution_name,
+        op_type=op_type,
+        task=task,
+    )
+
+
+def _run_eval_impl(
+    submission_code: str,
+    tests_content: str,
+    mode: str = "test",
+    trace_dir: str | None = None,
+    definition_name: str | None = None,
+    solution_name: str | None = None,
+    op_type: str | None = None,
+    task: str = "sparse_attention",
+) -> dict:
+    """Shared implementation for eval execution."""
     import sys
 
-    cache_sync = {"restore": {}, "save": {}, "errors": []}
+    task_path = TASK_PATHS.get(task, f"test_kernels/{task}")
+    work = Path(CONTAINER_EVAL_SUITE / task_path)
+    work.mkdir(parents=True, exist_ok=True)
 
-    try:
+    (work / "submission.py").write_text(submission_code)
+    (work / "tests.txt").write_text(tests_content)
+
+    r, w = os.pipe()
+    os.set_inheritable(w, True)
+    env = os.environ.copy()
+    env["POPCORN_FD"] = str(w)
+    if definition_name:
+        env["TRACE_DEFINITION"] = definition_name
+    if solution_name:
+        env["TRACE_SOLUTION"] = solution_name
+    if op_type:
+        env["TRACE_OP_TYPE"] = op_type
+    if trace_dir:
+        env["TRACE_OUT"] = trace_dir
+        Path(trace_dir).mkdir(parents=True, exist_ok=True)
+
+    proc = subprocess.Popen(
+        [sys.executable, "eval.py", mode, "tests.txt"],
+        cwd=str(work),
+        env=env,
+        pass_fds=(w,),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    os.close(w)
+
+    stdout, stderr = proc.communicate()
+    output = os.read(r, 1 << 20).decode()
+    os.close(r)
+
+    result = {
+        "popcorn": output,
+        "stdout": stdout.decode(errors="replace"),
+        "stderr": stderr.decode(errors="replace"),
+        "mode": mode,
+        "system": _system_info(),
+    }
+    if trace_dir:
+        import base64
+        import tarfile
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
         try:
-            cache_sync["restore"] = _restore_compile_cache_from_volume()
-        except Exception as exc:
-            cache_sync["errors"].append(f"restore_failed: {exc}")
+            with tarfile.open(tmp_path, "w:gz") as tar:
+                tar.add(trace_dir, arcname=".")
+            payload = tmp_path.read_bytes()
+            result["trace_archive_b64"] = base64.b64encode(payload).decode("ascii")
+            result["trace_archive_name"] = "trace.tar.gz"
+        finally:
+            tmp_path.unlink(missing_ok=True)
+            shutil.rmtree(trace_dir, ignore_errors=True)
 
-        task_path = TASK_PATHS.get(task, f"test_kernels/{task}")
-        work = Path(CONTAINER_EVAL_SUITE / task_path)
-        work.mkdir(parents=True, exist_ok=True)
-
-        (work / "submission.py").write_text(submission_code)
-        (work / "tests.txt").write_text(tests_content)
-
-        r, w = os.pipe()
-        os.set_inheritable(w, True)
-        env = os.environ.copy()
-        env["POPCORN_FD"] = str(w)
-        if definition_name:
-            env["TRACE_DEFINITION"] = definition_name
-        if solution_name:
-            env["TRACE_SOLUTION"] = solution_name
-        if op_type:
-            env["TRACE_OP_TYPE"] = op_type
-        if trace_dir:
-            env["TRACE_OUT"] = trace_dir
-            Path(trace_dir).mkdir(parents=True, exist_ok=True)
-
-        proc = subprocess.Popen(
-            [sys.executable, "eval.py", mode, "tests.txt"],
-            cwd=str(work),
-            env=env,
-            pass_fds=(w,),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        os.close(w)
-
-        stdout, stderr = proc.communicate()
-        output = os.read(r, 1 << 20).decode()
-        os.close(r)
-
-        result = {
-            "popcorn": output,
-            "stdout": stdout.decode(errors="replace"),
-            "stderr": stderr.decode(errors="replace"),
-            "mode": mode,
-            "system": _system_info(),
-        }
-        if trace_dir:
-            import base64
-            import tarfile
-            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-                tmp_path = Path(tmp.name)
-            try:
-                with tarfile.open(tmp_path, "w:gz") as tar:
-                    tar.add(trace_dir, arcname=".")
-                payload = tmp_path.read_bytes()
-                result["trace_archive_b64"] = base64.b64encode(payload).decode("ascii")
-                result["trace_archive_name"] = "trace.tar.gz"
-            finally:
-                tmp_path.unlink(missing_ok=True)
-                shutil.rmtree(trace_dir, ignore_errors=True)
-
-        result["cache_sync"] = cache_sync
-        return result
-    finally:
-        try:
-            cache_sync["save"] = _save_compile_cache_to_volume()
-        except Exception as exc:
-            cache_sync["errors"].append(f"save_failed: {exc}")
+    return result
 
 
 @app.function(
@@ -656,4 +634,5 @@ __all__ = [
     "volume_shell",
     "gpu_shell",
     "run_eval",
+    "run_eval_reuse_ephemeral",
 ]
