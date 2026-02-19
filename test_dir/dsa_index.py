@@ -19,7 +19,6 @@ cuda_src = """
 #include <cstddef>
 #include <climits>
 #include <cstdint>
-#include <cstdio>
 
 // ---------------------------------------------------------------------------------
 // Constants
@@ -35,7 +34,7 @@ constexpr int kPageBytes = kPageSize * kRowBytes;      // 8448
 constexpr int kPackedFp8Bytes = kPageSize * kHeadDim;  // 8192
 
 constexpr int kStageTokens = 64;
-constexpr int kNumStages = 10;
+constexpr int kNumStages = 8;
 constexpr int kNumTmemSlots = 8;
 static_assert(kNumTmemSlots * kStageTokens <= 512, "TMEM columns exceed hardware limit");
 
@@ -137,10 +136,6 @@ __device__ inline void mbarrier_wait_parity(int mbar_addr, int phase) {
         uint64_t now_ns = 0;
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now_ns));
         if (now_ns - start_ns > kTimeoutNs) {
-            if (threadIdx.x == 0) {
-                printf("MBAR timeout: addr=%d phase=%d waited_ns=%llu\\n",
-                       mbar_addr, phase, (unsigned long long)(now_ns - start_ns));
-            }
             asm volatile("trap;");
         }
     }
@@ -254,61 +249,70 @@ __device__ inline void tcgen05_fence_after_thread_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 }
 
-__device__ inline float tcgen05_ld_32x32b_1(int row, int col) {
-    float val;
-    int addr = (row << 16) | col;
-    asm volatile("tcgen05.ld.sync.aligned.32x32b.x1.b32 {%0}, [%1];"
-                 : "=f"(val) : "r"(addr));
-    return val;
+__device__ inline void tcgen05_ld_32x32b_64(int lane_base, int col_base, float out_vals[kStageTokens]) {
+    const int addr = (lane_base << 16) | col_base;
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x64.b32 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, "
+        "%24, %25, %26, %27, %28, %29, %30, %31, "
+        "%32, %33, %34, %35, %36, %37, %38, %39, "
+        "%40, %41, %42, %43, %44, %45, %46, %47, "
+        "%48, %49, %50, %51, %52, %53, %54, %55, "
+        "%56, %57, %58, %59, %60, %61, %62, %63}, [%64];"
+        : "=f"(out_vals[0]), "=f"(out_vals[1]), "=f"(out_vals[2]), "=f"(out_vals[3]),
+          "=f"(out_vals[4]), "=f"(out_vals[5]), "=f"(out_vals[6]), "=f"(out_vals[7]),
+          "=f"(out_vals[8]), "=f"(out_vals[9]), "=f"(out_vals[10]), "=f"(out_vals[11]),
+          "=f"(out_vals[12]), "=f"(out_vals[13]), "=f"(out_vals[14]), "=f"(out_vals[15]),
+          "=f"(out_vals[16]), "=f"(out_vals[17]), "=f"(out_vals[18]), "=f"(out_vals[19]),
+          "=f"(out_vals[20]), "=f"(out_vals[21]), "=f"(out_vals[22]), "=f"(out_vals[23]),
+          "=f"(out_vals[24]), "=f"(out_vals[25]), "=f"(out_vals[26]), "=f"(out_vals[27]),
+          "=f"(out_vals[28]), "=f"(out_vals[29]), "=f"(out_vals[30]), "=f"(out_vals[31]),
+          "=f"(out_vals[32]), "=f"(out_vals[33]), "=f"(out_vals[34]), "=f"(out_vals[35]),
+          "=f"(out_vals[36]), "=f"(out_vals[37]), "=f"(out_vals[38]), "=f"(out_vals[39]),
+          "=f"(out_vals[40]), "=f"(out_vals[41]), "=f"(out_vals[42]), "=f"(out_vals[43]),
+          "=f"(out_vals[44]), "=f"(out_vals[45]), "=f"(out_vals[46]), "=f"(out_vals[47]),
+          "=f"(out_vals[48]), "=f"(out_vals[49]), "=f"(out_vals[50]), "=f"(out_vals[51]),
+          "=f"(out_vals[52]), "=f"(out_vals[53]), "=f"(out_vals[54]), "=f"(out_vals[55]),
+          "=f"(out_vals[56]), "=f"(out_vals[57]), "=f"(out_vals[58]), "=f"(out_vals[59]),
+          "=f"(out_vals[60]), "=f"(out_vals[61]), "=f"(out_vals[62]), "=f"(out_vals[63])
+        : "r"(addr));
 }
 
-constexpr int kEpiTokenBlock = 8;
-
-__device__ inline void ep_compute_warp_partial_block8(
-    int tmem_row_base,
-    int tmem_slot,
-    int token_base,
-    int token_count,
+__device__ inline void ep_compute_all_stage_after_ld64(
+    int epi_warp,
+    int lane,
+    int valid_tokens,
+    int page_idx,
     const float* stage_scale,
+    const float lane_regs[kStageTokens],
     const float* w_stage,
-    float out_partial[kEpiTokenBlock]
+    float* cand_scores,
+    int* cand_ids
 ) {
-    const int lane = static_cast<int>(threadIdx.x & 31);
+    const int tmem_row_base = epi_warp * 32;
     const float w = w_stage[tmem_row_base + lane];
+    float warp_partial[kStageTokens];
+
     #pragma unroll
-    for (int i = 0; i < kEpiTokenBlock; ++i) {
+    for (int token = 0; token < kStageTokens; ++token) {
         float lane_val = 0.0f;
-        if (i < token_count) {
-            const int token = token_base + i;
-            const int col = tmem_slot * kStageTokens + token;
-            const float d = tcgen05_ld_32x32b_1(tmem_row_base + lane, col);
-            tcgen05_wait_ld();
-            const float v = d * stage_scale[token];
-            lane_val = (v > 0.0f) ? (v * w) : 0.0f;
+        if (token < valid_tokens) {
+            lane_val = fmaxf(lane_regs[token] * stage_scale[token], 0.0f) * w;
         }
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
             lane_val += __shfl_down_sync(0xFFFFFFFF, lane_val, off);
         }
-        out_partial[i] = lane_val;
+        warp_partial[token] = lane_val;
     }
-}
 
-__device__ inline void ep_finalize_two_warp_block8(
-    int epi_warp,
-    int lane,
-    int token_base,
-    int token_count,
-    int page_idx,
-    const float warp_partial[kEpiTokenBlock],
-    float* cand_scores,
-    int* cand_ids
-) {
     if (epi_warp == 1 && lane == 0) {
         #pragma unroll
-        for (int i = 0; i < kEpiTokenBlock; ++i) {
-            if (i < token_count) {
-                cand_scores[token_base + i] = warp_partial[i];
+        for (int token = 0; token < kStageTokens; ++token) {
+            if (token < valid_tokens) {
+                cand_scores[token] = warp_partial[token];
             }
         }
     }
@@ -316,10 +320,9 @@ __device__ inline void ep_finalize_two_warp_block8(
 
     if (epi_warp == 0 && lane == 0) {
         #pragma unroll
-        for (int i = 0; i < kEpiTokenBlock; ++i) {
-            if (i < token_count) {
-                const int token = token_base + i;
-                cand_scores[token] = warp_partial[i] + cand_scores[token];
+        for (int token = 0; token < kStageTokens; ++token) {
+            if (token < valid_tokens) {
+                cand_scores[token] = warp_partial[token] + cand_scores[token];
                 cand_ids[token] = page_idx * kPageSize + token;
             }
         }
@@ -494,8 +497,10 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     }
 
     // ---------------- MMA warp ----------------
-    if (warp_id == kMmaWarp && elect_sync()) {
+    if (warp_id == kMmaWarp) {
         tcgen05_alloc(tmem_addr_scratch_addr, kNumTmemSlots * kStageTokens);
+    }
+    if (warp_id == kMmaWarp && elect_sync()) {
         for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
             const int stage = tile_id % kNumStages;
             const int tmem_slot = tile_id % kNumTmemSlots;
@@ -552,47 +557,34 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                 mma_phase[stage] ^= 1;
             }
 
-            // Epilogue warps synchronize before/after TMEM reads and candidate writes.
+            // Both EP warps synchronize with warp0's mma_mbar wait.
             asm volatile("bar.sync 1, 64;" ::: "memory");
             tcgen05_fence_after_thread_sync();
 
             const int valid_tokens = stage_valid_tokens[stage];
-            const int page_idx = stage_page_idx[stage];
-            const float* stage_scale = k_stage_scale + stage * kStageTokens;
-            float* cand_scores = stage_tile_scores + stage * kStageTokens;
-            int* cand_ids = stage_tile_ids + stage * kStageTokens;
+            if (valid_tokens > 0) {
+                const int tmem_row_base = epi_warp * 32;
+                const int tmem_col_base = tmem_slot * kStageTokens;
+                float lane_regs[kStageTokens];
+                tcgen05_ld_32x32b_64(tmem_row_base, tmem_col_base, lane_regs);
+                tcgen05_wait_ld();
 
-            const int tmem_row_base = epi_warp * 32;
-
-            for (int token_base = 0; token_base < valid_tokens; token_base += kEpiTokenBlock) {
-                const int rem = valid_tokens - token_base;
-                const int token_count = (rem < kEpiTokenBlock) ? rem : kEpiTokenBlock;
-
-                float warp_partial[kEpiTokenBlock];
-                ep_compute_warp_partial_block8(
-                    tmem_row_base,
-                    tmem_slot,
-                    token_base,
-                    token_count,
-                    stage_scale,
-                    w_stage,
-                    warp_partial
-                );
-
-                ep_finalize_two_warp_block8(
+                const int page_idx = stage_page_idx[stage];
+                const float* stage_scale = k_stage_scale + stage * kStageTokens;
+                float* cand_scores = stage_tile_scores + stage * kStageTokens;
+                int* cand_ids = stage_tile_ids + stage * kStageTokens;
+                ep_compute_all_stage_after_ld64(
                     epi_warp,
                     lane,
-                    token_base,
-                    token_count,
+                    valid_tokens,
                     page_idx,
-                    warp_partial,
+                    stage_scale,
+                    lane_regs,
+                    w_stage,
                     cand_scores,
                     cand_ids
                 );
             }
-
-            // Both epilogue warps must finish all reads from this slot before signaling reuse.
-            asm volatile("bar.sync 1, 64;" ::: "memory");
             if (epi_warp == 0 && lane == 0) {
                 mbarrier_arrive(tmem_reuse_mbar_addr + tmem_slot * static_cast<int>(sizeof(uint64_t)));
                 mbarrier_arrive(epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
@@ -601,7 +593,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     }
 
     __syncthreads();
-    if (warp_id == kMmaWarp && elect_sync()) {
+    if (warp_id == kMmaWarp) {
         tcgen05_dealloc(0, kNumTmemSlots * kStageTokens);
     }
 
@@ -753,10 +745,11 @@ def _get_module():
             cuda_sources=cuda_src,
             functions=["dsa_topk_indexer_launch"],
             verbose=True,
+            no_implicit_headers=True,
             extra_cuda_cflags=[
-                "-O3",
+                "-O1",
                 "-gencode=arch=compute_100a,code=sm_100a",
-                "--threads=4",
+                "--split-compile=4",
                 "--relocatable-device-code=false",
             ],
             extra_ldflags=["-lcuda"],
