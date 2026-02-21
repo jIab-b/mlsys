@@ -91,13 +91,13 @@ __device__ inline uint64_t make_desc_kmajor_swizzle_128b(int smem_addr) {
 }
 
 __device__ inline uint64_t make_desc_kmajor_noswizzle(int smem_addr) {
-    // No-swizzle K-major candidates:
-    // const int lbo = 64 * 16;   // canonical-style (M=64 => 1024)
-    // const int sbo = 8 * 16;    // canonical-style (128)
+    //No-swizzle K-major candidates:
+    const int lbo = 64 * 16;   // canonical-style (M=64 => 1024)
+    const int sbo = 8 * 16;    // canonical-style (128)
     // const int lbo = 16;        // older interpretation (current)
     // const int sbo = 8 * 128;   // older interpretation (current)
-    const int lbo = 16;
-    const int sbo = 8 * 128;
+    // const int lbo = 16;
+    // const int sbo = 8 * 128;
     return desc_encode(static_cast<uint64_t>(smem_addr)) |
            (desc_encode(static_cast<uint64_t>(lbo)) << 16ULL) |
            (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
@@ -603,8 +603,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     if (seq_len > max_seq_by_pages) seq_len = max_seq_by_pages;
 
     for (int i = tid; i < topk; i += blockDim.x) {
-        // Debug path: initialize EP dump buffer with -inf (as fp32 bit pattern in int32).
-        epi_tests_b[i] = __float_as_int(-__int_as_float(0x7f800000));
+        epi_tests_b[i] = -1;
     }
     __syncthreads();
 
@@ -865,9 +864,6 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                         if (token < chunk_valid) {
                             cand_scores[token] = warp_partial_lo[token] + warp_partial_hi[token];
                             cand_ids[token] = page_idx * kPageSize + token_base + token;
-                            const int local_tok = tile_id * kStageTokens + token_base + token;
-                            // epi_tests[tile] = EP values before top-k (fp32 bits stored in int32 buffer).
-                            if (local_tok < topk) epi_tests_b[local_tok] = __float_as_int(cand_scores[token]);
                         }
                     }
                 }
@@ -899,6 +895,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
             const int stage = tile_id % kNumStages;
             const int phase = (tile_id / kNumStages) & 1;
 
+            // Wait for epilogue to finish writing this stage's candidates.
             if (topk_warp == 0 && lane == 0) {
                 mbarrier_wait_parity(
                     epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
@@ -906,14 +903,61 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
             }
             topk_team_barrier_8warps();
 
-            // Top-k is intentionally stubbed for debug/isolation:
-            // consume EP completion and immediately release stage reuse.
+            // Step 1: Compact — warps 0-1 filter 64 candidates against cutoff.
+            const int valid_tokens = stage_valid_tokens[stage];
+            const float cutoff = topk_cutoff_ptr[0];
+            topk_compact_stage_two_warps(
+                topk_warp, lane, valid_tokens,
+                stage_tile_scores + stage * kStageTokens,
+                stage_tile_ids + stage * kStageTokens,
+                cutoff,
+                topk_stage_compact_scores,
+                topk_stage_compact_ids,
+                topk_stage_compact_counts);
+
+            topk_team_barrier_8warps();
+
+            // Step 2: Update local heaps — warps 2-7 consume compacted survivors.
+            const int cc0 = topk_stage_compact_counts[0];
+            const int cc1 = topk_stage_compact_counts[1];
+            topk_process_compact_batch(
+                topk_warp, lane, cc0, cc1,
+                topk_stage_compact_scores,
+                topk_stage_compact_ids,
+                topk_local_heap_scores,
+                topk_local_heap_ids,
+                topk_local_heap_sizes,
+                topk_local_heap_ready,
+                topk);
+
+            // Step 3: Update global cutoff from local heap roots.
+            topk_update_global_cutoff_from_locals(
+                topk_warp, lane,
+                topk_local_heap_scores,
+                topk_local_heap_sizes,
+                topk_local_heap_ready,
+                topk_cutoff_ptr,
+                topk);
+
+            topk_team_barrier_8warps();
+
+            // Release stage for TMA reuse.
             if (topk_warp == 0 && lane == 0) {
                 mbarrier_arrive(topk_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
             }
             topk_team_barrier_8warps();
         }
-        // Top-k remains stubbed; output carries EP dump values.
+
+        // After all tiles: merge 6 local heaps into global heap, emit sorted result.
+        topk_merge_local_heaps_to_global(
+            topk_warp, lane,
+            topk_local_heap_scores,
+            topk_local_heap_ids,
+            topk_local_heap_sizes,
+            topk_heap_scores,
+            topk_heap_ids,
+            epi_tests_b,
+            topk);
     }
 
     __syncthreads();
@@ -1108,20 +1152,7 @@ def _dsa_topk_indexer(
 def custom_kernel(data: input_t) -> output_t:
     q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
     batch = int(q_index_fp8.shape[0])
-    epi_tests = torch.empty((batch, block_table.size(1) * 64), dtype=torch.int32, device=q_index_fp8.device)
-    _dsa_topk_indexer(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, epi_tests)
-    
-
-    scores = epi_tests.view(torch.float32)
-    actual_topk = min(2048, scores.size(1))
-    _, topk_idx = torch.topk(scores, actual_topk, dim=1)
-
-    page_slot = topk_idx // 64
-    offset = topk_idx % 64
-    global_page = block_table.to(torch.long).gather(1, page_slot.to(torch.long))
-    topk_tokens = (global_page * 64 + offset.to(torch.long)).to(torch.int32)
-
-    topk_indices = torch.full((batch, 2048), -1, dtype=torch.int32, device=q_index_fp8.device)
-    topk_indices[:, :actual_topk] = topk_tokens
-
+    topk = 2048
+    topk_indices = torch.full((batch, topk), -1, dtype=torch.int32, device=q_index_fp8.device)
+    _dsa_topk_indexer(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_indices)
     return (topk_indices,)

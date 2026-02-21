@@ -1105,7 +1105,8 @@ def _dsa_topk_indexer(
 def custom_kernel(data: input_t) -> output_t:
     q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
     batch = int(q_index_fp8.shape[0])
-    epi_tests = torch.empty((batch, block_table.size(1) * 64), dtype=torch.int32, device=q_index_fp8.device)
+    # Fill with -inf so unwritten slots never win torch.topk
+    epi_tests = torch.full((batch, block_table.size(1) * 64), float('-inf'), dtype=torch.float32, device=q_index_fp8.device).view(torch.int32)
     _dsa_topk_indexer(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, epi_tests)
 
 
