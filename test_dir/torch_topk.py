@@ -724,13 +724,13 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                 topk_phase[stage] ^= 1;
             }
 
-            int page_idx, valid_tokens; 
+            int page_idx, valid_tokens;
             // per stage metadata, block table for k_idx, sfs, zeroing for final batch
             prepare_stage_metadata_and_scale_tail(
                 tile_id, stage, seq_len, max_num_pages, num_pages, block_table_b,
                 stage_page_idx, stage_valid_tokens, k_stage_scale,
                 page_idx, valid_tokens);
-            
+
 
 
             if (valid_tokens > 0) {
@@ -761,7 +761,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
             const int stage = tile_id % kNumStages;
             const int tmem_slot = tile_id % kNumTmemSlots;
 
- 
+
             mbarrier_wait_parity(
                 tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
                 tma_phase[stage]);
@@ -773,8 +773,8 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                     tmem_reuse_phase_mma[tmem_slot]);
                 tmem_reuse_phase_mma[tmem_slot] ^= 1;
             }
-            
-        
+
+
 
             const int valid_tokens = stage_valid_tokens[stage];
             if (valid_tokens > 0) {
@@ -1110,7 +1110,7 @@ def custom_kernel(data: input_t) -> output_t:
     batch = int(q_index_fp8.shape[0])
     epi_tests = torch.empty((batch, block_table.size(1) * 64), dtype=torch.int32, device=q_index_fp8.device)
     _dsa_topk_indexer(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, epi_tests)
-    
+
 
     scores = epi_tests.view(torch.float32)
     actual_topk = min(2048, scores.size(1))
