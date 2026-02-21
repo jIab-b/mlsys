@@ -77,13 +77,11 @@ __device__ inline constexpr uint64_t desc_encode(uint64_t x) {
 }
 
 __device__ inline uint64_t make_desc_kmajor_swizzle_128b(int smem_addr) {
-    // K-major swizzle candidates:
-    // 128B swizzle (bits 61:63 = 2): const int sbo = 8 * 128;   // current
-    // 64B swizzle  (bits 61:63 = 4): const int sbo = 8 * 64;
-    // 32B swizzle  (bits 61:63 = 6): const int sbo = 8 * 32;
-    // LBO is not used for K-major swizzled layouts (assumed 1).
-    // Optional encoded LBO field (typically ignored in this mode): const int lbo = 16;
-    const int sbo = 8 * 128;
+    // 128B swizzle: each 8x128B chunk is the unit, swizzled internally.
+    // SBO = stride from one 8-row group to the next within the 128B-wide chunk.
+    // LBO is implicit (hardware knows adjacent 16B columns are +16B apart within 128B row).
+    // Swizzle mode in bits 61:63 = 2 (128B).
+    const int sbo = 8 * 128;  // = 1024
     return desc_encode(static_cast<uint64_t>(smem_addr)) |
            (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
            (1ULL << 46ULL) |
@@ -91,13 +89,12 @@ __device__ inline uint64_t make_desc_kmajor_swizzle_128b(int smem_addr) {
 }
 
 __device__ inline uint64_t make_desc_kmajor_noswizzle(int smem_addr) {
-    // No-swizzle K-major candidates:
-    // const int lbo = 64 * 16;   // canonical-style (M=64 => 1024)
-    // const int sbo = 8 * 16;    // canonical-style (128)
-    // const int lbo = 16;        // older interpretation (current)
-    // const int sbo = 8 * 128;   // older interpretation (current)
-    const int lbo = 16;
-    const int sbo = 8 * 128;
+    // No-swizzle: each 8x16B core matrix is contiguous. Columns of CMs are contiguous.
+    // LBO = stride from one 16B column to the next = height * 16B (height=64 for Q).
+    // SBO = stride from one 8-row group to the next within a column = 8 * 16B.
+    // Swizzle mode in bits 61:63 = 0 (none).
+    const int lbo = 64 * 16;  // = 1024 (Q tile height=64, each row=16B in a column)
+    const int sbo = 8 * 16;   // = 128  (one core matrix = 8 rows * 16B)
     return desc_encode(static_cast<uint64_t>(smem_addr)) |
            (desc_encode(static_cast<uint64_t>(lbo)) << 16ULL) |
            (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
