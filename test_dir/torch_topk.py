@@ -7,6 +7,7 @@ from task import input_t, output_t
 
 
 _module = None
+_DEBUG_PRINTED_POST_ONCE = False
 
 
 cuda_src = """
@@ -38,30 +39,117 @@ constexpr int kNumStages = 8;
 constexpr int kNumTmemSlots = 8;
 static_assert(kNumTmemSlots * kStageTokens <= 512, "TMEM columns exceed hardware limit");
 
-constexpr int kEpilogueWarpBase = 0;
+constexpr int kNumEpTopkWarpgroups = 4;
+constexpr int kWarpsPerWarpgroup = 4;
+constexpr int kEpTopkWarpCount = kNumEpTopkWarpgroups * kWarpsPerWarpgroup;  // 16
 constexpr int kNumEpilogueWarps = 8;
-constexpr int kProducerWarp = kEpilogueWarpBase + kNumEpilogueWarps;
-constexpr int kMmaWarp = kProducerWarp + 1;
-constexpr int kTopkWarpBase = kMmaWarp + 1;
 constexpr int kNumTopkWarps = 8;
+constexpr int kProducerWarp = kEpTopkWarpCount;
+constexpr int kMmaWarp = kProducerWarp + 1;
 constexpr int kNumTopkConsumeWarps = 2;
 constexpr int kTopkUpdateWarpBase = kNumTopkConsumeWarps;
 constexpr int kNumTopkUpdateWarps = kNumTopkWarps - kNumTopkConsumeWarps;
-constexpr int kNumWarps = kTopkWarpBase + kNumTopkWarps;
+constexpr int kNumWarps = kMmaWarp + 1;
 constexpr int kThreadsPerBlock = kNumWarps * 32;
+
+constexpr int kTopk = 2048;
+constexpr int kPreDebugSamples = 4;
+constexpr int kPostDebugSamples = 12;
+constexpr int kDebugSamples = kPostDebugSamples;
 
 constexpr int kMmaK = 32;
 constexpr int kMmaIters = kHeadDim / kMmaK;  // 4
 constexpr int kDesiredDynamicSmemBytes = 228 * 1024 - 2048;
 
 // ---------------------------------------------------------------------------------
-// Device helpers
+// Shared memory layout — all smem allocations in one struct
 // ---------------------------------------------------------------------------------
-__device__ inline int smem_addr_from_base(const void* base_ptr, int base_addr, const void* ptr) {
-    return base_addr + static_cast<int>(
-        reinterpret_cast<const unsigned char*>(ptr) - reinterpret_cast<const unsigned char*>(base_ptr));
+struct __align__(1024) SmemLayout {
+    // Per-stage K data
+    uint8_t k_stage_payload[kNumStages * kStageTokens * kPayloadBytesPerToken];
+    float k_stage_scale[kNumStages * kStageTokens];
+
+    // Q + weights
+    uint8_t q_stage[kNumHeads * kHeadDim];
+    float w_stage[kNumHeads];
+
+    // Stage metadata
+    int stage_page_idx[kNumStages];
+    int stage_valid_tokens[kNumStages];
+
+    // Per-stage phase counters
+    int tma_phase[kNumStages];
+    int mma_phase[kNumStages];
+    int topk_phase[kNumStages];
+    int tmem_reuse_phase_mma[kNumTmemSlots];
+
+    // Barrier arrays
+    uint64_t tma_mbar[kNumStages];
+    uint64_t mma_mbar[kNumStages];
+    uint64_t epi_mbar[kNumStages];
+    uint64_t topk_mbar[kNumStages];
+    uint64_t tmem_reuse_mbar[kNumTmemSlots];
+    uint64_t q_mbar;
+
+    // Epilogue candidate buffers
+    float stage_tile_scores[kNumStages * kStageTokens];
+    float stage_tile_pair_partial[kNumStages * kStageTokens];
+    int stage_tile_ids[kNumStages * kStageTokens];
+
+    // Top-k buffers
+    float topk_stage_compact_scores[kStageTokens];
+    int topk_stage_compact_ids[kStageTokens];
+    int topk_stage_compact_counts[2];
+    float topk_local_heap_scores[kNumTopkUpdateWarps * kTopk];
+    int topk_local_heap_ids[kNumTopkUpdateWarps * kTopk];
+    int topk_local_heap_sizes[kNumTopkUpdateWarps];
+    int topk_local_heap_ready[kNumTopkUpdateWarps];
+    float topk_heap_scores[kTopk];
+    int topk_heap_ids[kTopk];
+    float topk_cutoff;
+
+    // TMEM scratch
+    int tmem_addr_scratch;
+};
+
+// Precomputed PTX smem addresses
+struct SmemAddrs {
+    int k_stage_payload;
+    int k_stage_scale;
+    int q_stage;
+    int tma_mbar;
+    int mma_mbar;
+    int epi_mbar;
+    int topk_mbar;
+    int tmem_reuse_mbar;
+    int q_mbar;
+    int tmem_addr_scratch;
+};
+
+__device__ inline SmemAddrs init_smem_addrs(SmemLayout* s) {
+    const int base = static_cast<int>(__cvta_generic_to_shared(s));
+    auto off = [&](const void* field) {
+        return base + static_cast<int>(
+            reinterpret_cast<const unsigned char*>(field) -
+            reinterpret_cast<const unsigned char*>(s));
+    };
+    SmemAddrs a;
+    a.k_stage_payload = off(s->k_stage_payload);
+    a.k_stage_scale   = off(s->k_stage_scale);
+    a.q_stage         = off(s->q_stage);
+    a.tma_mbar        = off(s->tma_mbar);
+    a.mma_mbar        = off(s->mma_mbar);
+    a.epi_mbar        = off(s->epi_mbar);
+    a.topk_mbar       = off(s->topk_mbar);
+    a.tmem_reuse_mbar = off(s->tmem_reuse_mbar);
+    a.q_mbar          = off(&s->q_mbar);
+    a.tmem_addr_scratch = off(&s->tmem_addr_scratch);
+    return a;
 }
 
+// ---------------------------------------------------------------------------------
+// Device helpers
+// ---------------------------------------------------------------------------------
 __device__ inline uint32_t elect_sync() {
   uint32_t pred = 0;
   asm volatile(
@@ -72,16 +160,25 @@ __device__ inline uint32_t elect_sync() {
   return pred;
 }
 
+__device__ inline bool _is_ep_warp(int warp_id) {
+    // 0,1 , 4, 5, 8,9 , need first 2 warp group ids to match tcgen.ld issue semantics
+    return (warp_id < kEpTopkWarpCount) && ((warp_id & 3) < 2);
+}
+
+__device__ inline bool _is_topk_warp(int warp_id) {
+    return (warp_id >= kNumEpilogueWarps) && (warp_id < kEpTopkWarpCount);
+}
+
+__device__ inline int _topk_warp_rank(int warp_id) {
+    return warp_id - kNumEpilogueWarps;
+}
+
 __device__ inline constexpr uint64_t desc_encode(uint64_t x) {
     return (x & 0x3'FFFFULL) >> 4ULL;
 }
 
 __device__ inline uint64_t make_desc_kmajor_swizzle_128b(int smem_addr) {
-    // 128B swizzle: each 8x128B chunk is the unit, swizzled internally.
-    // SBO = stride from one 8-row group to the next within the 128B-wide chunk.
-    // LBO is implicit (hardware knows adjacent 16B columns are +16B apart within 128B row).
-    // Swizzle mode in bits 61:63 = 2 (128B).
-    const int sbo = 8 * 128;  // = 1024
+    const int sbo = 8 * 128;
     return desc_encode(static_cast<uint64_t>(smem_addr)) |
            (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
            (1ULL << 46ULL) |
@@ -89,27 +186,18 @@ __device__ inline uint64_t make_desc_kmajor_swizzle_128b(int smem_addr) {
 }
 
 __device__ inline uint64_t make_desc_kmajor_noswizzle(int smem_addr) {
-    // No-swizzle: each 8x16B core matrix is contiguous. Columns of CMs are contiguous.
-    // LBO = stride from one 16B column to the next = height * 16B (height=64 for Q).
-    // SBO = stride from one 8-row group to the next within a column = 8 * 16B.
-    // Swizzle mode in bits 61:63 = 0 (none).
-    const int lbo = 64 * 16;  // = 1024 (Q tile height=64, each row=16B in a column)
-    const int sbo = 8 * 16;   // = 128  (one core matrix = 8 rows * 16B)
+    //No-swizzle K-major candidates:
+    const int lbo = 64 * 16;   // canonical-style (M=64 => 1024)
+    const int sbo = 8 * 16;    // canonical-style (128)
+    // const int lbo = 16;        // older interpretation (current)
+    // const int sbo = 8 * 128;   // older interpretation (current)
+    // const int lbo = 16;
+    // const int sbo = 8 * 128;
     return desc_encode(static_cast<uint64_t>(smem_addr)) |
            (desc_encode(static_cast<uint64_t>(lbo)) << 16ULL) |
            (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
            (1ULL << 46ULL) |
            (0ULL << 61ULL);
-}
-
-template <typename T>
-__device__ inline T* smem_alloc(unsigned char*& ptr, int n) {
-    uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
-    constexpr uintptr_t kAlign = alignof(T);
-    p = (p + kAlign - 1) & ~(kAlign - 1);
-    T* out = reinterpret_cast<T*>(p);
-    ptr = reinterpret_cast<unsigned char*>(out + n);
-    return out;
 }
 
 __device__ inline void mbarrier_init(int mbar_addr, int count) {
@@ -565,10 +653,172 @@ __device__ inline void topk_merge_local_heaps_to_global(
     topk_heap_emit_desc(global_heap_scores, global_heap_ids, global_size, topk, out_b);
 }
 
+__device__ inline void run_epilogue_warps(
+    int warp_id,
+    int lane,
+    int b,
+    int num_tiles,
+    SmemLayout& s,
+    const SmemAddrs& addr,
+    const int* mma_debug_heads,
+    const int* mma_debug_local_tok,
+    float* mma_debug_vals,
+    float* ep_debug_vals,
+    int* epi_tests_b,
+    int epi_capacity
+) {
+    // EP uses the first 8 warps (two warpgroups): each warpgroup slot 0..3 maps to head blocks 0..63.
+    if (warp_id >= kNumEpilogueWarps) {
+        return;
+    }
+
+    constexpr int kValsPerLd = 8;
+    const int ep_warp = warp_id;      // 0..7
+    const int ep_wg = ep_warp >> 2;   // 0..1
+    const int ep_slot = ep_warp & 3;  // 0..3
+    const int lane_in_half = lane & 15;
+    const int lane_half = lane >> 4;  // 0 or 1
+    const int head = ep_slot * 16 + lane_in_half;
+
+    for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
+        const int stage = tile_id % kNumStages;
+        const int tmem_slot = tile_id % kNumTmemSlots;
+
+        if (warp_id == 0 && elect_sync()) {
+            mbarrier_wait_parity(
+                addr.mma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
+                s.mma_phase[stage]);
+            s.mma_phase[stage] ^= 1;
+        }
+
+        asm volatile("bar.sync 1, 256;" ::: "memory");
+        tcgen05_fence_after_thread_sync();
+
+        const int valid_tokens = s.stage_valid_tokens[stage];
+        if (valid_tokens > 0) {
+            const int page_idx = s.stage_page_idx[stage];
+            const float* stage_scale = s.k_stage_scale + stage * kStageTokens;
+            float* partial_scores = s.stage_tile_pair_partial + stage * kStageTokens;
+            float* cand_scores = s.stage_tile_scores + stage * kStageTokens;
+            int* cand_ids = s.stage_tile_ids + stage * kStageTokens;
+            const int dbg_base = b * kDebugSamples;
+            const int tile_tok_base = tile_id * kStageTokens;
+            const float w = s.w_stage[head];
+            const unsigned half_mask = (lane_half == 0) ? 0x0000FFFFU : 0xFFFF0000U;
+            const bool is_half_leader = (lane_in_half == 0);
+
+            // Two chunks per warpgroup: wg0 -> {0,16}, wg1 -> {8,24}.
+            #pragma unroll
+            for (int chunk_it = 0; chunk_it < 2; ++chunk_it) {
+                const int col_chunk = ep_wg * 8 + chunk_it * 16;
+                const int taddr = ((ep_slot * 32) << 16) | (tmem_slot * kStageTokens + col_chunk);
+
+                float lane_regs[kValsPerLd];
+                asm volatile(
+                    "tcgen05.ld.sync.aligned.16x32bx2.x8.b32 "
+                    "{%0, %1, %2, %3, %4, %5, %6, %7}, [%8], 16;"
+                    : "=f"(lane_regs[0]), "=f"(lane_regs[1]), "=f"(lane_regs[2]), "=f"(lane_regs[3]),
+                      "=f"(lane_regs[4]), "=f"(lane_regs[5]), "=f"(lane_regs[6]), "=f"(lane_regs[7])
+                    : "r"(taddr));
+                tcgen05_wait_ld();
+
+                float lane_partials[kValsPerLd];
+                #pragma unroll
+                for (int r = 0; r < kValsPerLd; ++r) {
+                    const int token = col_chunk + lane_half * 32 + r;
+                    float lane_val = 0.0f;
+                    if (token < valid_tokens) {
+                        const float raw = lane_regs[r];
+                        lane_val = fmaxf(raw * stage_scale[token], 0.0f) * w;
+
+                        const int tile_tok = tile_tok_base + token;
+                        #pragma unroll
+                        for (int sidx = 0; sidx < kPreDebugSamples; ++sidx) {
+                            if (mma_debug_heads[dbg_base + sidx] == head &&
+                                mma_debug_local_tok[dbg_base + sidx] == tile_tok) {
+                                mma_debug_vals[dbg_base + sidx] = raw;
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int off = 8; off > 0; off >>= 1) {
+                        lane_val += __shfl_down_sync(half_mask, lane_val, off);
+                    }
+                    lane_partials[r] = lane_val;
+                }
+
+                // Combine the 4 slot-partials (16 heads each) into final 64-head token scores.
+                if (is_half_leader && ep_slot == 0) {
+                    #pragma unroll
+                    for (int r = 0; r < kValsPerLd; ++r) {
+                        const int token = col_chunk + lane_half * 32 + r;
+                        if (token < valid_tokens) {
+                            partial_scores[token] = lane_partials[r];
+                        }
+                    }
+                }
+                asm volatile("bar.sync 1, 256;" ::: "memory");
+
+                if (is_half_leader && ep_slot == 1) {
+                    #pragma unroll
+                    for (int r = 0; r < kValsPerLd; ++r) {
+                        const int token = col_chunk + lane_half * 32 + r;
+                        if (token < valid_tokens) {
+                            partial_scores[token] += lane_partials[r];
+                        }
+                    }
+                }
+                asm volatile("bar.sync 1, 256;" ::: "memory");
+
+                if (is_half_leader && ep_slot == 2) {
+                    #pragma unroll
+                    for (int r = 0; r < kValsPerLd; ++r) {
+                        const int token = col_chunk + lane_half * 32 + r;
+                        if (token < valid_tokens) {
+                            partial_scores[token] += lane_partials[r];
+                        }
+                    }
+                }
+                asm volatile("bar.sync 1, 256;" ::: "memory");
+
+                if (is_half_leader && ep_slot == 3) {
+                    #pragma unroll
+                    for (int r = 0; r < kValsPerLd; ++r) {
+                        const int token = col_chunk + lane_half * 32 + r;
+                        if (token < valid_tokens) {
+                            const float final = partial_scores[token] + lane_partials[r];
+                            cand_scores[token] = final;
+                            cand_ids[token] = page_idx * kPageSize + token;
+
+                            const int tile_tok = tile_tok_base + token;
+                            if (tile_tok < epi_capacity) {
+                                epi_tests_b[tile_tok] = __float_as_int(final);
+                            }
+                            #pragma unroll
+                            for (int sidx = 0; sidx < kDebugSamples; ++sidx) {
+                                if (mma_debug_local_tok[dbg_base + sidx] == tile_tok) {
+                                    ep_debug_vals[dbg_base + sidx] = final;
+                                }
+                            }
+                        }
+                    }
+                }
+                asm volatile("bar.sync 1, 256;" ::: "memory");
+            }
+        }
+
+        if (warp_id == 0 && lane == 0) {
+            mbarrier_arrive(addr.tmem_reuse_mbar + tmem_slot * static_cast<int>(sizeof(uint64_t)));
+            mbarrier_arrive(addr.epi_mbar + stage * static_cast<int>(sizeof(uint64_t)));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------
 // Kernel: 3-stage warp-specialized pipeline
 // ---------------------------------------------------------------------------------
 __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
+    const __grid_constant__ CUtensorMap q_fp8_tmap,
     const __grid_constant__ CUtensorMap k_fp8_tmap,
     const __grid_constant__ CUtensorMap k_scale_tmap,
     const uint8_t* q_index_bytes,   // [B,64,128], FP8 E4M3
@@ -576,6 +826,10 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     const int* seq_lens,            // [B]
     const int* block_table,         // [B,max_num_pages]
     int* topk_indices,              // [B,topk]
+    const int* mma_debug_heads,     // [B,12], pre uses first 4
+    const int* mma_debug_local_tok, // [B,12]
+    float* mma_debug_vals,          // [B,12], pre-ep qk_raw (first 4 used)
+    float* ep_debug_vals,           // [B,12], post-ep final score
     int batch_size,
     int num_pages,
     int max_num_pages,
@@ -599,8 +853,12 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     const int max_seq_by_pages = max_num_pages * kPageSize;
     if (seq_len > max_seq_by_pages) seq_len = max_seq_by_pages;
 
+    if (tid < kDebugSamples) {
+        mma_debug_vals[static_cast<int64_t>(b) * kDebugSamples + tid] = 0.0f;
+        ep_debug_vals[static_cast<int64_t>(b) * kDebugSamples + tid] = 0.0f;
+    }
+
     for (int i = tid; i < topk; i += blockDim.x) {
-        // Debug path: initialize EP dump buffer with -inf (as fp32 bit pattern in int32).
         epi_tests_b[i] = __float_as_int(-__int_as_float(0x7f800000));
     }
     __syncthreads();
@@ -609,96 +867,56 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
         return;
     }
 
-    extern __shared__ __align__(1024) unsigned char smem_raw[];
-    const int smem_base_addr = static_cast<int>(__cvta_generic_to_shared(smem_raw));
-    unsigned char* smem_ptr = smem_raw;
-
-    // Per-stage K data.
-    uint8_t* k_stage_payload = smem_alloc<uint8_t>(smem_ptr, kNumStages * kStageTokens * kPayloadBytesPerToken);
-    float* k_stage_scale = smem_alloc<float>(smem_ptr, kNumStages * kStageTokens);
-
-    // Q + weights.
-    uint8_t* q_stage = smem_alloc<uint8_t>(smem_ptr, kNumHeads * kHeadDim);
-    float* w_stage = smem_alloc<float>(smem_ptr, kNumHeads);
-
-    // Stage metadata.
-    int* stage_page_idx = smem_alloc<int>(smem_ptr, kNumStages);
-    int* stage_valid_tokens = smem_alloc<int>(smem_ptr, kNumStages);
-
-    // Per-stage phase counters.
-    int* tma_phase = smem_alloc<int>(smem_ptr, kNumStages);
-    int* mma_phase = smem_alloc<int>(smem_ptr, kNumStages);
-    int* topk_phase = smem_alloc<int>(smem_ptr, kNumStages);
-    int* tmem_reuse_phase_mma = smem_alloc<int>(smem_ptr, kNumTmemSlots);
-
-    // Four mbar arrays (tma_done, mma_done, epi_done, topk_done).
-    uint64_t* tma_mbar = smem_alloc<uint64_t>(smem_ptr, kNumStages);
-    uint64_t* mma_mbar = smem_alloc<uint64_t>(smem_ptr, kNumStages);
-    uint64_t* epi_mbar = smem_alloc<uint64_t>(smem_ptr, kNumStages);
-    uint64_t* topk_mbar = smem_alloc<uint64_t>(smem_ptr, kNumStages);
-    uint64_t* tmem_reuse_mbar = smem_alloc<uint64_t>(smem_ptr, kNumTmemSlots);
-
-    // Per-stage epilogue candidates (requested per-stage top-k buffer).
-    float* stage_tile_scores = smem_alloc<float>(smem_ptr, kNumStages * kStageTokens);
-    int* stage_tile_ids = smem_alloc<int>(smem_ptr, kNumStages * kStageTokens);
-    float* topk_stage_compact_scores = smem_alloc<float>(smem_ptr, kStageTokens);
-    int* topk_stage_compact_ids = smem_alloc<int>(smem_ptr, kStageTokens);
-    int* topk_stage_compact_counts = smem_alloc<int>(smem_ptr, 2);
-    float* topk_local_heap_scores = smem_alloc<float>(smem_ptr, kNumTopkUpdateWarps * topk);
-    int* topk_local_heap_ids = smem_alloc<int>(smem_ptr, kNumTopkUpdateWarps * topk);
-    int* topk_local_heap_sizes = smem_alloc<int>(smem_ptr, kNumTopkUpdateWarps);
-    int* topk_local_heap_ready = smem_alloc<int>(smem_ptr, kNumTopkUpdateWarps);
-    float* topk_heap_scores = smem_alloc<float>(smem_ptr, topk);
-    int* topk_heap_ids = smem_alloc<int>(smem_ptr, topk);
-    float* topk_cutoff_ptr = smem_alloc<float>(smem_ptr, 1);
-
-    // TMEM scratch.
-    int* tmem_addr_scratch = smem_alloc<int>(smem_ptr, 1);
-
-    const int k_stage_payload_addr = smem_addr_from_base(smem_raw, smem_base_addr, k_stage_payload);
-    const int k_stage_scale_addr = smem_addr_from_base(smem_raw, smem_base_addr, k_stage_scale);
-    const int q_stage_addr = smem_addr_from_base(smem_raw, smem_base_addr, q_stage);
-    const int tma_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, tma_mbar);
-    const int mma_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, mma_mbar);
-    const int epi_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, epi_mbar);
-    const int topk_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, topk_mbar);
-    const int tmem_reuse_mbar_addr = smem_addr_from_base(smem_raw, smem_base_addr, tmem_reuse_mbar);
-    const int tmem_addr_scratch_addr = smem_addr_from_base(smem_raw, smem_base_addr, tmem_addr_scratch);
+    extern __shared__ __align__(1024) SmemLayout smem_storage[];
+    SmemLayout& s = smem_storage[0];
+    const SmemAddrs addr = init_smem_addrs(&s);
 
     // Init barriers and phases.
     if (warp_id == kProducerWarp && elect_sync()) {
         for (int i = 0; i < kNumStages; ++i) {
-            mbarrier_init(tma_mbar_addr + i * static_cast<int>(sizeof(uint64_t)), 1);
-            mbarrier_init(mma_mbar_addr + i * static_cast<int>(sizeof(uint64_t)), 1);
-            mbarrier_init(epi_mbar_addr + i * static_cast<int>(sizeof(uint64_t)), 1);
-            mbarrier_init(topk_mbar_addr + i * static_cast<int>(sizeof(uint64_t)), 1);
-            tma_phase[i] = 0;
-            mma_phase[i] = 0;
-            topk_phase[i] = 0;
+            mbarrier_init(addr.tma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
+            mbarrier_init(addr.mma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
+            mbarrier_init(addr.epi_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
+            mbarrier_init(addr.topk_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
+            s.tma_phase[i] = 0;
+            s.mma_phase[i] = 0;
+            s.topk_phase[i] = 0;
         }
         for (int i = 0; i < kNumTmemSlots; ++i) {
-            mbarrier_init(tmem_reuse_mbar_addr + i * static_cast<int>(sizeof(uint64_t)), 1);
-            tmem_reuse_phase_mma[i] = 0;
+            mbarrier_init(addr.tmem_reuse_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
+            s.tmem_reuse_phase_mma[i] = 0;
         }
+        mbarrier_init(addr.q_mbar, 1);
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
-   // __syncthreads();
 
-    // Stage Q + weights.
-    #pragma unroll
-    for (int idx = tid; idx < kNumHeads * kHeadDim; idx += blockDim.x) {
-        const int64_t q_off = static_cast<int64_t>(b) * kNumHeads * kHeadDim + idx;
-        q_stage[idx] = q_index_bytes[q_off];
+    // tma load q so we get same swizzle as k_idx  
+    if (warp_id == kProducerWarp && elect_sync()) {
+        constexpr int q_bytes = kNumHeads * kHeadDim;
+        mbarrier_arrive_expect_tx(addr.q_mbar, q_bytes);
+        tma_3d_gmem2smem(addr.q_stage, &q_fp8_tmap, 0, 0, b, addr.q_mbar, 0ULL);
+        mbarrier_wait_parity(addr.q_mbar, 0);
     }
+    __syncthreads();
+    //asm volatile("bar.sync 1, 576;" ::: "memory");
+
+    // #pragma unroll
+    // for (int idx = tid; idx < kNumHeads * kHeadDim; idx += blockDim.x) {
+    //     const int64_t q_off = static_cast<int64_t>(b) * kNumHeads * kHeadDim + idx;
+    //     s.q_stage[idx] = q_index_bytes[q_off];
+    // }
+    
+
     #pragma unroll
     for (int idx = tid; idx < kNumHeads; idx += blockDim.x) {
-        w_stage[idx] = weights_b[idx];
+        s.w_stage[idx] = weights_b[idx];
     }
 
     if (tid == 0) {
-        tmem_addr_scratch[0] = 0;
+        s.tmem_addr_scratch = 0;
     }
     __syncthreads();
+
 
     constexpr uint32_t kIdesc = (0U << 7U)    // atype = E4M3
                               | (0U << 10U)   // btype = E4M3
@@ -716,70 +934,62 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
             // Stage reuse requires prior top-k consumption on the same stage slot.
             if (tile_id >= kNumStages) {
                 mbarrier_wait_parity(
-                    topk_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
-                    topk_phase[stage]);
-                topk_phase[stage] ^= 1;
+                    addr.topk_mbar + stage * static_cast<int>(sizeof(uint64_t)),
+                    s.topk_phase[stage]);
+                s.topk_phase[stage] ^= 1;
             }
 
             int page_idx, valid_tokens;
-            // per stage metadata, block table for k_idx, sfs, zeroing for final batch
             prepare_stage_metadata_and_scale_tail(
                 tile_id, stage, seq_len, max_num_pages, num_pages, block_table_b,
-                stage_page_idx, stage_valid_tokens, k_stage_scale,
+                s.stage_page_idx, s.stage_valid_tokens, s.k_stage_scale,
                 page_idx, valid_tokens);
 
-
-
             if (valid_tokens > 0) {
-                const int payload_dst = k_stage_payload_addr + stage * kStageTokens * kPayloadBytesPerToken;
-                const int scale_dst = k_stage_scale_addr + stage * kStageTokens * static_cast<int>(sizeof(float));
-                const int mbar_addr = tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t));
+                const int payload_dst = addr.k_stage_payload + stage * kStageTokens * kPayloadBytesPerToken;
+                const int scale_dst = addr.k_stage_scale + stage * kStageTokens * static_cast<int>(sizeof(float));
+                const int mbar = addr.tma_mbar + stage * static_cast<int>(sizeof(uint64_t));
                 constexpr int payload_bytes = kStageTokens * kPayloadBytesPerToken;
                 constexpr int scale_bytes = kStageTokens * kScaleBytesPerToken;
 
-                mbarrier_arrive_expect_tx(mbar_addr, payload_bytes + scale_bytes);
+                mbarrier_arrive_expect_tx(mbar, payload_bytes + scale_bytes);
 
-                // main k_idx = 128 b swizzle, sfs = no swizzle
-                tma_3d_gmem2smem(payload_dst, &k_fp8_tmap, 0, 0, page_idx, mbar_addr, 0ULL);
-                tma_2d_gmem2smem(scale_dst, &k_scale_tmap, 0, page_idx, mbar_addr, 0ULL);
+                tma_3d_gmem2smem(payload_dst, &k_fp8_tmap, 0, 0, page_idx, mbar, 0ULL);
+                tma_2d_gmem2smem(scale_dst, &k_scale_tmap, 0, page_idx, mbar, 0ULL);
             } else {
-                mbarrier_arrive(tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
+                mbarrier_arrive(addr.tma_mbar + stage * static_cast<int>(sizeof(uint64_t)));
             }
-
         }
     }
 
     // ---------------- MMA warp ----------------
     if (warp_id == kMmaWarp) {
-        tcgen05_alloc(tmem_addr_scratch_addr, kNumTmemSlots * kStageTokens);
+        tcgen05_alloc(addr.tmem_addr_scratch, kNumTmemSlots * kStageTokens);
     }
     if (warp_id == kMmaWarp && elect_sync()) {
         for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
             const int stage = tile_id % kNumStages;
             const int tmem_slot = tile_id % kNumTmemSlots;
 
-
             mbarrier_wait_parity(
-                tma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
-                tma_phase[stage]);
-            tma_phase[stage] ^= 1;
+                addr.tma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
+                s.tma_phase[stage]);
+            s.tma_phase[stage] ^= 1;
 
             if (tile_id >= kNumTmemSlots) {
                 mbarrier_wait_parity(
-                    tmem_reuse_mbar_addr + tmem_slot * static_cast<int>(sizeof(uint64_t)),
-                    tmem_reuse_phase_mma[tmem_slot]);
-                tmem_reuse_phase_mma[tmem_slot] ^= 1;
+                    addr.tmem_reuse_mbar + tmem_slot * static_cast<int>(sizeof(uint64_t)),
+                    s.tmem_reuse_phase_mma[tmem_slot]);
+                s.tmem_reuse_phase_mma[tmem_slot] ^= 1;
             }
 
-
-
-            const int valid_tokens = stage_valid_tokens[stage];
+            const int valid_tokens = s.stage_valid_tokens[stage];
             if (valid_tokens > 0) {
-                const int q_addr = q_stage_addr;
-                const int k_addr = k_stage_payload_addr + stage * kStageTokens * kPayloadBytesPerToken;
+                const int q_a = addr.q_stage;
+                const int k_a = addr.k_stage_payload + stage * kStageTokens * kPayloadBytesPerToken;
 
-                uint64_t q_desc = make_desc_kmajor_noswizzle(q_addr);
-                uint64_t k_desc = make_desc_kmajor_swizzle_128b(k_addr);
+                uint64_t q_desc = make_desc_kmajor_swizzle_128b(q_a);
+                uint64_t k_desc = make_desc_kmajor_swizzle_128b(k_a);
                 const uint32_t tmem_d = static_cast<uint32_t>(tmem_slot * kStageTokens);
 
                 for (int ki = 0; ki < kMmaIters; ++ki) {
@@ -788,129 +998,51 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                     k_desc += (kMmaK >> 4);
                 }
 
-                tcgen05_commit(mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
+                tcgen05_commit(addr.mma_mbar + stage * static_cast<int>(sizeof(uint64_t)));
             } else {
-                mbarrier_arrive(mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
+                mbarrier_arrive(addr.mma_mbar + stage * static_cast<int>(sizeof(uint64_t)));
             }
         }
     }
 
     // ---------------- Epilogue warps ----------------
-    if (warp_id >= kEpilogueWarpBase && warp_id < kEpilogueWarpBase + kNumEpilogueWarps) {
-        const int epi_warp = warp_id - kEpilogueWarpBase;
-        constexpr int kTokensPerEpiWarp = 8;
-
-        for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
-            const int stage = tile_id % kNumStages;
-            const int tmem_slot = tile_id % kNumTmemSlots;
-
-            if (epi_warp == 0 && elect_sync()) {
-                mbarrier_wait_parity(
-                    mma_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
-                    mma_phase[stage]);
-                mma_phase[stage] ^= 1;
-            }
-
-            // All 8 EP warps synchronize with warp0's mma_mbar wait.
-            asm volatile("bar.sync 1, 256;" ::: "memory");
-            tcgen05_fence_after_thread_sync();
-
-            const int valid_tokens = stage_valid_tokens[stage];
-            const int token_base = epi_warp * kTokensPerEpiWarp;
-            int chunk_valid = valid_tokens - token_base;
-            if (chunk_valid > kTokensPerEpiWarp) chunk_valid = kTokensPerEpiWarp;
-
-            if (chunk_valid > 0) {
-                const int tmem_col_base = tmem_slot * kStageTokens + token_base;
-                float lane_regs_lo[kTokensPerEpiWarp];
-                float lane_regs_hi[kTokensPerEpiWarp];
-                tcgen05_ld_32x32b_8(0, tmem_col_base, lane_regs_lo);
-                tcgen05_wait_ld();
-                tcgen05_ld_32x32b_8(32, tmem_col_base, lane_regs_hi);
-                tcgen05_wait_ld();
-
-                const float* stage_scale = k_stage_scale + stage * kStageTokens + token_base;
-                const float w_lo = w_stage[lane];
-                const float w_hi = w_stage[32 + lane];
-                float warp_partial_lo[kTokensPerEpiWarp];
-                float warp_partial_hi[kTokensPerEpiWarp];
-
-                #pragma unroll
-                for (int token = 0; token < kTokensPerEpiWarp; ++token) {
-                    float lane_val_lo = 0.0f;
-                    float lane_val_hi = 0.0f;
-                    if (token < chunk_valid) {
-                        const float scale = stage_scale[token];
-                        lane_val_lo = fmaxf(lane_regs_lo[token] * scale, 0.0f) * w_lo;
-                        lane_val_hi = fmaxf(lane_regs_hi[token] * scale, 0.0f) * w_hi;
-                    }
-                    #pragma unroll
-                    for (int off = 16; off > 0; off >>= 1) {
-                        lane_val_lo += __shfl_down_sync(0xFFFFFFFF, lane_val_lo, off);
-                        lane_val_hi += __shfl_down_sync(0xFFFFFFFF, lane_val_hi, off);
-                    }
-                    warp_partial_lo[token] = lane_val_lo;
-                    warp_partial_hi[token] = lane_val_hi;
-                }
-
-                if (lane == 0) {
-                    const int page_idx = stage_page_idx[stage];
-                    float* cand_scores = stage_tile_scores + stage * kStageTokens + token_base;
-                    int* cand_ids = stage_tile_ids + stage * kStageTokens + token_base;
-                    #pragma unroll
-                    for (int token = 0; token < kTokensPerEpiWarp; ++token) {
-                        if (token < chunk_valid) {
-                            cand_scores[token] = warp_partial_lo[token] + warp_partial_hi[token];
-                            cand_ids[token] = page_idx * kPageSize + token_base + token;
-                            const int local_tok = tile_id * kStageTokens + token_base + token;
-                            // epi_tests[tile] = EP values before top-k (fp32 bits stored in int32 buffer).
-                            if (local_tok < topk) epi_tests_b[local_tok] = __float_as_int(cand_scores[token]);
-                        }
-                    }
-                }
-            }
-
-            asm volatile("bar.sync 1, 256;" ::: "memory");
-            if (epi_warp == 0 && lane == 0) {
-                mbarrier_arrive(tmem_reuse_mbar_addr + tmem_slot * static_cast<int>(sizeof(uint64_t)));
-                mbarrier_arrive(epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
-            }
-        }
-    }
+    run_epilogue_warps(
+        warp_id,
+        lane,
+        b,
+        num_tiles,
+        s,
+        addr,
+        mma_debug_heads,
+        mma_debug_local_tok,
+        mma_debug_vals,
+        ep_debug_vals,
+        epi_tests_b,
+        topk);
 
     // ---------------- Top-k warps ----------------
-    if (warp_id >= kTopkWarpBase && warp_id < kTopkWarpBase + kNumTopkWarps) {
-        const int topk_warp = warp_id - kTopkWarpBase;
-        if (topk_warp == 0 && lane == 0) {
-            topk_cutoff_ptr[0] = -3.402823466e+38F;
-            topk_stage_compact_counts[0] = 0;
-            topk_stage_compact_counts[1] = 0;
-            for (int w = 0; w < kNumTopkUpdateWarps; ++w) {
-                topk_local_heap_sizes[w] = 0;
-                topk_local_heap_ready[w] = 0;
-            }
-        }
+    if (_is_topk_warp(warp_id)) {
+        const int topk_warp = _topk_warp_rank(warp_id);
         topk_team_barrier_8warps();
 
         for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
             const int stage = tile_id % kNumStages;
             const int phase = (tile_id / kNumStages) & 1;
 
+            // Wait for epilogue to finish writing this stage's candidates.
             if (topk_warp == 0 && lane == 0) {
                 mbarrier_wait_parity(
-                    epi_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)),
+                    addr.epi_mbar + stage * static_cast<int>(sizeof(uint64_t)),
                     phase);
             }
             topk_team_barrier_8warps();
 
-            // Top-k is intentionally stubbed for debug/isolation:
-            // consume EP completion and immediately release stage reuse.
+            // Release stage for TMA reuse.
             if (topk_warp == 0 && lane == 0) {
-                mbarrier_arrive(topk_mbar_addr + stage * static_cast<int>(sizeof(uint64_t)));
+                mbarrier_arrive(addr.topk_mbar + stage * static_cast<int>(sizeof(uint64_t)));
             }
             topk_team_barrier_8warps();
         }
-        // Top-k remains stubbed; output carries EP dump values.
     }
 
     __syncthreads();
@@ -924,6 +1056,41 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
 // Host-side tensor-map encode helpers
 // ---------------------------------------------------------------------------------
 static bool g_kernel_attrs_set = false;
+
+static CUtensorMap make_q_fp8_tmap(const int8_t* q_ptr, int batch_size) {
+    CUtensorMap tmap{};
+    constexpr uint32_t rank = 3;
+    uint64_t globalDim[rank] = {
+        (uint64_t)kHeadDim,
+        (uint64_t)kNumHeads,
+        (uint64_t)batch_size,
+    };
+    uint64_t globalStrides[rank - 1] = {
+        (uint64_t)kHeadDim,
+        (uint64_t)(kNumHeads * kHeadDim),
+    };
+    uint32_t boxDim[rank] = {
+        (uint32_t)kHeadDim,
+        (uint32_t)kNumHeads,
+        1U,
+    };
+    uint32_t elementStrides[rank] = {1U, 1U, 1U};
+    auto st = cuTensorMapEncodeTiled(
+        &tmap,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        rank,
+        (void*)q_ptr,
+        globalDim,
+        globalStrides,
+        boxDim,
+        elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(st == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for q");
+    return tmap;
+}
 
 static CUtensorMap make_k_fp8_tmap(const int8_t* k_ptr, int num_pages) {
     CUtensorMap tmap{};
@@ -1002,7 +1169,11 @@ void dsa_topk_indexer_launch(
     torch::Tensor weights,
     torch::Tensor seq_lens,
     torch::Tensor block_table,
-    torch::Tensor topk_indices
+    torch::Tensor topk_indices,
+    torch::Tensor mma_debug_heads,
+    torch::Tensor mma_debug_local_tok,
+    torch::Tensor mma_debug_vals,
+    torch::Tensor ep_debug_vals
 ) {
     const int batch_size = static_cast<int>(q_index_fp8.size(0));
     const int num_pages = static_cast<int>(k_index_cache_fp8.size(0));
@@ -1022,12 +1193,15 @@ void dsa_topk_indexer_launch(
         g_kernel_attrs_set = true;
     }
 
+    const int8_t* q_ptr = reinterpret_cast<const int8_t*>(q_index_fp8.data_ptr());
     const int8_t* k_ptr = reinterpret_cast<const int8_t*>(k_index_cache_fp8.data_ptr());
+    CUtensorMap q_fp8_tmap = make_q_fp8_tmap(q_ptr, batch_size);
     CUtensorMap k_fp8_tmap = make_k_fp8_tmap(k_ptr, num_pages);
     CUtensorMap k_scale_tmap = make_k_scale_tmap(k_ptr, num_pages);
 
     const int blocks = batch_size;
     dsa_topk_indexer_kernel<<<blocks, kThreadsPerBlock, kDesiredDynamicSmemBytes>>>(
+        q_fp8_tmap,
         k_fp8_tmap,
         k_scale_tmap,
         reinterpret_cast<const uint8_t*>(q_index_fp8.data_ptr()),
@@ -1035,6 +1209,10 @@ void dsa_topk_indexer_launch(
         reinterpret_cast<const int*>(seq_lens.data_ptr()),
         reinterpret_cast<const int*>(block_table.data_ptr()),
         reinterpret_cast<int*>(topk_indices.data_ptr()),
+        reinterpret_cast<const int*>(mma_debug_heads.data_ptr()),
+        reinterpret_cast<const int*>(mma_debug_local_tok.data_ptr()),
+        reinterpret_cast<float*>(mma_debug_vals.data_ptr()),
+        reinterpret_cast<float*>(ep_debug_vals.data_ptr()),
         batch_size,
         num_pages,
         max_num_pages,
@@ -1053,7 +1231,11 @@ void dsa_topk_indexer_launch(
     torch::Tensor weights,
     torch::Tensor seq_lens,
     torch::Tensor block_table,
-    torch::Tensor topk_indices);
+    torch::Tensor topk_indices,
+    torch::Tensor mma_debug_heads,
+    torch::Tensor mma_debug_local_tok,
+    torch::Tensor mma_debug_vals,
+    torch::Tensor ep_debug_vals);
 """
 
 
@@ -1061,11 +1243,11 @@ def _get_module():
     global _module
     if _module is None:
         _module = load_inline(
-            name="dsa_topk_indexer_ext",
+            name="dsa_torch_topk_ext",
             cpp_sources=cpp_decl_src,
             cuda_sources=cuda_src,
             functions=["dsa_topk_indexer_launch"],
-            verbose=True,
+            #verbose=True,
             no_implicit_headers=True,
             extra_cuda_cflags=[
                 "-O1",
@@ -1089,6 +1271,10 @@ def _dsa_topk_indexer(
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
     topk_indices: torch.Tensor,
+    mma_debug_heads: torch.Tensor,
+    mma_debug_local_tok: torch.Tensor,
+    mma_debug_vals: torch.Tensor,
+    ep_debug_vals: torch.Tensor,
 ) -> torch.Tensor:
     mod = _get_module()
     mod.dsa_topk_indexer_launch(
@@ -1098,28 +1284,96 @@ def _dsa_topk_indexer(
         seq_lens,
         block_table,
         topk_indices,
+        mma_debug_heads,
+        mma_debug_local_tok,
+        mma_debug_vals,
+        ep_debug_vals,
     )
     return topk_indices
 
 
+def _sample_debug_tok(seq_len: int, count: int, seed: int, device: torch.device) -> torch.Tensor:
+    out = torch.zeros((count,), dtype=torch.int64, device=device)
+    if seq_len <= 0:
+        return out
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    if seq_len >= count:
+        out_cpu = torch.randperm(seq_len, generator=gen, dtype=torch.int64)[:count]
+    else:
+        out_cpu = torch.randint(0, seq_len, (count,), generator=gen, dtype=torch.int64)
+    return out_cpu.to(device=device)
+
+
 def custom_kernel(data: input_t) -> output_t:
+    global _DEBUG_PRINTED_POST_ONCE
     q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
     batch = int(q_index_fp8.shape[0])
-    # Fill with -inf so unwritten slots never win torch.topk
-    epi_tests = torch.full((batch, block_table.size(1) * 64), float('-inf'), dtype=torch.float32, device=q_index_fp8.device).view(torch.int32)
-    _dsa_topk_indexer(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, epi_tests)
+    k_debug = 12
 
+    # Kernel writes post-EP scores (as fp32 bits in int32) into this buffer.
+    epi_tests = torch.full(
+        (batch, block_table.size(1) * 64),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_index_fp8.device,
+    ).view(torch.int32)
 
-    scores = epi_tests.view(torch.float32)
-    actual_topk = min(2048, scores.size(1))
-    _, topk_idx = torch.topk(scores, actual_topk, dim=1)
+    # Keep kernel ABI identical to dsa_test while torch_topk path ignores debug tensors.
+    mma_debug_heads = torch.full((batch, k_debug), -1, dtype=torch.int32, device=q_index_fp8.device)
+    mma_debug_local_tok = torch.full((batch, k_debug), -1, dtype=torch.int32, device=q_index_fp8.device)
+    mma_debug_vals = torch.zeros((batch, k_debug), dtype=torch.float32, device=q_index_fp8.device)
+    ep_debug_vals = torch.zeros((batch, k_debug), dtype=torch.float32, device=q_index_fp8.device)
 
-    page_slot = topk_idx // 64
-    offset = topk_idx % 64
-    global_page = block_table.to(torch.long).gather(1, page_slot.to(torch.long))
-    topk_tokens = (global_page * 64 + offset.to(torch.long)).to(torch.int32)
+    _dsa_topk_indexer(
+        q_index_fp8,
+        k_index_cache_fp8,
+        weights,
+        seq_lens,
+        block_table,
+        epi_tests,
+        mma_debug_heads,
+        mma_debug_local_tok,
+        mma_debug_vals,
+        ep_debug_vals,
+    )
 
     topk_indices = torch.full((batch, 2048), -1, dtype=torch.int32, device=q_index_fp8.device)
-    topk_indices[:, :actual_topk] = topk_tokens
+    if batch == 0:
+        return (topk_indices,)
+
+    scores = epi_tests.view(torch.float32)
+    max_topk = min(2048, scores.size(1))
+    _, topk_idx = torch.topk(scores, max_topk, dim=1)
+    block_table_long = block_table.to(torch.long)
+
+    if (not _DEBUG_PRINTED_POST_ONCE) and batch >= 2:
+        sample_id = 0
+        for b in (0, 1):
+            tok_b = _sample_debug_tok(int(seq_lens[b].item()), 4, 20260222 + b, q_index_fp8.device)
+            for i in range(4):
+                t = int(tok_b[i].item())
+                page_slot = t // 64
+                global_page = int(block_table_long[b, page_slot].item())
+                global_tok = global_page * 64 + (t % 64)
+                v = float(scores[b, t].item())
+                print(
+                    f"post_ep_sample{sample_id}: batch={b} "
+                    f"local_tok={t} global_tok={global_tok} "
+                    f"post_ep_final_score={v:.7f}"
+                )
+                sample_id += 1
+        _DEBUG_PRINTED_POST_ONCE = True
+
+    for b in range(batch):
+        take = min(2048, int(seq_lens[b].item()))
+        if take <= 0:
+            continue
+        idx_b = topk_idx[b, :take]
+        page_slot_b = (idx_b // 64).to(torch.long)
+        offset_b = (idx_b % 64).to(torch.long)
+        global_page_b = block_table_long[b].gather(0, page_slot_b)
+        topk_tokens_b = (global_page_b * 64 + offset_b).to(torch.int32)
+        topk_indices[b, :take] = topk_tokens_b
 
     return (topk_indices,)

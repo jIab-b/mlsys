@@ -14,34 +14,37 @@ Running on:
 ## Benchmarks:
 ```
 batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ⏱ 3602.7 ± 13.47 µs
- ⚡ 3277.8 µs 🐌 3937.3 µs
- ❌ mismatch found! first mismatch at (0, 1): got=1860 ref=1529
+ ⏱ 4638.5 ± 10.19 µs
+ ⚡ 4377.6 µs 🐌 4976.6 µs
+ ❌ mismatch found! first mismatch at (0, 0): got=626 ref=245
 
 batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ⏱ 5386.2 ± 11.55 µs
- ⚡ 5081.1 µs 🐌 5793.9 µs
- ❌ mismatch found! first mismatch at (0, 0): got=664 ref=2748
+ ⏱ 6772.9 ± 8.75 µs
+ ⚡ 6515.7 µs 🐌 6961.2 µs
+ ❌ mismatch found! first mismatch at (0, 0): got=4035 ref=2748
 
 batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ⏱ 7544.4 ± 11.10 µs
- ⚡ 7335.9 µs 🐌 7823.4 µs
- ❌ mismatch found! first mismatch at (0, 0): got=3259 ref=99
+ ⏱ 9490.5 ± 11.40 µs
+ ⚡ 9253.9 µs 🐌 9878.5 µs
+ ❌ mismatch found! first mismatch at (0, 0): got=8063 ref=99
 ```
 
 ## Program stdout:
 ```
-[1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=dsa_topk_indexer_ext -DTORCH_API_INCLUDE_EXTENSION_H -isystem /usr/local/lib/python3.12/dist-packages/torch/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /usr/include/python3.12 -fPIC -std=c++17 -c /root/.cache/torch_extensions/py312_cu129/dsa_topk_indexer_ext/main.cpp -o main.o 
-[2/3] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=dsa_topk_indexer_ext -DTORCH_API_INCLUDE_EXTENSION_H -isystem /usr/local/lib/python3.12/dist-packages/torch/include -isystem /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /usr/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options '-fPIC' -O1 -gencode=arch=compute_100a,code=sm_100a --split-compile=4 --relocatable-device-code=false -std=c++17 -c /root/.cache/torch_extensions/py312_cu129/dsa_topk_indexer_ext/cuda.cu -o cuda.cuda.o 
-/root/.cache/torch_extensions/py312_cu129/dsa_topk_indexer_ext/cuda.cu(33): warning #177-D: variable "kNumEpilogueWarps" was declared but never referenced
-  constexpr int kNumEpilogueWarps = 8;
-                ^
-
-Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
-
-[3/3] c++ main.o cuda.cuda.o -shared -lcuda -L/usr/local/lib/python3.12/dist-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda/lib64 -lcudart -o dsa_topk_indexer_ext.so
-sample0: head=0 local_tok=0 global_tok=0 qk_raw=-0.3748474
-sample1: head=1 local_tok=1 global_tok=1 qk_raw=-5.0360107
-sample2: head=2 local_tok=2 global_tok=2 qk_raw=-6.8839417
-sample3: head=3 local_tok=3 global_tok=3 qk_raw=16.5885010
+pre_ep_sample0: head=0 local_tok=0 global_tok=0 qk_raw=-0.3748474
+pre_ep_sample1: head=1 local_tok=1 global_tok=1 qk_raw=-5.0360107
+pre_ep_sample2: head=2 local_tok=2 global_tok=2 qk_raw=-6.8839417
+pre_ep_sample3: head=3 local_tok=3 global_tok=3 qk_raw=16.5885010
+post_ep_sample0: local_tok=0 global_tok=0 post_ep_final_score=77.9319458
+post_ep_sample1: local_tok=1 global_tok=1 post_ep_final_score=121.8041687
+post_ep_sample2: local_tok=2 global_tok=2 post_ep_final_score=102.0941544
+post_ep_sample3: local_tok=3 global_tok=3 post_ep_final_score=82.2032700
+post_ep_sample4: local_tok=64 global_tok=64 post_ep_final_score=80.0542755
+post_ep_sample5: local_tok=65 global_tok=65 post_ep_final_score=141.6703491
+post_ep_sample6: local_tok=66 global_tok=66 post_ep_final_score=116.1279068
+post_ep_sample7: local_tok=67 global_tok=67 post_ep_final_score=90.4635315
+post_ep_sample8: local_tok=128 global_tok=128 post_ep_final_score=129.8545380
+post_ep_sample9: local_tok=129 global_tok=129 post_ep_final_score=66.2164841
+post_ep_sample10: local_tok=130 global_tok=130 post_ep_final_score=104.6785431
+post_ep_sample11: local_tok=131 global_tok=131 post_ep_final_score=59.9751511
 ```"

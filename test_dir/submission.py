@@ -6,7 +6,20 @@ PAGE_SIZE = 64
 NUM_INDEX_HEADS = 64
 INDEX_HEAD_DIM = 128
 TOPK = 2048
-_DEBUG_PRINTED_ONCE = False
+_DEBUG_PRINTED_POST_ONCE = False
+
+
+def _sample_debug_tok(seq_len, count, seed, device):
+    out = torch.zeros((count,), dtype=torch.int64, device=device)
+    if seq_len <= 0:
+        return out
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    if seq_len >= count:
+        out_cpu = torch.randperm(seq_len, generator=gen, dtype=torch.int64)[:count]
+    else:
+        out_cpu = torch.randint(0, seq_len, (count,), generator=gen, dtype=torch.int64)
+    return out_cpu.to(device=device)
 
 
 def decode_fp8_kv_cache_parts(k_index_cache_fp8):
@@ -33,7 +46,7 @@ def dequant_fp8_kv_cache(k_index_cache_fp8):
 
 @torch.no_grad()
 def custom_kernel(data):
-    global _DEBUG_PRINTED_ONCE
+    global _DEBUG_PRINTED_POST_ONCE
     q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
 
     batch_size, num_index_heads, index_head_dim = q_index_fp8.shape
@@ -50,6 +63,17 @@ def custom_kernel(data):
 
     topk_indices = torch.full((batch_size, TOPK), -1, dtype=torch.int32, device=device)
 
+    debug_batches = [0, 1] if (batch_size >= 2 and not _DEBUG_PRINTED_POST_ONCE) else []
+    debug_tok = {}
+    for b_dbg in debug_batches:
+        debug_tok[b_dbg] = _sample_debug_tok(
+            int(seq_lens[b_dbg].item()),
+            4,
+            20260222 + b_dbg,
+            device,
+        )
+    printed_debug_batches = 0
+
     for b in range(batch_size):
         seq_len = int(seq_lens[b].item())
         if seq_len <= 0:
@@ -61,32 +85,27 @@ def custom_kernel(data):
         k_paged = k_all[page_indices]
         k = k_paged.reshape(-1, index_head_dim)[:seq_len]
 
-        if b == 0 and not _DEBUG_PRINTED_ONCE:
-            k_raw = k_raw_all[page_indices].reshape(-1, index_head_dim)[:seq_len]
-            scores_raw = q[b] @ k_raw.T
-            max_tok = seq_len - 1
-            dbg_heads = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device=device)
-            dbg_tok = torch.tensor(
-                [0, 1 if max_tok >= 1 else 0, 2 if max_tok >= 2 else 0, 3 if max_tok >= 3 else 0],
-                dtype=torch.int64,
-                device=device,
-            )
+        scores = q[b] @ k.T
+        scores_relu = torch.relu(scores)
+        final_scores = (scores_relu * weights[b][:, None]).sum(dim=0)
+
+        if (not _DEBUG_PRINTED_POST_ONCE) and (b in debug_tok):
+            sample_base = 4 * printed_debug_batches
             for i in range(4):
-                h = int(dbg_heads[i].item())
-                t = int(dbg_tok[i].item())
+                t = int(debug_tok[b][i].item())
                 page_slot = t // page_size
                 offset = t % page_size
                 global_page = int(page_indices[page_slot].item())
                 global_tok = global_page * page_size + offset
-                v = float(scores_raw[h, t].item())
+                v = float(final_scores[t].item())
                 print(
-                    f"sample{i}: head={h} local_tok={t} global_tok={global_tok} qk_raw={v:.7f}"
+                    f"post_ep_sample{sample_base + i}: batch={b} "
+                    f"local_tok={t} global_tok={global_tok} "
+                    f"post_ep_final_score={v:.7f}"
                 )
-            _DEBUG_PRINTED_ONCE = True
-
-        scores = q[b] @ k.T
-        scores_relu = torch.relu(scores)
-        final_scores = (scores_relu * weights[b][:, None]).sum(dim=0)
+            printed_debug_batches += 1
+            if printed_debug_batches == len(debug_batches):
+                _DEBUG_PRINTED_POST_ONCE = True
 
         actual_topk = min(TOPK, seq_len)
         _, topk_idx = torch.topk(final_scores, actual_topk)
