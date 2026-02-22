@@ -1,5 +1,8 @@
 """DSA index submission."""
 
+import os
+import re
+
 import torch
 from torch.utils.cpp_extension import load_inline
 
@@ -7,6 +10,7 @@ from task import input_t, output_t
 
 
 _module = None
+_DEBUG_PRINTED_ONCE = False
 
 
 cuda_src = """
@@ -38,19 +42,21 @@ constexpr int kNumStages = 8;
 constexpr int kNumTmemSlots = 8;
 static_assert(kNumTmemSlots * kStageTokens <= 512, "TMEM columns exceed hardware limit");
 
-constexpr int kEpilogueWarpBase = 0;
+constexpr int kNumEpTopkWarpgroups = 4;
+constexpr int kWarpsPerWarpgroup = 4;
+constexpr int kEpTopkWarpCount = kNumEpTopkWarpgroups * kWarpsPerWarpgroup;  // 16
 constexpr int kNumEpilogueWarps = 8;
-constexpr int kProducerWarp = kEpilogueWarpBase + kNumEpilogueWarps;
-constexpr int kMmaWarp = kProducerWarp + 1;
-constexpr int kTopkWarpBase = kMmaWarp + 1;
 constexpr int kNumTopkWarps = 8;
+constexpr int kProducerWarp = kEpTopkWarpCount;
+constexpr int kMmaWarp = kProducerWarp + 1;
 constexpr int kNumTopkConsumeWarps = 2;
 constexpr int kTopkUpdateWarpBase = kNumTopkConsumeWarps;
 constexpr int kNumTopkUpdateWarps = kNumTopkWarps - kNumTopkConsumeWarps;
-constexpr int kNumWarps = kTopkWarpBase + kNumTopkWarps;
+constexpr int kNumWarps = kMmaWarp + 1;
 constexpr int kThreadsPerBlock = kNumWarps * 32;
 
 constexpr int kTopk = 2048;
+constexpr int kDebugSamples = 4;
 
 constexpr int kMmaK = 32;
 constexpr int kMmaIters = kHeadDim / kMmaK;  // 4
@@ -88,6 +94,7 @@ struct __align__(1024) SmemLayout {
 
     // Epilogue candidate buffers
     float stage_tile_scores[kNumStages * kStageTokens];
+    float stage_tile_pair_partial[kNumStages * kStageTokens];
     int stage_tile_ids[kNumStages * kStageTokens];
 
     // Top-k buffers
@@ -154,17 +161,26 @@ __device__ inline uint32_t elect_sync() {
   return pred;
 }
 
+__device__ inline bool _is_ep_warp(int warp_id) {
+    // 0,1 , 4, 5, 8,9 , need first 2 warp group ids to match tcgen.ld issue semantics
+    return (warp_id < kEpTopkWarpCount) && ((warp_id & 3) < 2);
+}
+
+__device__ inline bool _is_topk_warp(int warp_id) {
+    return (warp_id < kEpTopkWarpCount) && ((warp_id & 3) >= 2);
+}
+
+__device__ inline int _topk_warp_rank(int warp_id) {
+    const int wg = warp_id >> 2;
+    const int slot = warp_id & 3;
+    return (wg << 1) + (slot - 2);
+}
+
 __device__ inline constexpr uint64_t desc_encode(uint64_t x) {
     return (x & 0x3'FFFFULL) >> 4ULL;
 }
 
 __device__ inline uint64_t make_desc_kmajor_swizzle_128b(int smem_addr) {
-    // K-major swizzle candidates:
-    // 128B swizzle (bits 61:63 = 2): const int sbo = 8 * 128;   // current
-    // 64B swizzle  (bits 61:63 = 4): const int sbo = 8 * 64;
-    // 32B swizzle  (bits 61:63 = 6): const int sbo = 8 * 32;
-    // LBO is not used for K-major swizzled layouts (assumed 1).
-    // Optional encoded LBO field (typically ignored in this mode): const int lbo = 16;
     const int sbo = 8 * 128;
     return desc_encode(static_cast<uint64_t>(smem_addr)) |
            (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
@@ -640,6 +656,133 @@ __device__ inline void topk_merge_local_heaps_to_global(
     topk_heap_emit_desc(global_heap_scores, global_heap_ids, global_size, topk, out_b);
 }
 
+__device__ inline void run_epilogue_warps(
+    int warp_id,
+    int lane,
+    int b,
+    int num_tiles,
+    SmemLayout& s,
+    const SmemAddrs& addr,
+    const int* mma_debug_heads,
+    const int* mma_debug_local_tok,
+    float* mma_debug_vals
+) {
+    if (!_is_ep_warp(warp_id)) {
+        return;
+    }
+
+    constexpr int kTokensPerEpPair = 16;
+    constexpr int kValsPerLd = 8;
+    const int ep_pair = warp_id >> 2;
+    const int ep_slot = warp_id & 3;  // only 0 or 1 for EP warps
+    const int lane_base = (ep_slot == 0) ? 0 : 32;
+    const int token_base = ep_pair * kTokensPerEpPair;
+
+    for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
+        const int stage = tile_id % kNumStages;
+        const int tmem_slot = tile_id % kNumTmemSlots;
+
+        if (warp_id == 0 && elect_sync()) {
+            mbarrier_wait_parity(
+                addr.mma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
+                s.mma_phase[stage]);
+            s.mma_phase[stage] ^= 1;
+        }
+
+        asm volatile("bar.sync 1, 256;" ::: "memory");
+        tcgen05_fence_after_thread_sync();
+
+        const int valid_tokens = s.stage_valid_tokens[stage];
+        int chunk_valid = valid_tokens - token_base;
+        if (chunk_valid < 0) chunk_valid = 0;
+        if (chunk_valid > kTokensPerEpPair) chunk_valid = kTokensPerEpPair;
+
+        float warp_partial[kTokensPerEpPair];
+        #pragma unroll
+        for (int token = 0; token < kTokensPerEpPair; ++token) {
+            warp_partial[token] = 0.0f;
+        }
+
+        if (chunk_valid > 0) {
+            const int tmem_col_base = tmem_slot * kStageTokens + token_base;
+            float lane_regs_0[kValsPerLd];
+            float lane_regs_1[kValsPerLd];
+            tcgen05_ld_32x32b_8(lane_base, tmem_col_base, lane_regs_0);
+            tcgen05_wait_ld();
+            tcgen05_ld_32x32b_8(lane_base, tmem_col_base + kValsPerLd, lane_regs_1);
+            tcgen05_wait_ld();
+
+            const int dbg_base = b * kDebugSamples;
+            const int tile_tok_base = tile_id * kStageTokens + token_base;
+            #pragma unroll
+            for (int sidx = 0; sidx < kDebugSamples; ++sidx) {
+                const int dbg_head = mma_debug_heads[dbg_base + sidx];
+                const int dbg_tok = mma_debug_local_tok[dbg_base + sidx];
+                if (dbg_tok >= tile_tok_base && dbg_tok < tile_tok_base + chunk_valid) {
+                    const int tok_in_chunk = dbg_tok - tile_tok_base;
+                    if (dbg_head >= lane_base && dbg_head < lane_base + 32) {
+                        if (lane == (dbg_head - lane_base)) {
+                            mma_debug_vals[dbg_base + sidx] =
+                                (tok_in_chunk < kValsPerLd) ? lane_regs_0[tok_in_chunk]
+                                                            : lane_regs_1[tok_in_chunk - kValsPerLd];
+                        }
+                    }
+                }
+            }
+
+            const float* stage_scale = s.k_stage_scale + stage * kStageTokens + token_base;
+            const float w = s.w_stage[lane_base + lane];
+
+            #pragma unroll
+            for (int token = 0; token < kTokensPerEpPair; ++token) {
+                float lane_val = 0.0f;
+                if (token < chunk_valid) {
+                    const float raw = (token < kValsPerLd) ? lane_regs_0[token] : lane_regs_1[token - kValsPerLd];
+                    const float scale = stage_scale[token];
+                    lane_val = fmaxf(raw * scale, 0.0f) * w;
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    lane_val += __shfl_down_sync(0xFFFFFFFF, lane_val, off);
+                }
+                warp_partial[token] = lane_val;
+            }
+
+            if (lane == 0 && ep_slot == 1) {
+                float* pair_partial = s.stage_tile_pair_partial + stage * kStageTokens + token_base;
+                #pragma unroll
+                for (int token = 0; token < kTokensPerEpPair; ++token) {
+                    if (token < chunk_valid) {
+                        pair_partial[token] = warp_partial[token];
+                    }
+                }
+            }
+        }
+
+        asm volatile("bar.sync 1, 256;" ::: "memory");
+
+        if (chunk_valid > 0 && lane == 0 && ep_slot == 0) {
+            const int page_idx = s.stage_page_idx[stage];
+            const float* pair_partial = s.stage_tile_pair_partial + stage * kStageTokens + token_base;
+            float* cand_scores = s.stage_tile_scores + stage * kStageTokens + token_base;
+            int* cand_ids = s.stage_tile_ids + stage * kStageTokens + token_base;
+            #pragma unroll
+            for (int token = 0; token < kTokensPerEpPair; ++token) {
+                if (token < chunk_valid) {
+                    cand_scores[token] = warp_partial[token] + pair_partial[token];
+                    cand_ids[token] = page_idx * kPageSize + token_base + token;
+                }
+            }
+        }
+
+        asm volatile("bar.sync 1, 256;" ::: "memory");
+        if (warp_id == 0 && lane == 0) {
+            mbarrier_arrive(addr.tmem_reuse_mbar + tmem_slot * static_cast<int>(sizeof(uint64_t)));
+            mbarrier_arrive(addr.epi_mbar + stage * static_cast<int>(sizeof(uint64_t)));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------
 // Kernel: 3-stage warp-specialized pipeline
 // ---------------------------------------------------------------------------------
@@ -652,6 +795,9 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     const int* seq_lens,            // [B]
     const int* block_table,         // [B,max_num_pages]
     int* topk_indices,              // [B,topk]
+    const int* mma_debug_heads,     // [B,4]
+    const int* mma_debug_local_tok, // [B,4]
+    float* mma_debug_vals,          // [B,4]
     int batch_size,
     int num_pages,
     int max_num_pages,
@@ -674,6 +820,10 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     if (seq_len < 0) seq_len = 0;
     const int max_seq_by_pages = max_num_pages * kPageSize;
     if (seq_len > max_seq_by_pages) seq_len = max_seq_by_pages;
+
+    if (tid < kDebugSamples) {
+        mma_debug_vals[static_cast<int64_t>(b) * kDebugSamples + tid] = 0.0f;
+    }
 
     for (int i = tid; i < topk; i += blockDim.x) {
         epi_tests_b[i] = -1;
@@ -707,19 +857,22 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
 
-    // Stage Q + weights.
+    // tma load q so we get same swizzle as k_idx  
     if (warp_id == kProducerWarp && elect_sync()) {
         constexpr int q_bytes = kNumHeads * kHeadDim;
         mbarrier_arrive_expect_tx(addr.q_mbar, q_bytes);
         tma_3d_gmem2smem(addr.q_stage, &q_fp8_tmap, 0, 0, b, addr.q_mbar, 0ULL);
         mbarrier_wait_parity(addr.q_mbar, 0);
     }
+    __syncthreads();
+    //asm volatile("bar.sync 1, 576;" ::: "memory");
+
     // #pragma unroll
     // for (int idx = tid; idx < kNumHeads * kHeadDim; idx += blockDim.x) {
     //     const int64_t q_off = static_cast<int64_t>(b) * kNumHeads * kHeadDim + idx;
     //     s.q_stage[idx] = q_index_bytes[q_off];
     // }
-    asm volatile("bar.sync 1, 576;" ::: "memory");
+    
 
     #pragma unroll
     for (int idx = tid; idx < kNumHeads; idx += blockDim.x) {
@@ -730,6 +883,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
         s.tmem_addr_scratch = 0;
     }
     __syncthreads();
+
 
     constexpr uint32_t kIdesc = (0U << 7U)    // atype = E4M3
                               | (0U << 10U)   // btype = E4M3
@@ -819,87 +973,20 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     }
 
     // ---------------- Epilogue warps ----------------
-    if (warp_id >= kEpilogueWarpBase && warp_id < kEpilogueWarpBase + kNumEpilogueWarps) {
-        const int epi_warp = warp_id - kEpilogueWarpBase;
-        constexpr int kTokensPerEpiWarp = 8;
-
-        for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
-            const int stage = tile_id % kNumStages;
-            const int tmem_slot = tile_id % kNumTmemSlots;
-
-            if (epi_warp == 0 && elect_sync()) {
-                mbarrier_wait_parity(
-                    addr.mma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
-                    s.mma_phase[stage]);
-                s.mma_phase[stage] ^= 1;
-            }
-
-            asm volatile("bar.sync 1, 256;" ::: "memory");
-            tcgen05_fence_after_thread_sync();
-
-            const int valid_tokens = s.stage_valid_tokens[stage];
-            const int token_base = epi_warp * kTokensPerEpiWarp;
-            int chunk_valid = valid_tokens - token_base;
-            if (chunk_valid > kTokensPerEpiWarp) chunk_valid = kTokensPerEpiWarp;
-
-            if (chunk_valid > 0) {
-                const int tmem_col_base = tmem_slot * kStageTokens + token_base;
-                float lane_regs_lo[kTokensPerEpiWarp];
-                float lane_regs_hi[kTokensPerEpiWarp];
-                tcgen05_ld_32x32b_8(0, tmem_col_base, lane_regs_lo);
-                tcgen05_wait_ld();
-                tcgen05_ld_32x32b_8(32, tmem_col_base, lane_regs_hi);
-                tcgen05_wait_ld();
-
-                const float* stage_scale = s.k_stage_scale + stage * kStageTokens + token_base;
-                const float w_lo = s.w_stage[lane];
-                const float w_hi = s.w_stage[32 + lane];
-                float warp_partial_lo[kTokensPerEpiWarp];
-                float warp_partial_hi[kTokensPerEpiWarp];
-
-                #pragma unroll
-                for (int token = 0; token < kTokensPerEpiWarp; ++token) {
-                    float lane_val_lo = 0.0f;
-                    float lane_val_hi = 0.0f;
-                    if (token < chunk_valid) {
-                        const float scale = stage_scale[token];
-                        lane_val_lo = fmaxf(lane_regs_lo[token] * scale, 0.0f) * w_lo;
-                        lane_val_hi = fmaxf(lane_regs_hi[token] * scale, 0.0f) * w_hi;
-                    }
-                    #pragma unroll
-                    for (int off = 16; off > 0; off >>= 1) {
-                        lane_val_lo += __shfl_down_sync(0xFFFFFFFF, lane_val_lo, off);
-                        lane_val_hi += __shfl_down_sync(0xFFFFFFFF, lane_val_hi, off);
-                    }
-                    warp_partial_lo[token] = lane_val_lo;
-                    warp_partial_hi[token] = lane_val_hi;
-                }
-
-                if (lane == 0) {
-                    const int page_idx = s.stage_page_idx[stage];
-                    float* cand_scores = s.stage_tile_scores + stage * kStageTokens + token_base;
-                    int* cand_ids = s.stage_tile_ids + stage * kStageTokens + token_base;
-                    #pragma unroll
-                    for (int token = 0; token < kTokensPerEpiWarp; ++token) {
-                        if (token < chunk_valid) {
-                            cand_scores[token] = warp_partial_lo[token] + warp_partial_hi[token];
-                            cand_ids[token] = page_idx * kPageSize + token_base + token;
-                        }
-                    }
-                }
-            }
-
-            asm volatile("bar.sync 1, 256;" ::: "memory");
-            if (epi_warp == 0 && lane == 0) {
-                mbarrier_arrive(addr.tmem_reuse_mbar + tmem_slot * static_cast<int>(sizeof(uint64_t)));
-                mbarrier_arrive(addr.epi_mbar + stage * static_cast<int>(sizeof(uint64_t)));
-            }
-        }
-    }
+    run_epilogue_warps(
+        warp_id,
+        lane,
+        b,
+        num_tiles,
+        s,
+        addr,
+        mma_debug_heads,
+        mma_debug_local_tok,
+        mma_debug_vals);
 
     // ---------------- Top-k warps ----------------
-    if (warp_id >= kTopkWarpBase && warp_id < kTopkWarpBase + kNumTopkWarps) {
-        const int topk_warp = warp_id - kTopkWarpBase;
+    if (_is_topk_warp(warp_id)) {
+        const int topk_warp = _topk_warp_rank(warp_id);
         if (topk_warp == 0 && lane == 0) {
             s.topk_cutoff = -3.402823466e+38F;
             s.topk_stage_compact_counts[0] = 0;
@@ -1104,7 +1191,10 @@ void dsa_topk_indexer_launch(
     torch::Tensor weights,
     torch::Tensor seq_lens,
     torch::Tensor block_table,
-    torch::Tensor topk_indices
+    torch::Tensor topk_indices,
+    torch::Tensor mma_debug_heads,
+    torch::Tensor mma_debug_local_tok,
+    torch::Tensor mma_debug_vals
 ) {
     const int batch_size = static_cast<int>(q_index_fp8.size(0));
     const int num_pages = static_cast<int>(k_index_cache_fp8.size(0));
@@ -1140,6 +1230,9 @@ void dsa_topk_indexer_launch(
         reinterpret_cast<const int*>(seq_lens.data_ptr()),
         reinterpret_cast<const int*>(block_table.data_ptr()),
         reinterpret_cast<int*>(topk_indices.data_ptr()),
+        reinterpret_cast<const int*>(mma_debug_heads.data_ptr()),
+        reinterpret_cast<const int*>(mma_debug_local_tok.data_ptr()),
+        reinterpret_cast<float*>(mma_debug_vals.data_ptr()),
         batch_size,
         num_pages,
         max_num_pages,
@@ -1158,7 +1251,10 @@ void dsa_topk_indexer_launch(
     torch::Tensor weights,
     torch::Tensor seq_lens,
     torch::Tensor block_table,
-    torch::Tensor topk_indices);
+    torch::Tensor topk_indices,
+    torch::Tensor mma_debug_heads,
+    torch::Tensor mma_debug_local_tok,
+    torch::Tensor mma_debug_vals);
 """
 
 
@@ -1194,6 +1290,9 @@ def _dsa_topk_indexer(
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
     topk_indices: torch.Tensor,
+    mma_debug_heads: torch.Tensor,
+    mma_debug_local_tok: torch.Tensor,
+    mma_debug_vals: torch.Tensor,
 ) -> torch.Tensor:
     mod = _get_module()
     mod.dsa_topk_indexer_launch(
@@ -1203,14 +1302,88 @@ def _dsa_topk_indexer(
         seq_lens,
         block_table,
         topk_indices,
+        mma_debug_heads,
+        mma_debug_local_tok,
+        mma_debug_vals,
     )
     return topk_indices
 
 
+def _load_ref_indices_for_b0(device: torch.device, seq_lens: torch.Tensor, block_table: torch.Tensor):
+    heads = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    local_tok = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    path = os.path.join(os.path.dirname(__file__), "outref.txt")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            txt = f.read()
+        pairs = re.findall(r"sample\d+:\s*head=(\d+)\s+local_tok=(\d+)", txt)
+        if len(pairs) >= 4:
+            heads = torch.tensor([int(pairs[i][0]) for i in range(4)], dtype=torch.int32, device=device)
+            local_tok = torch.tensor([int(pairs[i][1]) for i in range(4)], dtype=torch.int32, device=device)
+    except OSError:
+        pass
+
+    seq0 = int(seq_lens[0].item()) if seq_lens.numel() > 0 else 0
+    if seq0 > 0:
+        local_tok = torch.remainder(local_tok, seq0)
+    else:
+        local_tok = torch.zeros_like(local_tok)
+
+    global_tok = torch.full((4,), -1, dtype=torch.int64, device=device)
+    if block_table.size(0) > 0:
+        max_pages = int(block_table.size(1))
+        for i in range(4):
+            t = int(local_tok[i].item())
+            page_slot = t // 64
+            if 0 <= page_slot < max_pages:
+                global_page = int(block_table[0, page_slot].item())
+                global_tok[i] = global_page * 64 + (t % 64)
+    return heads, local_tok, global_tok
+
+
 def custom_kernel(data: input_t) -> output_t:
+    global _DEBUG_PRINTED_ONCE
     q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
     batch = int(q_index_fp8.shape[0])
     topk = 2048
     topk_indices = torch.full((batch, topk), -1, dtype=torch.int32, device=q_index_fp8.device)
-    _dsa_topk_indexer(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_indices)
+    mma_debug_heads = torch.zeros((batch, 4), dtype=torch.int32, device=q_index_fp8.device)
+    mma_debug_local_tok = torch.zeros((batch, 4), dtype=torch.int32, device=q_index_fp8.device)
+    mma_debug_vals = torch.full((batch, 4), float("nan"), dtype=torch.float32, device=q_index_fp8.device)
+
+    if batch > 0:
+        b0_heads, b0_local_tok, b0_global_tok = _load_ref_indices_for_b0(
+            q_index_fp8.device, seq_lens, block_table
+        )
+        mma_debug_heads[0] = b0_heads
+        mma_debug_local_tok[0] = b0_local_tok
+    else:
+        b0_heads = torch.zeros((4,), dtype=torch.int32, device=q_index_fp8.device)
+        b0_local_tok = torch.zeros((4,), dtype=torch.int32, device=q_index_fp8.device)
+        b0_global_tok = torch.full((4,), -1, dtype=torch.int64, device=q_index_fp8.device)
+
+    _dsa_topk_indexer(
+        q_index_fp8,
+        k_index_cache_fp8,
+        weights,
+        seq_lens,
+        block_table,
+        topk_indices,
+        mma_debug_heads,
+        mma_debug_local_tok,
+        mma_debug_vals,
+    )
+
+    if batch > 0 and not _DEBUG_PRINTED_ONCE:
+        torch.cuda.synchronize(q_index_fp8.device)
+        vals = mma_debug_vals[0].cpu().tolist()
+        heads = b0_heads.cpu().tolist()
+        local_tok = b0_local_tok.cpu().tolist()
+        global_tok = b0_global_tok.cpu().tolist()
+        for i in range(4):
+            print(
+                f"sample{i}: head={int(heads[i])} local_tok={int(local_tok[i])} "
+                f"global_tok={int(global_tok[i])} qk_raw={float(vals[i]):.7f}"
+            )
+        _DEBUG_PRINTED_ONCE = True
     return (topk_indices,)
