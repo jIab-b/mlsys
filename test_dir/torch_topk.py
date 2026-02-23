@@ -1,8 +1,5 @@
 """DSA index submission."""
 
-import os
-import re
-
 import torch
 from torch.utils.cpp_extension import load_inline
 
@@ -10,7 +7,6 @@ from task import input_t, output_t
 
 
 _module = None
-_DEBUG_PRINTED_ONCE = False
 
 
 cuda_src = """
@@ -55,9 +51,6 @@ constexpr int kNumWarps = kMmaWarp + 1;
 constexpr int kThreadsPerBlock = kNumWarps * 32;
 
 constexpr int kTopk = 2048;
-constexpr int kPreDebugSamples = 4;
-constexpr int kPostDebugSamples = 12;
-constexpr int kDebugSamples = kPostDebugSamples;
 
 constexpr int kMmaK = 32;
 constexpr int kMmaIters = kHeadDim / kMmaK;  // 4
@@ -695,125 +688,36 @@ __device__ inline void run_topk_warps_sorted_merge(
     int* out_b,
     int topk
 ) {
-    constexpr float kNegInf = -3.402823466e+38F;
     if (!_is_topk_warp(warp_id)) {
         return;
     }
 
     const int topk_warp = _topk_warp_rank(warp_id);
-    if (topk != kTopk) {
-        for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
-            const int stage = tile_id % kNumStages;
-            const int phase = (tile_id / kNumStages) & 1;
-            if (topk_warp == 0 && lane == 0) {
-                mbarrier_wait_parity(
-                    addr.epi_mbar + stage * static_cast<int>(sizeof(uint64_t)),
-                    phase);
-            }
-            topk_team_barrier_8warps();
-            if (topk_warp == 0 && lane == 0) {
-                mbarrier_arrive(addr.topk_mbar + stage * static_cast<int>(sizeof(uint64_t)));
-            }
-            topk_team_barrier_8warps();
-        }
-        return;
-    }
-
-    float thread_q_scores[kTopkThreadQ];
-    int thread_q_ids[kTopkThreadQ];
-    int thread_q_count = 0;
-    int post_fill_tile_count = 0;
-
-    if (topk_warp == 0 && lane == 0) {
-        s.topk_fill = 0;
-        s.topk_bank = 0;
-        s.topk_sorted_ready = 0;
-        s.topk_cutoff_score = kNegInf;
-        s.topk_cutoff_id = INT_MAX;
-        s.topk_keep_count = 0;
-    }
-    topk_team_barrier_8warps();
-
+    // Stubbed top-k warp path:
+    // Keep only producer/consumer mbarrier handshakes so stage reuse ordering is unchanged.
+    // Final top-k indices are computed on the Python side with torch.topk.
     for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
         const int stage = tile_id % kNumStages;
         const int phase = (tile_id / kNumStages) & 1;
-
         if (topk_warp == 0 && lane == 0) {
             mbarrier_wait_parity(
                 addr.epi_mbar + stage * static_cast<int>(sizeof(uint64_t)),
                 phase);
         }
         topk_team_barrier_8warps();
-
-        const int valid_tokens = s.stage_valid_tokens[stage];
-        const int rem_start = topk_stage_fill_and_maybe_sort(
-            topk_warp,
-            lane,
-            valid_tokens,
-            s.stage_tile_scores + stage * kStageTokens,
-            s.stage_tile_ids + stage * kStageTokens,
-            topk,
-            s);
-
-        topk_enqueue_stage_candidates_faiss<kTopkThreadQ>(
-            topk_warp,
-            lane,
-            valid_tokens,
-            rem_start,
-            s.stage_tile_scores + stage * kStageTokens,
-            s.stage_tile_ids + stage * kStageTokens,
-            thread_q_scores,
-            thread_q_ids,
-            thread_q_count,
-            s);
-
-        const int rem_count = valid_tokens - rem_start;
-        if (s.topk_sorted_ready != 0 && rem_count > 0) {
-            ++post_fill_tile_count;
-            if (post_fill_tile_count >= kTopkThreadQ) {
-                topk_flush_thread_queue_faiss<kTopkThreadQ>(
-                    topk_warp,
-                    lane,
-                    thread_q_scores,
-                    thread_q_ids,
-                    thread_q_count,
-                    topk,
-                    s);
-                post_fill_tile_count = 0;
-            }
-        }
-
-        topk_team_barrier_8warps();
-
         if (topk_warp == 0 && lane == 0) {
             mbarrier_arrive(addr.topk_mbar + stage * static_cast<int>(sizeof(uint64_t)));
         }
         topk_team_barrier_8warps();
     }
-
-    topk_flush_thread_queue_faiss<kTopkThreadQ>(
-        topk_warp,
-        lane,
-        thread_q_scores,
-        thread_q_ids,
-        thread_q_count,
-        topk,
-        s);
-
-    topk_finalize_emit_sorted_merge(topk_warp, lane, out_b, topk, s);
 }
 
 __device__ inline void run_epilogue_warps(
     int warp_id,
     int lane,
-    int b,
     int num_tiles,
     SmemLayout& s,
-    const SmemAddrs& addr,
-    const int* mma_debug_heads,
-    const int* mma_debug_local_tok,
-    float* mma_debug_vals,
-    float* ep_debug_vals
+    const SmemAddrs& addr
 ) {
     // EP uses the first 8 warps, split as two 4-warp teams.
     // Each 4-warp team (slots 0..3) accumulates one 16-token chunk at a time.
@@ -850,8 +754,6 @@ __device__ inline void run_epilogue_warps(
             float* partial_scores = s.stage_tile_pair_partial + stage * kStageTokens;
             float* cand_scores = s.stage_tile_scores + stage * kStageTokens;
             int* cand_ids = s.stage_tile_ids + stage * kStageTokens;
-            const int dbg_base = b * kDebugSamples;
-            const int tile_tok_base = tile_id * kStageTokens;
             const float* stage_scale = s.k_stage_scale + stage * kStageTokens;
             const float w = s.w_stage[head];
 
@@ -888,15 +790,6 @@ __device__ inline void run_epilogue_warps(
                                                     ? lane_regs_0[token]
                                                     : lane_regs_1[token - kValsPerLd];
                                 lane_val = fmaxf(raw * stage_scale[tok], 0.0f) * w;
-
-                                const int tile_tok = tile_tok_base + tok;
-                                #pragma unroll
-                                for (int sidx = 0; sidx < kPreDebugSamples; ++sidx) {
-                                    if (mma_debug_heads[dbg_base + sidx] == head &&
-                                        mma_debug_local_tok[dbg_base + sidx] == tile_tok) {
-                                        mma_debug_vals[dbg_base + sidx] = raw;
-                                    }
-                                }
                             }
                             #pragma unroll
                             for (int off = 8; off > 0; off >>= 1) {
@@ -945,14 +838,6 @@ __device__ inline void run_epilogue_warps(
                             const float final = partial_scores[tok] + warp_partial[token];
                             cand_scores[tok] = final;
                             cand_ids[tok] = page_idx * kPageSize + tok;
-
-                            const int tile_tok = tile_tok_base + tok;
-                            #pragma unroll
-                            for (int sidx = 0; sidx < kDebugSamples; ++sidx) {
-                                if (mma_debug_local_tok[dbg_base + sidx] == tile_tok) {
-                                    ep_debug_vals[dbg_base + sidx] = final;
-                                }
-                            }
                         }
                     }
                 }
@@ -979,10 +864,6 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     const int* seq_lens,            // [B]
     const int* block_table,         // [B,max_num_pages]
     int* topk_indices,              // [B,topk]
-    const int* mma_debug_heads,     // [B,12], pre uses first 4
-    const int* mma_debug_local_tok, // [B,12]
-    float* mma_debug_vals,          // [B,12], pre-ep qk_raw (first 4 used)
-    float* ep_debug_vals,           // [B,12], post-ep final score
     int batch_size,
     int num_pages,
     int max_num_pages,
@@ -1005,11 +886,6 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     if (seq_len < 0) seq_len = 0;
     const int max_seq_by_pages = max_num_pages * kPageSize;
     if (seq_len > max_seq_by_pages) seq_len = max_seq_by_pages;
-
-    if (tid < kDebugSamples) {
-        mma_debug_vals[static_cast<int64_t>(b) * kDebugSamples + tid] = 0.0f;
-        ep_debug_vals[static_cast<int64_t>(b) * kDebugSamples + tid] = 0.0f;
-    }
 
     for (int i = tid; i < topk; i += blockDim.x) {
         epi_tests_b[i] = -1;
@@ -1162,14 +1038,9 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     run_epilogue_warps(
         warp_id,
         lane,
-        b,
         num_tiles,
         s,
-        addr,
-        mma_debug_heads,
-        mma_debug_local_tok,
-        mma_debug_vals,
-        ep_debug_vals);
+        addr);
 
     // ---------------- Top-k warps ----------------
     run_topk_warps_sorted_merge(
@@ -1305,11 +1176,7 @@ void dsa_topk_indexer_launch(
     torch::Tensor weights,
     torch::Tensor seq_lens,
     torch::Tensor block_table,
-    torch::Tensor topk_indices,
-    torch::Tensor mma_debug_heads,
-    torch::Tensor mma_debug_local_tok,
-    torch::Tensor mma_debug_vals,
-    torch::Tensor ep_debug_vals
+    torch::Tensor topk_indices
 ) {
     const int batch_size = static_cast<int>(q_index_fp8.size(0));
     const int num_pages = static_cast<int>(k_index_cache_fp8.size(0));
@@ -1345,10 +1212,6 @@ void dsa_topk_indexer_launch(
         reinterpret_cast<const int*>(seq_lens.data_ptr()),
         reinterpret_cast<const int*>(block_table.data_ptr()),
         reinterpret_cast<int*>(topk_indices.data_ptr()),
-        reinterpret_cast<const int*>(mma_debug_heads.data_ptr()),
-        reinterpret_cast<const int*>(mma_debug_local_tok.data_ptr()),
-        reinterpret_cast<float*>(mma_debug_vals.data_ptr()),
-        reinterpret_cast<float*>(ep_debug_vals.data_ptr()),
         batch_size,
         num_pages,
         max_num_pages,
@@ -1367,11 +1230,7 @@ void dsa_topk_indexer_launch(
     torch::Tensor weights,
     torch::Tensor seq_lens,
     torch::Tensor block_table,
-    torch::Tensor topk_indices,
-    torch::Tensor mma_debug_heads,
-    torch::Tensor mma_debug_local_tok,
-    torch::Tensor mma_debug_vals,
-    torch::Tensor ep_debug_vals);
+    torch::Tensor topk_indices);
 """
 
 
@@ -1407,10 +1266,6 @@ def _dsa_topk_indexer(
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
     topk_indices: torch.Tensor,
-    mma_debug_heads: torch.Tensor,
-    mma_debug_local_tok: torch.Tensor,
-    mma_debug_vals: torch.Tensor,
-    ep_debug_vals: torch.Tensor,
 ) -> torch.Tensor:
     mod = _get_module()
     mod.dsa_topk_indexer_launch(
@@ -1420,129 +1275,64 @@ def _dsa_topk_indexer(
         seq_lens,
         block_table,
         topk_indices,
-        mma_debug_heads,
-        mma_debug_local_tok,
-        mma_debug_vals,
-        ep_debug_vals,
     )
     return topk_indices
 
 
-def _load_ref_indices_for_b0(device: torch.device, seq_lens: torch.Tensor, block_table: torch.Tensor):
-    heads = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
-    local_tok = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
-    path = os.path.join(os.path.dirname(__file__), "outref.txt")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            txt = f.read()
-        pairs = re.findall(r"(?:sample|pre_ep_sample)\d+:\s*head=(\d+)\s+local_tok=(\d+)", txt)
-        if len(pairs) >= 4:
-            heads = torch.tensor([int(pairs[i][0]) for i in range(4)], dtype=torch.int32, device=device)
-            local_tok = torch.tensor([int(pairs[i][1]) for i in range(4)], dtype=torch.int32, device=device)
-    except OSError:
-        pass
+def _dequant_fp8_kv_cache(k_index_cache_fp8: torch.Tensor) -> torch.Tensor:
+    k_u8 = k_index_cache_fp8.view(torch.uint8)
+    num_pages, page_size, _, head_dim_plus_scale = k_u8.shape
+    head_dim = head_dim_plus_scale - 4
 
-    seq0 = int(seq_lens[0].item()) if seq_lens.numel() > 0 else 0
-    if seq0 > 0:
-        local_tok = torch.remainder(local_tok, seq0)
-    else:
-        local_tok = torch.zeros_like(local_tok)
+    kv_flat = k_u8.view(num_pages, page_size * head_dim_plus_scale)
+    fp8_bytes = kv_flat[:, : page_size * head_dim].contiguous()
+    fp8_vals = fp8_bytes.view(num_pages, page_size, head_dim).view(torch.float8_e4m3fn).to(torch.float32)
 
-    global_tok = torch.full((4,), -1, dtype=torch.int64, device=device)
-    if block_table.size(0) > 0:
-        max_pages = int(block_table.size(1))
-        for i in range(4):
-            t = int(local_tok[i].item())
-            page_slot = t // 64
-            if 0 <= page_slot < max_pages:
-                global_page = int(block_table[0, page_slot].item())
-                global_tok[i] = global_page * 64 + (t % 64)
-    return heads, local_tok, global_tok
-
-
-def _global_tok_from_local(
-    block_table: torch.Tensor,
-    batch_idx: int,
-    local_tok: torch.Tensor,
-) -> torch.Tensor:
-    count = int(local_tok.numel())
-    global_tok = torch.full((count,), -1, dtype=torch.int64, device=local_tok.device)
-    if batch_idx < 0 or batch_idx >= int(block_table.size(0)):
-        return global_tok
-
-    max_pages = int(block_table.size(1))
-    for i in range(count):
-        t = int(local_tok[i].item())
-        page_slot = t // 64
-        if 0 <= page_slot < max_pages:
-            global_page = int(block_table[batch_idx, page_slot].item())
-            global_tok[i] = global_page * 64 + (t % 64)
-    return global_tok
-
-
-def _build_post_debug_local_tok(seq_len: int, device: torch.device) -> torch.Tensor:
-    post_local_tok = torch.zeros((12,), dtype=torch.int32, device=device)
-    if seq_len <= 0:
-        return post_local_tok
-
-    targets = (0, 1, 2, 3, 60, 61, 62, 63, 63, 63, 63, 63)
-    last_tok = seq_len - 1
-    for i, t in enumerate(targets):
-        post_local_tok[i] = t if t <= last_tok else last_tok
-    return post_local_tok
+    scale_bytes = kv_flat[:, page_size * head_dim :].contiguous()
+    scales = scale_bytes.view(num_pages, page_size, 4).view(torch.float32)
+    return fp8_vals * scales
 
 
 def custom_kernel(data: input_t) -> output_t:
-    global _DEBUG_PRINTED_ONCE
     q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
     batch = int(q_index_fp8.shape[0])
-    k_pre_debug = 4
-    k_post_debug = 12
-    k_post_print = 8
     topk = 2048
-    topk_indices = torch.full((batch, topk), -1, dtype=torch.int32, device=q_index_fp8.device)
-    mma_debug_heads = torch.full((batch, k_post_debug), -1, dtype=torch.int32, device=q_index_fp8.device)
-    mma_debug_local_tok = torch.zeros((batch, k_post_debug), dtype=torch.int32, device=q_index_fp8.device)
-    mma_debug_vals = torch.full((batch, k_post_debug), float("nan"), dtype=torch.float32, device=q_index_fp8.device)
-    ep_debug_vals = torch.full((batch, k_post_debug), float("nan"), dtype=torch.float32, device=q_index_fp8.device)
+    topk_indices_kernel = torch.empty((batch, topk), dtype=torch.int32, device=q_index_fp8.device)
 
-    if batch > 0:
-        b0_heads, b0_pre_local_tok, _ = _load_ref_indices_for_b0(
-            q_index_fp8.device, seq_lens, block_table
-        )
-        seq0 = int(seq_lens[0].item())
-        b0_post_local_tok = _build_post_debug_local_tok(seq0, q_index_fp8.device)
-        mma_debug_heads[0, :k_pre_debug] = b0_heads
-        mma_debug_local_tok[0] = b0_post_local_tok
-        b0_post_global_tok = _global_tok_from_local(block_table, 0, b0_post_local_tok)
-    else:
-        b0_heads = torch.zeros((4,), dtype=torch.int32, device=q_index_fp8.device)
-        b0_pre_local_tok = torch.zeros((4,), dtype=torch.int32, device=q_index_fp8.device)
-        b0_post_local_tok = torch.zeros((12,), dtype=torch.int32, device=q_index_fp8.device)
-        b0_post_global_tok = torch.full((12,), -1, dtype=torch.int64, device=q_index_fp8.device)
-
+    # Keep the CUDA pipeline run (including mbar ordering), but top-k itself is stubbed in device code.
     _dsa_topk_indexer(
         q_index_fp8,
         k_index_cache_fp8,
         weights,
         seq_lens,
         block_table,
-        topk_indices,
-        mma_debug_heads,
-        mma_debug_local_tok,
-        mma_debug_vals,
-        ep_debug_vals,
+        topk_indices_kernel,
     )
 
-    if batch > 0 and not _DEBUG_PRINTED_ONCE:
-        torch.cuda.synchronize(q_index_fp8.device)
-        post_vals = ep_debug_vals[0, :k_post_print].cpu().tolist()
-        post_local_tok = b0_post_local_tok.cpu().tolist()
-        post_global_tok = b0_post_global_tok.cpu().tolist()
-        for i in range(k_post_print):
-            print(
-                f"post_ep_sample{i}: local_tok={int(post_local_tok[i])} "
-                f"global_tok={int(post_global_tok[i])} post_ep_final_score={float(post_vals[i]):.7f}"
-            )
-        _DEBUG_PRINTED_ONCE = True
-    return (topk_indices,)
+
+    q = q_index_fp8.to(torch.float32)
+    k_all = _dequant_fp8_kv_cache(k_index_cache_fp8)
+    out_topk_indices = torch.full((batch, topk), -1, dtype=torch.int32, device=q_index_fp8.device)
+
+    for b in range(batch):
+        seq_len = int(seq_lens[b].item())
+        if seq_len <= 0:
+            continue
+        num_pages_for_seq = (seq_len + 64 - 1) // 64
+        page_indices = block_table[b, :num_pages_for_seq].to(torch.long)
+
+        k_paged = k_all[page_indices]
+        k = k_paged.reshape(-1, 128)[:seq_len]
+        scores = q[b] @ k.T
+        final_scores = (torch.relu(scores) * weights[b][:, None]).sum(dim=0)
+
+        actual_topk = min(topk, seq_len)
+        _, topk_idx = torch.topk(final_scores, actual_topk)
+
+        page_idx_per_token = topk_idx // 64
+        offset_per_token = topk_idx % 64
+        global_page_idx = page_indices[page_idx_per_token]
+        topk_tokens = global_page_idx * 64 + offset_per_token
+        out_topk_indices[b, :actual_topk] = topk_tokens.to(torch.int32)
+
+    return (out_topk_indices,)
