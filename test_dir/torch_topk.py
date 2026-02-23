@@ -39,8 +39,8 @@ constexpr int kNumTmemSlots = 8;
 static_assert(kNumTmemSlots * kStageTokens <= 512, "TMEM columns exceed hardware limit");
 
 constexpr int kWarpsPerWarpgroup = 4;
-constexpr int kNumEpilogueWarps = 16;
-constexpr int kNumEpTeams = kNumEpilogueWarps / kWarpsPerWarpgroup;
+constexpr int kNumEpTeams = 7;
+constexpr int kNumEpilogueWarps = kNumEpTeams * kWarpsPerWarpgroup;
 constexpr int kProducerWarp = kNumEpilogueWarps;
 constexpr int kMmaWarp = kProducerWarp + 1;
 //constexpr int kNumWarps = kMmaWarp + 1;
@@ -135,7 +135,7 @@ __device__ inline uint32_t elect_sync() {
 }
 
 __device__ inline bool _is_ep_warp(int warp_id) {
-    // EP uses the first 16 warps (0..15).
+    // EP uses the first kNumEpilogueWarps warps.
     return warp_id < kNumEpilogueWarps;
 }
 
@@ -345,8 +345,14 @@ __device__ inline void ep_team_barrier_4warps(int ep_team) {
         asm volatile("bar.sync 4, 128;" ::: "memory");
     } else if (ep_team == 2) {
         asm volatile("bar.sync 5, 128;" ::: "memory");
-    } else {
+    } else if (ep_team == 3) {
         asm volatile("bar.sync 6, 128;" ::: "memory");
+    } else if (ep_team == 4) {
+        asm volatile("bar.sync 7, 128;" ::: "memory");
+    } else if (ep_team == 5) {
+        asm volatile("bar.sync 8, 128;" ::: "memory");
+    } else {
+        asm volatile("bar.sync 9, 128;" ::: "memory");
     }
 }
 
@@ -360,13 +366,13 @@ __device__ inline void run_epilogue_warps(
     int* out_ids_b,
     int out_stride
 ) {
-    // EP uses first 16 warps, as 4 independent 4-warp teams.
+    // EP uses first kNumEpilogueWarps warps, as kNumEpTeams independent 4-warp teams.
     if (!_is_ep_warp(warp_id)) {
         return;
     }
 
     constexpr int kTokensPerChunk = 32;
-    const int ep_team = warp_id >> 2;  // 0..3
+    const int ep_team = warp_id >> 2;  // 0..kNumEpTeams-1
     const int ep_slot = warp_id & 3;   // 0..3
     const int lane_base = ep_slot * 32;
     const int lane16 = lane & 15;
@@ -492,6 +498,73 @@ __device__ inline void run_epilogue_warps(
     }
 }
 
+__device__ inline bool kernel_setup(
+    int b,
+    int tid,
+    int warp_id,
+    int out_stride,
+    int max_num_pages,
+    const int* seq_lens,
+    const float* weights_b,
+    float* out_scores_b,
+    int* out_ids_b,
+    const CUtensorMap& q_fp8_tmap,
+    SmemLayout& s,
+    const SmemAddrs& addr,
+    int& seq_len
+) {
+    seq_len = seq_lens[b];
+    if (seq_len < 0) seq_len = 0;
+    const int max_seq_by_pages = max_num_pages * kPageSize;
+    if (seq_len > max_seq_by_pages) seq_len = max_seq_by_pages;
+
+    constexpr float kNegInf = -3.402823466e+38F;
+    for (int i = tid; i < out_stride; i += blockDim.x) {
+        out_scores_b[i] = kNegInf;
+        out_ids_b[i] = -1;
+    }
+
+    if (seq_len == 0 || out_stride <= 0) {
+        return false;
+    }
+
+    // Init barriers and phases.
+    if (warp_id == kProducerWarp && elect_sync()) {
+        for (int i = 0; i < kNumStages; ++i) {
+            mbarrier_init(addr.tma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
+            mbarrier_init(addr.mma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
+            mbarrier_init(addr.epi_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
+            s.tma_phase[i] = 0;
+            s.mma_phase[i] = 0;
+            s.epi_phase[i] = 0;
+        }
+        for (int i = 0; i < kNumTmemSlots; ++i) {
+            mbarrier_init(addr.tmem_reuse_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
+            s.tmem_reuse_phase_mma[i] = 0;
+        }
+        mbarrier_init(addr.q_mbar, 1);
+        asm volatile("fence.mbarrier_init.release.cluster;");
+    }
+
+    // TMA load q so we get same swizzle as k_idx.
+    if (warp_id == kProducerWarp && elect_sync()) {
+        constexpr int q_bytes = kNumHeads * kHeadDim;
+        mbarrier_arrive_expect_tx(addr.q_mbar, q_bytes);
+        tma_3d_gmem2smem(addr.q_stage, &q_fp8_tmap, 0, 0, b, addr.q_mbar, 0ULL);
+        mbarrier_wait_parity(addr.q_mbar, 0);
+    }
+
+    if (tid < kNumHeads) {
+        s.w_stage[tid] = weights_b[tid];
+    }
+    if (tid == 0) {
+        s.tmem_addr_scratch = 0;
+    }
+    __syncthreads();
+
+    return true;
+}
+
 // ---------------------------------------------------------------------------------
 // Kernel: 3-stage warp-specialized pipeline
 // ---------------------------------------------------------------------------------
@@ -524,70 +597,26 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     float* out_scores_b = out_scores + static_cast<int64_t>(b) * out_stride;
     int* out_ids_b = out_ids + static_cast<int64_t>(b) * out_stride;
 
-    int seq_len = seq_lens[b];
-    if (seq_len < 0) seq_len = 0;
-    const int max_seq_by_pages = max_num_pages * kPageSize;
-    if (seq_len > max_seq_by_pages) seq_len = max_seq_by_pages;
-
-    constexpr float kNegInf = -3.402823466e+38F;
-    for (int i = tid; i < out_stride; i += blockDim.x) {
-        out_scores_b[i] = kNegInf;
-        out_ids_b[i] = -1;
-    }
-    __syncthreads();
-
-    if (seq_len == 0 || out_stride <= 0) {
-        return;
-    }
-
     extern __shared__ __align__(1024) SmemLayout smem_storage[];
     SmemLayout& s = smem_storage[0];
     const SmemAddrs addr = init_smem_addrs(&s);
-
-    // Init barriers and phases.
-    if (warp_id == kProducerWarp && elect_sync()) {
-        for (int i = 0; i < kNumStages; ++i) {
-            mbarrier_init(addr.tma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
-            mbarrier_init(addr.mma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
-            mbarrier_init(addr.epi_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
-            s.tma_phase[i] = 0;
-            s.mma_phase[i] = 0;
-            s.epi_phase[i] = 0;
-        }
-        for (int i = 0; i < kNumTmemSlots; ++i) {
-            mbarrier_init(addr.tmem_reuse_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
-            s.tmem_reuse_phase_mma[i] = 0;
-        }
-        mbarrier_init(addr.q_mbar, 1);
-        asm volatile("fence.mbarrier_init.release.cluster;");
+    int seq_len = 0;
+    if (!kernel_setup(
+            b,
+            tid,
+            warp_id,
+            out_stride,
+            max_num_pages,
+            seq_lens,
+            weights_b,
+            out_scores_b,
+            out_ids_b,
+            q_fp8_tmap,
+            s,
+            addr,
+            seq_len)) {
+        return;
     }
-
-    // tma load q so we get same swizzle as k_idx
-    if (warp_id == kProducerWarp && elect_sync()) {
-        constexpr int q_bytes = kNumHeads * kHeadDim;
-        mbarrier_arrive_expect_tx(addr.q_mbar, q_bytes);
-        tma_3d_gmem2smem(addr.q_stage, &q_fp8_tmap, 0, 0, b, addr.q_mbar, 0ULL);
-        mbarrier_wait_parity(addr.q_mbar, 0);
-    }
-    __syncthreads();
-    //asm volatile("bar.sync 1, 576;" ::: "memory");
-
-    // #pragma unroll
-    // for (int idx = tid; idx < kNumHeads * kHeadDim; idx += blockDim.x) {
-    //     const int64_t q_off = static_cast<int64_t>(b) * kNumHeads * kHeadDim + idx;
-    //     s.q_stage[idx] = q_index_bytes[q_off];
-    // }
-
-
-    #pragma unroll
-    for (int idx = tid; idx < kNumHeads; idx += blockDim.x) {
-        s.w_stage[idx] = weights_b[idx];
-    }
-
-    if (tid == 0) {
-        s.tmem_addr_scratch = 0;
-    }
-    __syncthreads();
 
 
     constexpr uint32_t kIdesc = (0U << 7U)    // atype = E4M3
