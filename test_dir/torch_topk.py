@@ -39,12 +39,10 @@ constexpr int kNumTmemSlots = 8;
 static_assert(kNumTmemSlots * kStageTokens <= 512, "TMEM columns exceed hardware limit");
 
 constexpr int kWarpsPerWarpgroup = 4;
-constexpr int kNumEpTeams = 7;
+constexpr int kNumEpTeams = 6;
 constexpr int kNumEpilogueWarps = kNumEpTeams * kWarpsPerWarpgroup;
 constexpr int kProducerWarp = kNumEpilogueWarps;
 constexpr int kMmaWarp = kProducerWarp + 1;
-//constexpr int kNumWarps = kMmaWarp + 1;
-
 constexpr int kNumWarps = 32;
 constexpr int kThreadsPerBlock = kNumWarps * 32;
 
@@ -70,8 +68,6 @@ struct __align__(1024) SmemLayout {
 
     // Per-stage phase counters
     int tma_phase[kNumStages];
-    int mma_phase[kNumStages];
-    int epi_phase[kNumStages];
     int tmem_reuse_phase_mma[kNumTmemSlots];
 
     // Barrier arrays
@@ -81,8 +77,8 @@ struct __align__(1024) SmemLayout {
     uint64_t tmem_reuse_mbar[kNumTmemSlots];
     uint64_t q_mbar;
 
-    // Epilogue reduction scratch
-    float stage_tile_pair_partial[kNumStages * kStageTokens];
+    // Epilogue raw TMEM staging (token-major, head-minor): [stage][token][head]
+    float stage_tile_raw[kNumStages * kStageTokens * kNumHeads];
 
     // TMEM scratch
     int tmem_addr_scratch;
@@ -349,10 +345,8 @@ __device__ inline void ep_team_barrier_4warps(int ep_team) {
         asm volatile("bar.sync 6, 128;" ::: "memory");
     } else if (ep_team == 4) {
         asm volatile("bar.sync 7, 128;" ::: "memory");
-    } else if (ep_team == 5) {
-        asm volatile("bar.sync 8, 128;" ::: "memory");
     } else {
-        asm volatile("bar.sync 9, 128;" ::: "memory");
+        asm volatile("bar.sync 8, 128;" ::: "memory");
     }
 }
 
@@ -366,28 +360,59 @@ __device__ inline void run_epilogue_warps(
     int* out_ids_b,
     int out_stride
 ) {
-    // EP baseline path: keep only mbarrier handshakes (no epilogue compute).
+    // EP ring-loader stub:
+    // - owner team = tile_id % kNumEpTeams
+    // - load TMEM rows into per-stage raw SMEM buffer
+    // - keep only handshake signaling (no score/top-k compute yet)
     if (!_is_ep_warp(warp_id)) {
         return;
     }
 
     const int ep_team = warp_id >> 2;  // 0..kNumEpTeams-1
     const int ep_slot = warp_id & 3;   // 0..3
+    const int lane16 = lane & 15;
+    const int lane_half = lane >> 4;   // 0: tokens 0..31, 1: tokens 32..63
+    const int head = ep_slot * 16 + lane16;
+    const int lane_base = ep_slot * 32;
+    constexpr int kTokensPerLoad = 32;
 
     for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
         const int stage = tile_id % kNumStages;
         const int tmem_slot = tile_id % kNumTmemSlots;
-        const int stage_owner_team = stage % kNumEpTeams;
-        if (ep_team != stage_owner_team) {
+        const int owner_team = tile_id % kNumEpTeams;
+        if (ep_team != owner_team) {
             continue;
         }
+        const int phase = (tile_id / kNumStages) & 1;
 
         if (ep_slot == 0 && elect_sync()) {
             mbarrier_wait_parity(
                 addr.mma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
-                s.mma_phase[stage]);
-            s.mma_phase[stage] ^= 1;
+                phase);
         }
+
+        ep_team_barrier_4warps(ep_team);
+        tcgen05_fence_after_thread_sync();
+
+        const int valid_tokens = s.stage_valid_tokens[stage];
+        if (valid_tokens > 0) {
+            const int token_base = lane_half * kTokensPerLoad;
+            const int tmem_col_base = tmem_slot * kStageTokens;
+            float lane_regs[kTokensPerLoad];
+            tcgen05_ld_32x32b_32(lane_base, tmem_col_base, lane_regs);
+            tcgen05_wait_ld();
+
+            #pragma unroll
+            for (int t = 0; t < kTokensPerLoad; ++t) {
+                const int tok = token_base + t;
+                if (tok < valid_tokens) {
+                    const int raw_idx = (stage * kStageTokens + tok) * kNumHeads + head;
+                    s.stage_tile_raw[raw_idx] = lane_regs[t];
+                }
+            }
+        }
+
+        ep_team_barrier_4warps(ep_team);
 
         if (ep_slot == 0 && elect_sync()) {
             mbarrier_arrive(addr.tmem_reuse_mbar + tmem_slot * static_cast<int>(sizeof(uint64_t)));
@@ -433,8 +458,6 @@ __device__ inline bool kernel_setup(
             mbarrier_init(addr.mma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
             mbarrier_init(addr.epi_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
             s.tma_phase[i] = 0;
-            s.mma_phase[i] = 0;
-            s.epi_phase[i] = 0;
         }
         for (int i = 0; i < kNumTmemSlots; ++i) {
             mbarrier_init(addr.tmem_reuse_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
@@ -532,10 +555,10 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
 
             // Stage reuse requires prior epilogue completion on the same stage slot.
             if (tile_id >= kNumStages) {
+                const int phase = ((tile_id - kNumStages) / kNumStages) & 1;
                 mbarrier_wait_parity(
                     addr.epi_mbar + stage * static_cast<int>(sizeof(uint64_t)),
-                    s.epi_phase[stage]);
-                s.epi_phase[stage] ^= 1;
+                    phase);
             }
 
             int page_idx, valid_tokens;

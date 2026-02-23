@@ -1,4 +1,5 @@
-#include <tvm_ffi/core/tensor_view.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/function.h>
 #include <cuda.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
