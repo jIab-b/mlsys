@@ -14,13 +14,19 @@ Running on:
 ## Benchmarks:
 ```
 batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ❌ Encountered index 1 is out of bounds for dimension 0 with size 1
+ ⏱ 110.6 ± 0.40 µs
+ ⚡ 104.4 µs 🐌 128.0 µs
+ ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=245
 
 batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ❌ Encountered index 8 is out of bounds for dimension 0 with size 8
+ ⏱ 139.1 ± 0.60 µs
+ ⚡ 131.0 µs 🐌 179.0 µs
+ ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=2748
 
 batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ❌ Encountered index 16 is out of bounds for dimension 0 with size 16
+ ⏱ 180.8 ± 0.52 µs
+ ⚡ 174.0 µs 🐌 219.1 µs
+ ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=99
 ```
 
 ## Program stdout:

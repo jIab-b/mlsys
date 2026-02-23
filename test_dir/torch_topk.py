@@ -684,9 +684,7 @@ __device__ inline void run_topk_warps_sorted_merge(
     int lane,
     int num_tiles,
     SmemLayout& s,
-    const SmemAddrs& addr,
-    int* out_b,
-    int topk
+    const SmemAddrs& addr
 ) {
     if (!_is_topk_warp(warp_id)) {
         return;
@@ -717,7 +715,10 @@ __device__ inline void run_epilogue_warps(
     int lane,
     int num_tiles,
     SmemLayout& s,
-    const SmemAddrs& addr
+    const SmemAddrs& addr,
+    float* out_scores_b,
+    int* out_ids_b,
+    int out_stride
 ) {
     // EP uses the first 8 warps, split as two 4-warp teams.
     // Each 4-warp team (slots 0..3) accumulates one 16-token chunk at a time.
@@ -775,6 +776,7 @@ __device__ inline void run_epilogue_warps(
                     const int tmem_col_base = tmem_slot * kStageTokens + token_base;
                     float lane_regs_0[kValsPerLd];
                     float lane_regs_1[kValsPerLd];
+
                     tcgen05_ld_32x32b_8(lane_base, tmem_col_base, lane_regs_0);
                     tcgen05_wait_ld();
                     tcgen05_ld_32x32b_8(lane_base, tmem_col_base + kValsPerLd, lane_regs_1);
@@ -837,7 +839,13 @@ __device__ inline void run_epilogue_warps(
                             const int tok = token_base + token;
                             const float final = partial_scores[tok] + warp_partial[token];
                             cand_scores[tok] = final;
-                            cand_ids[tok] = page_idx * kPageSize + tok;
+                            const int global_token = page_idx * kPageSize + tok;
+                            cand_ids[tok] = global_token;
+                            const int seq_tok = tile_id * kStageTokens + tok;
+                            if (seq_tok < out_stride) {
+                                out_scores_b[seq_tok] = final;
+                                out_ids_b[seq_tok] = global_token;
+                            }
                         }
                     }
                 }
@@ -863,11 +871,12 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
     const float* weights,           // [B,64]
     const int* seq_lens,            // [B]
     const int* block_table,         // [B,max_num_pages]
-    int* topk_indices,              // [B,topk]
+    float* out_scores,              // [B,out_stride]
+    int* out_ids,                   // [B,out_stride]
     int batch_size,
     int num_pages,
     int max_num_pages,
-    int topk
+    int out_stride
 ) {
     const int b = blockIdx.x;
     const int tid = threadIdx.x;
@@ -880,19 +889,22 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
 
     const int* block_table_b = block_table + static_cast<int64_t>(b) * max_num_pages;
     const float* weights_b = weights + static_cast<int64_t>(b) * kNumHeads;
-    int* epi_tests_b = topk_indices + static_cast<int64_t>(b) * topk;
+    float* out_scores_b = out_scores + static_cast<int64_t>(b) * out_stride;
+    int* out_ids_b = out_ids + static_cast<int64_t>(b) * out_stride;
 
     int seq_len = seq_lens[b];
     if (seq_len < 0) seq_len = 0;
     const int max_seq_by_pages = max_num_pages * kPageSize;
     if (seq_len > max_seq_by_pages) seq_len = max_seq_by_pages;
 
-    for (int i = tid; i < topk; i += blockDim.x) {
-        epi_tests_b[i] = -1;
+    constexpr float kNegInf = -3.402823466e+38F;
+    for (int i = tid; i < out_stride; i += blockDim.x) {
+        out_scores_b[i] = kNegInf;
+        out_ids_b[i] = -1;
     }
     __syncthreads();
 
-    if (seq_len == 0 || topk <= 0) {
+    if (seq_len == 0 || out_stride <= 0) {
         return;
     }
 
@@ -1040,7 +1052,10 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
         lane,
         num_tiles,
         s,
-        addr);
+        addr,
+        out_scores_b,
+        out_ids_b,
+        out_stride);
 
     // ---------------- Top-k warps ----------------
     run_topk_warps_sorted_merge(
@@ -1048,9 +1063,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
         lane,
         num_tiles,
         s,
-        addr,
-        epi_tests_b,
-        topk);
+        addr);
 
     __syncthreads();
     if (warp_id == kMmaWarp) {
@@ -1176,14 +1189,15 @@ void dsa_topk_indexer_launch(
     torch::Tensor weights,
     torch::Tensor seq_lens,
     torch::Tensor block_table,
-    torch::Tensor topk_indices
+    torch::Tensor out_scores,
+    torch::Tensor out_ids
 ) {
     const int batch_size = static_cast<int>(q_index_fp8.size(0));
     const int num_pages = static_cast<int>(k_index_cache_fp8.size(0));
     const int max_num_pages = static_cast<int>(block_table.size(1));
-    const int topk = static_cast<int>(topk_indices.size(1));
+    const int out_stride = static_cast<int>(out_scores.size(1));
 
-    if (batch_size == 0 || topk == 0) {
+    if (batch_size == 0 || out_stride == 0) {
         return;
     }
 
@@ -1211,11 +1225,12 @@ void dsa_topk_indexer_launch(
         reinterpret_cast<const float*>(weights.data_ptr()),
         reinterpret_cast<const int*>(seq_lens.data_ptr()),
         reinterpret_cast<const int*>(block_table.data_ptr()),
-        reinterpret_cast<int*>(topk_indices.data_ptr()),
+        reinterpret_cast<float*>(out_scores.data_ptr()),
+        reinterpret_cast<int*>(out_ids.data_ptr()),
         batch_size,
         num_pages,
         max_num_pages,
-        topk
+        out_stride
     );
     cudaError_t launch_st = cudaGetLastError();
     TORCH_CHECK(launch_st == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(launch_st));
@@ -1230,7 +1245,8 @@ void dsa_topk_indexer_launch(
     torch::Tensor weights,
     torch::Tensor seq_lens,
     torch::Tensor block_table,
-    torch::Tensor topk_indices);
+    torch::Tensor out_scores,
+    torch::Tensor out_ids);
 """
 
 
@@ -1265,8 +1281,9 @@ def _dsa_topk_indexer(
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
-    topk_indices: torch.Tensor,
-) -> torch.Tensor:
+    out_scores: torch.Tensor,
+    out_ids: torch.Tensor,
+):
     mod = _get_module()
     mod.dsa_topk_indexer_launch(
         q_index_fp8,
@@ -1274,9 +1291,10 @@ def _dsa_topk_indexer(
         weights,
         seq_lens,
         block_table,
-        topk_indices,
+        out_scores,
+        out_ids,
     )
-    return topk_indices
+    return out_scores, out_ids
 
 
 def _dequant_fp8_kv_cache(k_index_cache_fp8: torch.Tensor) -> torch.Tensor:
@@ -1297,50 +1315,28 @@ def custom_kernel(data: input_t) -> output_t:
     q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
     batch = int(q_index_fp8.shape[0])
     topk = 2048
+    out_topk_indices = torch.full((batch, topk), -1, dtype=torch.int32, device=q_index_fp8.device)
+    if batch == 0:
+        return (out_topk_indices,)
 
-    out_scores = torch.empty((batch, seq_lens.max().item()), dtype=torch.int32, device=q_index_fp8.device)
+    max_seq = min(int(seq_lens.max().item()), int(block_table.shape[1]) * 64)
+    if max_seq <= 0:
+        return (out_topk_indices,)
 
-    
+    out_scores = torch.empty((batch, max_seq), dtype=torch.float32, device=q_index_fp8.device)
+    out_ids = torch.empty((batch, max_seq), dtype=torch.int32, device=q_index_fp8.device)
 
-    topk_indices_kernel = torch.empty((batch, topk), dtype=torch.int32, device=q_index_fp8.device)
-
-    # Keep the CUDA pipeline run (including mbar ordering), but top-k itself is stubbed in device code.
     _dsa_topk_indexer(
         q_index_fp8,
         k_index_cache_fp8,
         weights,
         seq_lens,
         block_table,
-        topk_indices_kernel,
+        out_scores,
+        out_ids,
     )
 
-    k = min(topk, int(seq_lens.min().item()))              # one shared k across batch
-    vals, idx = torch.topk(topk_indices_kernel[:, :k], k, dim=1)
-    return (vals.to(torch.int32),)
-
-    # q = q_index_fp8.to(torch.float32)
-    # k_all = _dequant_fp8_kv_cache(k_index_cache_fp8)
-    # out_topk_indices = torch.full((batch, topk), -1, dtype=torch.int32, device=q_index_fp8.device)
-
-    # for b in range(batch):
-    #     seq_len = int(seq_lens[b].item())
-    #     if seq_len <= 0:
-    #         continue
-    #     num_pages_for_seq = (seq_len + 64 - 1) // 64
-    #     page_indices = block_table[b, :num_pages_for_seq].to(torch.long)
-
-    #     k_paged = k_all[page_indices]
-    #     k = k_paged.reshape(-1, 128)[:seq_len]
-    #     scores = q[b] @ k.T
-    #     final_scores = (torch.relu(scores) * weights[b][:, None]).sum(dim=0)
-
-    #     actual_topk = min(topk, seq_len)
-    #     _, topk_idx = torch.topk(final_scores, actual_topk)
-
-    #     page_idx_per_token = topk_idx // 64
-    #     offset_per_token = topk_idx % 64
-    #     global_page_idx = page_indices[page_idx_per_token]
-    #     topk_tokens = global_page_idx * 64 + offset_per_token
-    #     out_topk_indices[b, :actual_topk] = topk_tokens.to(torch.int32)
-
-    # return (out_topk_indices,)
+    k = min(topk, max_seq)
+    top_pos = torch.topk(out_scores, k, dim=1).indices
+    out_topk_indices[:, :k] = torch.gather(out_ids, 1, top_pos).to(torch.int32)
+    return (out_topk_indices,)
