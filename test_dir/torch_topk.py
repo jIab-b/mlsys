@@ -845,7 +845,7 @@ __device__ inline void run_epilogue_warps(
             }
         }
 
-        if (warp_id == 0 && lane == 0) {
+        if (warp_id == 0 && elect_sync()) {
             mbarrier_arrive(addr.tmem_reuse_mbar + tmem_slot * static_cast<int>(sizeof(uint64_t)));
             mbarrier_arrive(addr.epi_mbar + stage * static_cast<int>(sizeof(uint64_t)));
         }
@@ -1297,6 +1297,11 @@ def custom_kernel(data: input_t) -> output_t:
     q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
     batch = int(q_index_fp8.shape[0])
     topk = 2048
+
+    out_scores = torch.empty((batch, seq_lens.max().item()), dtype=torch.int32, device=q_index_fp8.device)
+
+    
+
     topk_indices_kernel = torch.empty((batch, topk), dtype=torch.int32, device=q_index_fp8.device)
 
     # Keep the CUDA pipeline run (including mbar ordering), but top-k itself is stubbed in device code.
@@ -1309,30 +1314,33 @@ def custom_kernel(data: input_t) -> output_t:
         topk_indices_kernel,
     )
 
+    k = min(topk, int(seq_lens.min().item()))              # one shared k across batch
+    vals, idx = torch.topk(topk_indices_kernel[:, :k], k, dim=1)
+    return (vals.to(torch.int32),)
 
-    q = q_index_fp8.to(torch.float32)
-    k_all = _dequant_fp8_kv_cache(k_index_cache_fp8)
-    out_topk_indices = torch.full((batch, topk), -1, dtype=torch.int32, device=q_index_fp8.device)
+    # q = q_index_fp8.to(torch.float32)
+    # k_all = _dequant_fp8_kv_cache(k_index_cache_fp8)
+    # out_topk_indices = torch.full((batch, topk), -1, dtype=torch.int32, device=q_index_fp8.device)
 
-    for b in range(batch):
-        seq_len = int(seq_lens[b].item())
-        if seq_len <= 0:
-            continue
-        num_pages_for_seq = (seq_len + 64 - 1) // 64
-        page_indices = block_table[b, :num_pages_for_seq].to(torch.long)
+    # for b in range(batch):
+    #     seq_len = int(seq_lens[b].item())
+    #     if seq_len <= 0:
+    #         continue
+    #     num_pages_for_seq = (seq_len + 64 - 1) // 64
+    #     page_indices = block_table[b, :num_pages_for_seq].to(torch.long)
 
-        k_paged = k_all[page_indices]
-        k = k_paged.reshape(-1, 128)[:seq_len]
-        scores = q[b] @ k.T
-        final_scores = (torch.relu(scores) * weights[b][:, None]).sum(dim=0)
+    #     k_paged = k_all[page_indices]
+    #     k = k_paged.reshape(-1, 128)[:seq_len]
+    #     scores = q[b] @ k.T
+    #     final_scores = (torch.relu(scores) * weights[b][:, None]).sum(dim=0)
 
-        actual_topk = min(topk, seq_len)
-        _, topk_idx = torch.topk(final_scores, actual_topk)
+    #     actual_topk = min(topk, seq_len)
+    #     _, topk_idx = torch.topk(final_scores, actual_topk)
 
-        page_idx_per_token = topk_idx // 64
-        offset_per_token = topk_idx % 64
-        global_page_idx = page_indices[page_idx_per_token]
-        topk_tokens = global_page_idx * 64 + offset_per_token
-        out_topk_indices[b, :actual_topk] = topk_tokens.to(torch.int32)
+    #     page_idx_per_token = topk_idx // 64
+    #     offset_per_token = topk_idx % 64
+    #     global_page_idx = page_indices[page_idx_per_token]
+    #     topk_tokens = global_page_idx * 64 + offset_per_token
+    #     out_topk_indices[b, :actual_topk] = topk_tokens.to(torch.int32)
 
-    return (out_topk_indices,)
+    # return (out_topk_indices,)
