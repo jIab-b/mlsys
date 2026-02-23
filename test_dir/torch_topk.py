@@ -38,19 +38,15 @@ constexpr int kNumStages = 8;
 constexpr int kNumTmemSlots = 8;
 static_assert(kNumTmemSlots * kStageTokens <= 512, "TMEM columns exceed hardware limit");
 
-constexpr int kNumEpTopkWarpgroups = 4;
 constexpr int kWarpsPerWarpgroup = 4;
-constexpr int kEpTopkWarpCount = kNumEpTopkWarpgroups * kWarpsPerWarpgroup;  // 16
-constexpr int kNumEpilogueWarps = 8;
-constexpr int kNumTopkWarps = 8;
-constexpr int kTopkTeamThreads = kNumTopkWarps * 32;
-constexpr int kTopkThreadQ = 8;
-constexpr int kProducerWarp = kEpTopkWarpCount;
+constexpr int kNumEpilogueWarps = 16;
+constexpr int kNumEpTeams = kNumEpilogueWarps / kWarpsPerWarpgroup;
+constexpr int kProducerWarp = kNumEpilogueWarps;
 constexpr int kMmaWarp = kProducerWarp + 1;
-constexpr int kNumWarps = kMmaWarp + 1;
-constexpr int kThreadsPerBlock = kNumWarps * 32;
+//constexpr int kNumWarps = kMmaWarp + 1;
 
-constexpr int kTopk = 2048;
+constexpr int kNumWarps = 32;
+constexpr int kThreadsPerBlock = kNumWarps * 32;
 
 constexpr int kMmaK = 32;
 constexpr int kMmaIters = kHeadDim / kMmaK;  // 4
@@ -75,33 +71,18 @@ struct __align__(1024) SmemLayout {
     // Per-stage phase counters
     int tma_phase[kNumStages];
     int mma_phase[kNumStages];
-    int topk_phase[kNumStages];
+    int epi_phase[kNumStages];
     int tmem_reuse_phase_mma[kNumTmemSlots];
 
     // Barrier arrays
     uint64_t tma_mbar[kNumStages];
     uint64_t mma_mbar[kNumStages];
     uint64_t epi_mbar[kNumStages];
-    uint64_t topk_mbar[kNumStages];
     uint64_t tmem_reuse_mbar[kNumTmemSlots];
     uint64_t q_mbar;
 
-    // Epilogue candidate buffers
-    float stage_tile_scores[kNumStages * kStageTokens];
+    // Epilogue reduction scratch
     float stage_tile_pair_partial[kNumStages * kStageTokens];
-    int stage_tile_ids[kNumStages * kStageTokens];
-
-    // Top-k buffers
-    float topk_scores[2][kTopk];
-    int topk_ids[2][kTopk];
-    int topk_fill;
-    int topk_bank;
-    int topk_sorted_ready;
-    float topk_cutoff_score;
-    int topk_cutoff_id;
-    float topk_keep_scores[kTopk];
-    int topk_keep_ids[kTopk];
-    int topk_keep_count;
 
     // TMEM scratch
     int tmem_addr_scratch;
@@ -115,7 +96,6 @@ struct SmemAddrs {
     int tma_mbar;
     int mma_mbar;
     int epi_mbar;
-    int topk_mbar;
     int tmem_reuse_mbar;
     int q_mbar;
     int tmem_addr_scratch;
@@ -135,7 +115,6 @@ __device__ inline SmemAddrs init_smem_addrs(SmemLayout* s) {
     a.tma_mbar        = off(s->tma_mbar);
     a.mma_mbar        = off(s->mma_mbar);
     a.epi_mbar        = off(s->epi_mbar);
-    a.topk_mbar       = off(s->topk_mbar);
     a.tmem_reuse_mbar = off(s->tmem_reuse_mbar);
     a.q_mbar          = off(&s->q_mbar);
     a.tmem_addr_scratch = off(&s->tmem_addr_scratch);
@@ -156,16 +135,8 @@ __device__ inline uint32_t elect_sync() {
 }
 
 __device__ inline bool _is_ep_warp(int warp_id) {
-    // EP uses the first 8 warps (0..7).
+    // EP uses the first 16 warps (0..15).
     return warp_id < kNumEpilogueWarps;
-}
-
-__device__ inline bool _is_topk_warp(int warp_id) {
-    return (warp_id >= kNumEpilogueWarps) && (warp_id < kEpTopkWarpCount);
-}
-
-__device__ inline int _topk_warp_rank(int warp_id) {
-    return warp_id - kNumEpilogueWarps;
 }
 
 __device__ inline constexpr uint64_t desc_encode(uint64_t x) {
@@ -348,18 +319,14 @@ __device__ inline void tcgen05_fence_after_thread_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 }
 
-__device__ inline void tcgen05_ld_32x32b_64(int lane_base, int col_base, float out_vals[kStageTokens]) {
+__device__ inline void tcgen05_ld_32x32b_32(int lane_base, int col_base, float out_vals[32]) {
     const int addr = (lane_base << 16) | col_base;
     asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x64.b32 "
+        "tcgen05.ld.sync.aligned.32x32b.x32.b32 "
         "{%0, %1, %2, %3, %4, %5, %6, %7, "
         "%8, %9, %10, %11, %12, %13, %14, %15, "
         "%16, %17, %18, %19, %20, %21, %22, %23, "
-        "%24, %25, %26, %27, %28, %29, %30, %31, "
-        "%32, %33, %34, %35, %36, %37, %38, %39, "
-        "%40, %41, %42, %43, %44, %45, %46, %47, "
-        "%48, %49, %50, %51, %52, %53, %54, %55, "
-        "%56, %57, %58, %59, %60, %61, %62, %63}, [%64];"
+        "%24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
         : "=f"(out_vals[0]), "=f"(out_vals[1]), "=f"(out_vals[2]), "=f"(out_vals[3]),
           "=f"(out_vals[4]), "=f"(out_vals[5]), "=f"(out_vals[6]), "=f"(out_vals[7]),
           "=f"(out_vals[8]), "=f"(out_vals[9]), "=f"(out_vals[10]), "=f"(out_vals[11]),
@@ -367,346 +334,19 @@ __device__ inline void tcgen05_ld_32x32b_64(int lane_base, int col_base, float o
           "=f"(out_vals[16]), "=f"(out_vals[17]), "=f"(out_vals[18]), "=f"(out_vals[19]),
           "=f"(out_vals[20]), "=f"(out_vals[21]), "=f"(out_vals[22]), "=f"(out_vals[23]),
           "=f"(out_vals[24]), "=f"(out_vals[25]), "=f"(out_vals[26]), "=f"(out_vals[27]),
-          "=f"(out_vals[28]), "=f"(out_vals[29]), "=f"(out_vals[30]), "=f"(out_vals[31]),
-          "=f"(out_vals[32]), "=f"(out_vals[33]), "=f"(out_vals[34]), "=f"(out_vals[35]),
-          "=f"(out_vals[36]), "=f"(out_vals[37]), "=f"(out_vals[38]), "=f"(out_vals[39]),
-          "=f"(out_vals[40]), "=f"(out_vals[41]), "=f"(out_vals[42]), "=f"(out_vals[43]),
-          "=f"(out_vals[44]), "=f"(out_vals[45]), "=f"(out_vals[46]), "=f"(out_vals[47]),
-          "=f"(out_vals[48]), "=f"(out_vals[49]), "=f"(out_vals[50]), "=f"(out_vals[51]),
-          "=f"(out_vals[52]), "=f"(out_vals[53]), "=f"(out_vals[54]), "=f"(out_vals[55]),
-          "=f"(out_vals[56]), "=f"(out_vals[57]), "=f"(out_vals[58]), "=f"(out_vals[59]),
-          "=f"(out_vals[60]), "=f"(out_vals[61]), "=f"(out_vals[62]), "=f"(out_vals[63])
+          "=f"(out_vals[28]), "=f"(out_vals[29]), "=f"(out_vals[30]), "=f"(out_vals[31])
         : "r"(addr));
 }
 
-__device__ inline void tcgen05_ld_32x32b_8(int lane_base, int col_base, float out_vals[8]) {
-    const int addr = (lane_base << 16) | col_base;
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x8.b32 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-        : "=f"(out_vals[0]), "=f"(out_vals[1]), "=f"(out_vals[2]), "=f"(out_vals[3]),
-          "=f"(out_vals[4]), "=f"(out_vals[5]), "=f"(out_vals[6]), "=f"(out_vals[7])
-        : "r"(addr));
-}
-
-__device__ inline void topk_team_barrier_8warps() {
-    asm volatile("bar.sync 2, 256;" ::: "memory");
-}
-
-__device__ inline bool topk_pair_better_desc(float sa, int ida, float sb, int idb) {
-    if (sa > sb) return true;
-    if (sa < sb) return false;
-    return ida < idb;
-}
-
-template <int N>
-__device__ inline void topk_bitonic_sort_desc_team(
-    int topk_warp,
-    int lane,
-    float* scores,
-    int* ids
-) {
-    static_assert((N & (N - 1)) == 0, "N must be a power of two");
-    constexpr int kTeamThreads = kNumTopkWarps * 32;
-    const int tid = topk_warp * 32 + lane;
-
-    for (int k = 2; k <= N; k <<= 1) {
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            for (int i = tid; i < N; i += kTeamThreads) {
-                const int ixj = i ^ j;
-                if (ixj > i) {
-                    const float si = scores[i];
-                    const int idi = ids[i];
-                    const float sj = scores[ixj];
-                    const int idj = ids[ixj];
-
-                    const bool up = ((i & k) == 0);
-                    const bool swap = up
-                        ? topk_pair_better_desc(sj, idj, si, idi)
-                        : topk_pair_better_desc(si, idi, sj, idj);
-                    if (swap) {
-                        scores[i] = sj;
-                        ids[i] = idj;
-                        scores[ixj] = si;
-                        ids[ixj] = idi;
-                    }
-                }
-            }
-            topk_team_barrier_8warps();
-        }
-    }
-}
-
-__device__ inline int topk_stage_fill_and_maybe_sort(
-    int topk_warp,
-    int lane,
-    int valid_tokens,
-    const float* cand_scores,
-    const int* cand_ids,
-    int topk,
-    SmemLayout& s
-) {
-    const int tid = topk_warp * 32 + lane;
-    int rem_start = 0;
-
-    if (topk <= 0 || valid_tokens <= 0) {
-        return 0;
-    }
-
-    if (s.topk_fill < topk) {
-        const int fill_before = s.topk_fill;
-        int append_cnt = valid_tokens;
-        const int room = topk - fill_before;
-        if (append_cnt > room) append_cnt = room;
-
-        if (tid < append_cnt) {
-            const int bank = s.topk_bank;
-            const int dst = fill_before + tid;
-            s.topk_scores[bank][dst] = cand_scores[tid];
-            s.topk_ids[bank][dst] = cand_ids[tid];
-        }
-        topk_team_barrier_8warps();
-
-        if (topk_warp == 0 && lane == 0) {
-            s.topk_fill = fill_before + append_cnt;
-        }
-        topk_team_barrier_8warps();
-
-        rem_start = append_cnt;
-
-        if (s.topk_fill == topk && s.topk_sorted_ready == 0) {
-            const int bank = s.topk_bank;
-            topk_bitonic_sort_desc_team<kTopk>(topk_warp, lane, s.topk_scores[bank], s.topk_ids[bank]);
-            if (topk_warp == 0 && lane == 0) {
-                s.topk_sorted_ready = 1;
-                s.topk_cutoff_score = s.topk_scores[bank][topk - 1];
-                s.topk_cutoff_id = s.topk_ids[bank][topk - 1];
-            }
-            topk_team_barrier_8warps();
-        }
-    }
-    return rem_start;
-}
-
-template <int kThreadQ>
-__device__ inline bool topk_enqueue_stage_candidates_faiss(
-    int topk_warp,
-    int lane,
-    int valid_tokens,
-    int rem_start,
-    const float* cand_scores,
-    const int* cand_ids,
-    float (&thread_scores)[kThreadQ],
-    int (&thread_ids)[kThreadQ],
-    int& thread_count,
-    SmemLayout& s
-) {
-    const int rem_count = valid_tokens - rem_start;
-    if (rem_count <= 0 || s.topk_sorted_ready == 0 || s.topk_fill < kTopk) {
-        return false;
-    }
-
-    const int tid = topk_warp * 32 + lane;
-    if (tid >= rem_count) {
-        return false;
-    }
-
-    const int token = rem_start + tid;
-    const float sc = cand_scores[token];
-    const int id = cand_ids[token];
-    if (!topk_pair_better_desc(sc, id, s.topk_cutoff_score, s.topk_cutoff_id)) {
-        return false;
-    }
-
-    if (thread_count < kThreadQ) {
-        thread_scores[thread_count] = sc;
-        thread_ids[thread_count] = id;
-        ++thread_count;
-        return true;
-    }
-
-    int worst = 0;
-    #pragma unroll
-    for (int i = 1; i < kThreadQ; ++i) {
-        if (topk_pair_better_desc(thread_scores[worst], thread_ids[worst], thread_scores[i], thread_ids[i])) {
-            worst = i;
-        }
-    }
-    if (topk_pair_better_desc(sc, id, thread_scores[worst], thread_ids[worst])) {
-        thread_scores[worst] = sc;
-        thread_ids[worst] = id;
-        return true;
-    }
-    return false;
-}
-
-template <int kThreadQ>
-__device__ inline void topk_flush_thread_queue_faiss(
-    int topk_warp,
-    int lane,
-    float (&thread_scores)[kThreadQ],
-    int (&thread_ids)[kThreadQ],
-    int& thread_count,
-    int topk,
-    SmemLayout& s
-) {
-    constexpr float kNegInf = -3.402823466e+38F;
-    constexpr int kTeamThreads = kTopkTeamThreads;
-
-    if (topk <= 0 || s.topk_sorted_ready == 0 || s.topk_fill < topk) {
-        thread_count = 0;
-        return;
-    }
-
-    if (topk_warp == 0 && lane == 0) {
-        s.topk_keep_count = 0;
-    }
-    topk_team_barrier_8warps();
-
-    #pragma unroll
-    for (int i = 0; i < kThreadQ; ++i) {
-        if (i < thread_count) {
-            const int pos = atomicAdd(&s.topk_keep_count, 1);
-            if (pos < topk) {
-                s.topk_keep_scores[pos] = thread_scores[i];
-                s.topk_keep_ids[pos] = thread_ids[i];
-            }
-        }
-    }
-    thread_count = 0;
-    topk_team_barrier_8warps();
-
-    int keep_count = s.topk_keep_count;
-    if (keep_count > topk) {
-        keep_count = topk;
-    }
-    if (keep_count <= 0) {
-        return;
-    }
-
-    const int tid = topk_warp * 32 + lane;
-    for (int i = tid; i < topk; i += kTeamThreads) {
-        if (i >= keep_count) {
-            s.topk_keep_scores[i] = kNegInf;
-            s.topk_keep_ids[i] = INT_MAX;
-        }
-    }
-    topk_team_barrier_8warps();
-
-    topk_bitonic_sort_desc_team<kTopk>(topk_warp, lane, s.topk_keep_scores, s.topk_keep_ids);
-    topk_team_barrier_8warps();
-
-    if (topk_warp == 0 && lane == 0) {
-        const int src_bank = s.topk_bank;
-        const int dst_bank = src_bank ^ 1;
-        const float* src_scores = s.topk_scores[src_bank];
-        const int* src_ids = s.topk_ids[src_bank];
-        float* dst_scores = s.topk_scores[dst_bank];
-        int* dst_ids = s.topk_ids[dst_bank];
-
-        int ia = 0;
-        int ib = 0;
-        for (int out = 0; out < topk; ++out) {
-            bool take_a = false;
-            if (ib >= keep_count) {
-                take_a = true;
-            } else if (ia >= topk) {
-                take_a = false;
-            } else {
-                take_a = topk_pair_better_desc(
-                    src_scores[ia], src_ids[ia],
-                    s.topk_keep_scores[ib], s.topk_keep_ids[ib]);
-            }
-
-            if (take_a) {
-                dst_scores[out] = src_scores[ia];
-                dst_ids[out] = src_ids[ia];
-                ++ia;
-            } else {
-                dst_scores[out] = s.topk_keep_scores[ib];
-                dst_ids[out] = s.topk_keep_ids[ib];
-                ++ib;
-            }
-        }
-
-        s.topk_bank = dst_bank;
-        s.topk_cutoff_score = dst_scores[topk - 1];
-        s.topk_cutoff_id = dst_ids[topk - 1];
-    }
-    topk_team_barrier_8warps();
-}
-
-__device__ inline void topk_finalize_emit_sorted_merge(
-    int topk_warp,
-    int lane,
-    int* out_b,
-    int topk,
-    SmemLayout& s
-) {
-    constexpr float kNegInf = -3.402823466e+38F;
-    constexpr int kTeamThreads = kNumTopkWarps * 32;
-    const int tid = topk_warp * 32 + lane;
-
-    if (topk <= 0 || s.topk_fill <= 0) {
-        return;
-    }
-
-    if (s.topk_sorted_ready == 0) {
-        const int bank = s.topk_bank;
-        const int fill = s.topk_fill;
-        for (int i = tid; i < topk; i += kTeamThreads) {
-            if (i >= fill) {
-                s.topk_scores[bank][i] = kNegInf;
-                s.topk_ids[bank][i] = INT_MAX;
-            }
-        }
-        topk_team_barrier_8warps();
-
-        topk_bitonic_sort_desc_team<kTopk>(topk_warp, lane, s.topk_scores[bank], s.topk_ids[bank]);
-        if (topk_warp == 0 && lane == 0) {
-            s.topk_sorted_ready = 1;
-            s.topk_cutoff_score = s.topk_scores[bank][topk - 1];
-            s.topk_cutoff_id = s.topk_ids[bank][topk - 1];
-        }
-        topk_team_barrier_8warps();
-    }
-
-    const int bank = s.topk_bank;
-    const int fill = s.topk_fill;
-    const int emit = (fill < topk) ? fill : topk;
-    for (int i = tid; i < emit; i += kTeamThreads) {
-        out_b[i] = s.topk_ids[bank][i];
-    }
-}
-
-__device__ inline void run_topk_warps_sorted_merge(
-    int warp_id,
-    int lane,
-    int num_tiles,
-    SmemLayout& s,
-    const SmemAddrs& addr
-) {
-    if (!_is_topk_warp(warp_id)) {
-        return;
-    }
-
-    const int topk_warp = _topk_warp_rank(warp_id);
-    // Stubbed top-k warp path:
-    // Keep only producer/consumer mbarrier handshakes so stage reuse ordering is unchanged.
-    // Final top-k indices are computed on the Python side with torch.topk.
-    for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
-        const int stage = tile_id % kNumStages;
-        const int phase = (tile_id / kNumStages) & 1;
-        if (topk_warp == 0 && lane == 0) {
-            mbarrier_wait_parity(
-                addr.epi_mbar + stage * static_cast<int>(sizeof(uint64_t)),
-                phase);
-        }
-        topk_team_barrier_8warps();
-        if (topk_warp == 0 && lane == 0) {
-            mbarrier_arrive(addr.topk_mbar + stage * static_cast<int>(sizeof(uint64_t)));
-        }
-        topk_team_barrier_8warps();
+__device__ inline void ep_team_barrier_4warps(int ep_team) {
+    if (ep_team == 0) {
+        asm volatile("bar.sync 3, 128;" ::: "memory");
+    } else if (ep_team == 1) {
+        asm volatile("bar.sync 4, 128;" ::: "memory");
+    } else if (ep_team == 2) {
+        asm volatile("bar.sync 5, 128;" ::: "memory");
+    } else {
+        asm volatile("bar.sync 6, 128;" ::: "memory");
     }
 }
 
@@ -720,15 +360,13 @@ __device__ inline void run_epilogue_warps(
     int* out_ids_b,
     int out_stride
 ) {
-    // EP uses the first 8 warps, split as two 4-warp teams.
-    // Each 4-warp team (slots 0..3) accumulates one 16-token chunk at a time.
+    // EP uses first 16 warps, as 4 independent 4-warp teams.
     if (!_is_ep_warp(warp_id)) {
         return;
     }
 
-    constexpr int kTokensPerChunk = 16;
-    constexpr int kValsPerLd = 8;
-    const int ep_team = warp_id >> 2;  // 0 or 1
+    constexpr int kTokensPerChunk = 32;
+    const int ep_team = warp_id >> 2;  // 0..3
     const int ep_slot = warp_id & 3;   // 0..3
     const int lane_base = ep_slot * 32;
     const int lane16 = lane & 15;
@@ -738,30 +376,32 @@ __device__ inline void run_epilogue_warps(
     for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
         const int stage = tile_id % kNumStages;
         const int tmem_slot = tile_id % kNumTmemSlots;
+        const int stage_owner_team = stage % kNumEpTeams;
+        if (ep_team != stage_owner_team) {
+            continue;
+        }
 
-        if (warp_id == 0 && elect_sync()) {
+        if (ep_slot == 0 && elect_sync()) {
             mbarrier_wait_parity(
                 addr.mma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
                 s.mma_phase[stage]);
             s.mma_phase[stage] ^= 1;
         }
 
-        asm volatile("bar.sync 1, 256;" ::: "memory");
+        ep_team_barrier_4warps(ep_team);
         tcgen05_fence_after_thread_sync();
 
         const int valid_tokens = s.stage_valid_tokens[stage];
         if (valid_tokens > 0) {
             const int page_idx = s.stage_page_idx[stage];
             float* partial_scores = s.stage_tile_pair_partial + stage * kStageTokens;
-            float* cand_scores = s.stage_tile_scores + stage * kStageTokens;
-            int* cand_ids = s.stage_tile_ids + stage * kStageTokens;
             const float* stage_scale = s.k_stage_scale + stage * kStageTokens;
             const float w = s.w_stage[head];
 
-            // Two passes: tokens {0..31} and {32..63}. Team 0 does low 16 of pass, team 1 does high 16.
+            // Two passes: tokens {0..31} and {32..63}.
             #pragma unroll
             for (int pass = 0; pass < 2; ++pass) {
-                const int token_base = pass * 32 + ep_team * kTokensPerChunk;
+                const int token_base = pass * kTokensPerChunk;
                 int chunk_valid = valid_tokens - token_base;
                 if (chunk_valid < 0) chunk_valid = 0;
                 if (chunk_valid > kTokensPerChunk) chunk_valid = kTokensPerChunk;
@@ -774,12 +414,8 @@ __device__ inline void run_epilogue_warps(
 
                 if (chunk_valid > 0) {
                     const int tmem_col_base = tmem_slot * kStageTokens + token_base;
-                    float lane_regs_0[kValsPerLd];
-                    float lane_regs_1[kValsPerLd];
-
-                    tcgen05_ld_32x32b_8(lane_base, tmem_col_base, lane_regs_0);
-                    tcgen05_wait_ld();
-                    tcgen05_ld_32x32b_8(lane_base, tmem_col_base + kValsPerLd, lane_regs_1);
+                    float lane_regs[kTokensPerChunk];
+                    tcgen05_ld_32x32b_32(lane_base, tmem_col_base, lane_regs);
                     tcgen05_wait_ld();
 
                     if (lane_active) {
@@ -788,9 +424,7 @@ __device__ inline void run_epilogue_warps(
                             const int tok = token_base + token;
                             float lane_val = 0.0f;
                             if (token < chunk_valid) {
-                                const float raw = (token < kValsPerLd)
-                                                    ? lane_regs_0[token]
-                                                    : lane_regs_1[token - kValsPerLd];
+                                const float raw = lane_regs[token];
                                 lane_val = fmaxf(raw * stage_scale[tok], 0.0f) * w;
                             }
                             #pragma unroll
@@ -810,7 +444,7 @@ __device__ inline void run_epilogue_warps(
                         }
                     }
                 }
-                asm volatile("bar.sync 1, 256;" ::: "memory");
+                ep_team_barrier_4warps(ep_team);
 
                 if (lane == 0 && ep_slot == 1) {
                     #pragma unroll
@@ -820,7 +454,7 @@ __device__ inline void run_epilogue_warps(
                         }
                     }
                 }
-                asm volatile("bar.sync 1, 256;" ::: "memory");
+                ep_team_barrier_4warps(ep_team);
 
                 if (lane == 0 && ep_slot == 2) {
                     #pragma unroll
@@ -830,7 +464,7 @@ __device__ inline void run_epilogue_warps(
                         }
                     }
                 }
-                asm volatile("bar.sync 1, 256;" ::: "memory");
+                ep_team_barrier_4warps(ep_team);
 
                 if (lane == 0 && ep_slot == 3) {
                     #pragma unroll
@@ -838,9 +472,7 @@ __device__ inline void run_epilogue_warps(
                         if (token < chunk_valid) {
                             const int tok = token_base + token;
                             const float final = partial_scores[tok] + warp_partial[token];
-                            cand_scores[tok] = final;
                             const int global_token = page_idx * kPageSize + tok;
-                            cand_ids[tok] = global_token;
                             const int seq_tok = tile_id * kStageTokens + tok;
                             if (seq_tok < out_stride) {
                                 out_scores_b[seq_tok] = final;
@@ -849,11 +481,11 @@ __device__ inline void run_epilogue_warps(
                         }
                     }
                 }
-                asm volatile("bar.sync 1, 256;" ::: "memory");
+                ep_team_barrier_4warps(ep_team);
             }
         }
 
-        if (warp_id == 0 && elect_sync()) {
+        if (ep_slot == 0 && elect_sync()) {
             mbarrier_arrive(addr.tmem_reuse_mbar + tmem_slot * static_cast<int>(sizeof(uint64_t)));
             mbarrier_arrive(addr.epi_mbar + stage * static_cast<int>(sizeof(uint64_t)));
         }
@@ -918,10 +550,9 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
             mbarrier_init(addr.tma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
             mbarrier_init(addr.mma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
             mbarrier_init(addr.epi_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
-            mbarrier_init(addr.topk_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
             s.tma_phase[i] = 0;
             s.mma_phase[i] = 0;
-            s.topk_phase[i] = 0;
+            s.epi_phase[i] = 0;
         }
         for (int i = 0; i < kNumTmemSlots; ++i) {
             mbarrier_init(addr.tmem_reuse_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
@@ -972,12 +603,12 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
         for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
             const int stage = tile_id % kNumStages;
 
-            // Stage reuse requires prior top-k consumption on the same stage slot.
+            // Stage reuse requires prior epilogue completion on the same stage slot.
             if (tile_id >= kNumStages) {
                 mbarrier_wait_parity(
-                    addr.topk_mbar + stage * static_cast<int>(sizeof(uint64_t)),
-                    s.topk_phase[stage]);
-                s.topk_phase[stage] ^= 1;
+                    addr.epi_mbar + stage * static_cast<int>(sizeof(uint64_t)),
+                    s.epi_phase[stage]);
+                s.epi_phase[stage] ^= 1;
             }
 
             int page_idx, valid_tokens;
@@ -1056,14 +687,6 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
         out_scores_b,
         out_ids_b,
         out_stride);
-
-    // ---------------- Top-k warps ----------------
-    run_topk_warps_sorted_merge(
-        warp_id,
-        lane,
-        num_tiles,
-        s,
-        addr);
 
     __syncthreads();
     if (warp_id == kMmaWarp) {
