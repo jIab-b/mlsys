@@ -366,18 +366,13 @@ __device__ inline void run_epilogue_warps(
     int* out_ids_b,
     int out_stride
 ) {
-    // EP uses first kNumEpilogueWarps warps, as kNumEpTeams independent 4-warp teams.
+    // EP baseline path: keep only mbarrier handshakes (no epilogue compute).
     if (!_is_ep_warp(warp_id)) {
         return;
     }
 
-    constexpr int kTokensPerChunk = 32;
     const int ep_team = warp_id >> 2;  // 0..kNumEpTeams-1
     const int ep_slot = warp_id & 3;   // 0..3
-    const int lane_base = ep_slot * 32;
-    const int lane16 = lane & 15;
-    const bool lane_active = (lane < 16);
-    const int head = ep_slot * 16 + lane16;
 
     for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
         const int stage = tile_id % kNumStages;
@@ -392,103 +387,6 @@ __device__ inline void run_epilogue_warps(
                 addr.mma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
                 s.mma_phase[stage]);
             s.mma_phase[stage] ^= 1;
-        }
-
-        ep_team_barrier_4warps(ep_team);
-        tcgen05_fence_after_thread_sync();
-
-        const int valid_tokens = s.stage_valid_tokens[stage];
-        if (valid_tokens > 0) {
-            const int page_idx = s.stage_page_idx[stage];
-            float* partial_scores = s.stage_tile_pair_partial + stage * kStageTokens;
-            const float* stage_scale = s.k_stage_scale + stage * kStageTokens;
-            const float w = s.w_stage[head];
-
-            // Two passes: tokens {0..31} and {32..63}.
-            #pragma unroll
-            for (int pass = 0; pass < 2; ++pass) {
-                const int token_base = pass * kTokensPerChunk;
-                int chunk_valid = valid_tokens - token_base;
-                if (chunk_valid < 0) chunk_valid = 0;
-                if (chunk_valid > kTokensPerChunk) chunk_valid = kTokensPerChunk;
-
-                float warp_partial[kTokensPerChunk];
-                #pragma unroll
-                for (int token = 0; token < kTokensPerChunk; ++token) {
-                    warp_partial[token] = 0.0f;
-                }
-
-                if (chunk_valid > 0) {
-                    const int tmem_col_base = tmem_slot * kStageTokens + token_base;
-                    float lane_regs[kTokensPerChunk];
-                    tcgen05_ld_32x32b_32(lane_base, tmem_col_base, lane_regs);
-                    tcgen05_wait_ld();
-
-                    if (lane_active) {
-                        #pragma unroll
-                        for (int token = 0; token < kTokensPerChunk; ++token) {
-                            const int tok = token_base + token;
-                            float lane_val = 0.0f;
-                            if (token < chunk_valid) {
-                                const float raw = lane_regs[token];
-                                lane_val = fmaxf(raw * stage_scale[tok], 0.0f) * w;
-                            }
-                            #pragma unroll
-                            for (int off = 8; off > 0; off >>= 1) {
-                                lane_val += __shfl_down_sync(0x0000FFFFU, lane_val, off);
-                            }
-                            warp_partial[token] = lane_val;
-                        }
-                    }
-                }
-
-                if (lane == 0 && ep_slot == 0) {
-                    #pragma unroll
-                    for (int token = 0; token < kTokensPerChunk; ++token) {
-                        if (token < chunk_valid) {
-                            partial_scores[token_base + token] = warp_partial[token];
-                        }
-                    }
-                }
-                ep_team_barrier_4warps(ep_team);
-
-                if (lane == 0 && ep_slot == 1) {
-                    #pragma unroll
-                    for (int token = 0; token < kTokensPerChunk; ++token) {
-                        if (token < chunk_valid) {
-                            partial_scores[token_base + token] += warp_partial[token];
-                        }
-                    }
-                }
-                ep_team_barrier_4warps(ep_team);
-
-                if (lane == 0 && ep_slot == 2) {
-                    #pragma unroll
-                    for (int token = 0; token < kTokensPerChunk; ++token) {
-                        if (token < chunk_valid) {
-                            partial_scores[token_base + token] += warp_partial[token];
-                        }
-                    }
-                }
-                ep_team_barrier_4warps(ep_team);
-
-                if (lane == 0 && ep_slot == 3) {
-                    #pragma unroll
-                    for (int token = 0; token < kTokensPerChunk; ++token) {
-                        if (token < chunk_valid) {
-                            const int tok = token_base + token;
-                            const float final = partial_scores[tok] + warp_partial[token];
-                            const int global_token = page_idx * kPageSize + tok;
-                            const int seq_tok = tile_id * kStageTokens + tok;
-                            if (seq_tok < out_stride) {
-                                out_scores_b[seq_tok] = final;
-                                out_ids_b[seq_tok] = global_token;
-                            }
-                        }
-                    }
-                }
-                ep_team_barrier_4warps(ep_team);
-            }
         }
 
         if (ep_slot == 0 && elect_sync()) {
@@ -988,7 +886,7 @@ def custom_kernel(data: input_t) -> output_t:
         out_ids,
     )
 
-    k = min(topk, max_seq)
-    top_pos = torch.topk(out_scores, k, dim=1).indices
-    out_topk_indices[:, :k] = torch.gather(out_ids, 1, top_pos).to(torch.int32)
+    # k = min(topk, max_seq)
+    # top_pos = torch.topk(out_scores, k, dim=1).indices
+    # out_topk_indices[:, :k] = torch.gather(out_ids, 1, top_pos).to(torch.int32)
     return (out_topk_indices,)
