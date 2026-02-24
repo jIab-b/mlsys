@@ -360,10 +360,11 @@ __device__ inline void run_epilogue_warps(
     int* out_ids_b,
     int out_stride
 ) {
-    // EP ring-loader stub:
+    // EP register-heavy variant:
     // - owner team = tile_id % kNumEpTeams
-    // - load TMEM rows into per-stage raw SMEM buffer
-    // - keep only handshake signaling (no score/top-k compute yet)
+    // - load TMEM rows, apply scale+relu+weight in registers
+    // - reduce 16 heads in-warp, atomically accumulate to out_scores
+    // - no EP staging to SMEM
     if (!_is_ep_warp(warp_id)) {
         return;
     }
@@ -371,10 +372,10 @@ __device__ inline void run_epilogue_warps(
     const int ep_team = warp_id >> 2;  // 0..kNumEpTeams-1
     const int ep_slot = warp_id & 3;   // 0..3
     const int lane16 = lane & 15;
-    const int lane_half = lane >> 4;   // 0: tokens 0..31, 1: tokens 32..63
+    const bool active_lane = (lane < 16);
     const int head = ep_slot * 16 + lane16;
     const int lane_base = ep_slot * 32;
-    constexpr int kTokensPerLoad = 32;
+    constexpr int kTokensPerHalf = 32;
 
     for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
         const int stage = tile_id % kNumStages;
@@ -395,19 +396,76 @@ __device__ inline void run_epilogue_warps(
         tcgen05_fence_after_thread_sync();
 
         const int valid_tokens = s.stage_valid_tokens[stage];
+        const int tile_seq_start = tile_id * kStageTokens;
+        const int page_idx = s.stage_page_idx[stage];
+        if (ep_slot == 0 && valid_tokens > 0) {
+            for (int tok = lane; tok < valid_tokens; tok += 32) {
+                const int out_idx = tile_seq_start + tok;
+                if (out_idx < out_stride) {
+                    out_scores_b[out_idx] = 0.0f;
+                    out_ids_b[out_idx] = page_idx * kPageSize + tok;
+                }
+            }
+        }
+
+        ep_team_barrier_4warps(ep_team);
+
         if (valid_tokens > 0) {
-            const int token_base = lane_half * kTokensPerLoad;
             const int tmem_col_base = tmem_slot * kStageTokens;
-            float lane_regs[kTokensPerLoad];
-            tcgen05_ld_32x32b_32(lane_base, tmem_col_base, lane_regs);
+            const float* stage_scale = s.k_stage_scale + stage * kStageTokens;
+            const float w = s.w_stage[head];
+            float lane_vals_lo[kTokensPerHalf];
+            float lane_vals_hi[kTokensPerHalf];
+            tcgen05_ld_32x32b_32(lane_base, tmem_col_base, lane_vals_lo);
+            tcgen05_ld_32x32b_32(lane_base, tmem_col_base + kTokensPerHalf, lane_vals_hi);
             tcgen05_wait_ld();
 
-            #pragma unroll
-            for (int t = 0; t < kTokensPerLoad; ++t) {
-                const int tok = token_base + t;
-                if (tok < valid_tokens) {
-                    const int raw_idx = (stage * kStageTokens + tok) * kNumHeads + head;
-                    s.stage_tile_raw[raw_idx] = lane_regs[t];
+            if (active_lane) {
+                #pragma unroll
+                for (int t = 0; t < kTokensPerHalf; ++t) {
+                    const int tok0 = t;
+                    const int tok1 = t + kTokensPerHalf;
+                    float v0 = 0.0f;
+                    float v1 = 0.0f;
+                    if (tok0 < valid_tokens) {
+                        const float scaled0 = lane_vals_lo[t] * stage_scale[tok0];
+                        v0 = fmaxf(scaled0, 0.0f) * w;
+                    }
+                    if (tok1 < valid_tokens) {
+                        const float scaled1 = lane_vals_hi[t] * stage_scale[tok1];
+                        v1 = fmaxf(scaled1, 0.0f) * w;
+                    }
+                    lane_vals_lo[t] = v0;
+                    lane_vals_hi[t] = v1;
+                }
+
+                #pragma unroll
+                for (int off = 8; off > 0; off >>= 1) {
+                    #pragma unroll
+                    for (int t = 0; t < kTokensPerHalf; ++t) {
+                        lane_vals_lo[t] += __shfl_down_sync(0x0000FFFF, lane_vals_lo[t], off, 16);
+                        lane_vals_hi[t] += __shfl_down_sync(0x0000FFFF, lane_vals_hi[t], off, 16);
+                    }
+                }
+
+                if (lane16 == 0) {
+                    #pragma unroll
+                    for (int t = 0; t < kTokensPerHalf; ++t) {
+                        const int tok0 = t;
+                        const int tok1 = t + kTokensPerHalf;
+                        if (tok0 < valid_tokens) {
+                            const int out_idx0 = tile_seq_start + tok0;
+                            if (out_idx0 < out_stride) {
+                                atomicAdd(out_scores_b + out_idx0, lane_vals_lo[t]);
+                            }
+                        }
+                        if (tok1 < valid_tokens) {
+                            const int out_idx1 = tile_seq_start + tok1;
+                            if (out_idx1 < out_stride) {
+                                atomicAdd(out_scores_b + out_idx1, lane_vals_hi[t]);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -827,7 +885,7 @@ def _get_module():
     global _module
     if _module is None:
         _module = load_inline(
-            name="dsa_topk_indexer_ext",
+            name="dsa_topk_indexer_ext_ld_rmem",
             cpp_sources=cpp_decl_src,
             cuda_sources=cuda_src,
             functions=["dsa_topk_indexer_launch"],

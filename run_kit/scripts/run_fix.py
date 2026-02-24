@@ -13,10 +13,14 @@ app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
-image = (
+env_image = {
+    "CUDA_HOME": "/usr/local/cuda",
+    "TVM_FFI_CUDA_ARCH_LIST": "10.0a",
+}
 
+image = (
     modal.Image.from_registry("pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel")
-    .env({"CUDA_HOME": "/usr/local/cuda"})
+    .env(env_image)
     .pip_install("flashinfer-bench", "triton", "numpy")
 )
 
@@ -48,6 +52,25 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     except Exception as e:
         return {"__error__": {"status": "COMPILE_ERROR", "log": f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"}}
 
+    # Smoke test: run first workload only — bail fast on runtime errors
+    smoke_config = BenchmarkConfig(warmup_runs=0, iterations=1, num_trials=1)
+    smoke_trace_set = TraceSet(
+        root=trace_set.root,
+        definitions={definition.name: definition},
+        solutions={definition.name: [solution]},
+        workloads={definition.name: workloads[:1]},
+        traces={definition.name: []},
+    )
+    try:
+        smoke_result = Benchmark(smoke_trace_set, smoke_config).run_all(dump_traces=False)
+    except Exception as e:
+        return {"__error__": {"status": "RUNTIME_ERROR", "log": f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"}}
+    for trace in smoke_result.traces.get(definition.name, []):
+        if trace.evaluation and trace.evaluation.status.value != "PASSED":
+            ev = trace.evaluation
+            return {"__error__": {"status": ev.status.value, "log": ev.log or repr(ev)}}
+
+    # Full benchmark
     bench_trace_set = TraceSet(
         root=trace_set.root,
         definitions={definition.name: definition},
@@ -55,7 +78,10 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         workloads={definition.name: workloads},
         traces={definition.name: []},
     )
-    result_trace_set = Benchmark(bench_trace_set, config).run_all(dump_traces=True)
+    try:
+        result_trace_set = Benchmark(bench_trace_set, config).run_all(dump_traces=True)
+    except Exception as e:
+        return {"__error__": {"status": "RUNTIME_ERROR", "log": f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"}}
 
     results = {}
     for trace in result_trace_set.traces.get(definition.name, []):
@@ -69,6 +95,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             entry.update(max_abs_err=ev.correctness.max_absolute_error, max_rel_err=ev.correctness.max_relative_error)
         if ev.log:
             entry["log"] = ev.log
+        if ev.status.value != "PASSED":
+            return {"__error__": {"status": ev.status.value, "log": ev.log or repr(ev)}}
         results[trace.workload.uuid] = entry
     return results
 
