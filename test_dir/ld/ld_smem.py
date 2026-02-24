@@ -360,11 +360,11 @@ __device__ inline void run_epilogue_warps(
     int* out_ids_b,
     int out_stride
 ) {
-    // EP register-heavy variant:
+    // EP deterministic-combine variant:
     // - owner team = tile_id % kNumEpTeams
     // - load TMEM rows, apply scale+relu+weight in registers
-    // - reduce 16 heads in-warp, atomically accumulate to out_scores
-    // - no EP staging to SMEM
+    // - reduce 16 heads in-warp to one partial per ep_slot and token
+    // - store partials to SMEM, then ep_slot 0 sums slots [0..3] in fixed order
     if (!_is_ep_warp(warp_id)) {
         return;
     }
@@ -454,18 +454,31 @@ __device__ inline void run_epilogue_warps(
                         const int tok0 = t;
                         const int tok1 = t + kTokensPerHalf;
                         if (tok0 < valid_tokens) {
-                            const int out_idx0 = tile_seq_start + tok0;
-                            if (out_idx0 < out_stride) {
-                                atomicAdd(out_scores_b + out_idx0, lane_vals_lo[t]);
-                            }
+                            const int part_idx0 = ((stage * kStageTokens + tok0) * kNumHeads) + ep_slot;
+                            s.stage_tile_raw[part_idx0] = lane_vals_lo[t];
                         }
                         if (tok1 < valid_tokens) {
-                            const int out_idx1 = tile_seq_start + tok1;
-                            if (out_idx1 < out_stride) {
-                                atomicAdd(out_scores_b + out_idx1, lane_vals_hi[t]);
-                            }
+                            const int part_idx1 = ((stage * kStageTokens + tok1) * kNumHeads) + ep_slot;
+                            s.stage_tile_raw[part_idx1] = lane_vals_hi[t];
                         }
                     }
+                }
+            }
+        }
+
+        ep_team_barrier_4warps(ep_team);
+
+        if (ep_slot == 0 && valid_tokens > 0) {
+            for (int tok = lane; tok < valid_tokens; tok += 32) {
+                const int out_idx = tile_seq_start + tok;
+                if (out_idx < out_stride) {
+                    const int part_base = ((stage * kStageTokens + tok) * kNumHeads);
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int sidx = 0; sidx < 4; ++sidx) {
+                        sum += s.stage_tile_raw[part_base + sidx];
+                    }
+                    out_scores_b[out_idx] = sum;
                 }
             }
         }

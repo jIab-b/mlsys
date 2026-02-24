@@ -27,10 +27,6 @@ class DsaAttn2048EvalRunner(EvalRunner):
         from reference import check_implementation
         return check_implementation
 
-    def get_reference_kernel(self):
-        from reference import ref_kernel
-        return ref_kernel
-
     def get_compile_kernel(self):
         try:
             from submission import compile_kernel

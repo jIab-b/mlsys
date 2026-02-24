@@ -7,14 +7,12 @@ import time
 import os
 import sys
 import math
-import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 
 import torch.cuda
 
-from .utils import set_seed
-from . import trace as trace_ctx
+from common.utils import set_seed
 
 
 class PopcornOutput:
@@ -71,25 +69,6 @@ def get_test_cases(file_name: str, seed: Optional[int]) -> list[TestCase]:
     tests = []
     lines = content.splitlines()
     for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-
-        # Handle __real__ format: "__real__:{json_workload}"
-        if line.startswith("__real__:"):
-            import json
-            json_str = line[len("__real__:"):]
-            try:
-                workload_record = json.loads(json_str)
-                # Store the full workload record in args with special key
-                case = {"__real_workload__": workload_record}
-                tests.append(TestCase(spec=line[:50] + "...", args=case))
-                continue
-            except json.JSONDecodeError as e:
-                print(f"Invalid __real__ JSON: {e}", file=sys.stderr)
-                exit(113)
-
-        # Standard format: "key: value; key: value; ..."
         parts = line.split(";")
         case = {}
         for part in parts:
@@ -145,139 +124,23 @@ def calculate_stats(durations: list[float]) -> Stats:
 def clone_data(data):
     if isinstance(data, tuple):
         return tuple(clone_data(x) for x in data)
-    if isinstance(data, list):
+    elif isinstance(data, list):
         return [clone_data(x) for x in data]
-    if isinstance(data, dict):
+    elif isinstance(data, dict):
         return {k: clone_data(v) for k, v in data.items()}
-    if isinstance(data, torch.Tensor):
+    elif isinstance(data, torch.Tensor):
         return data.clone()
-    return data
-
-
-def _system_info_trace() -> dict:
-    info = {
-        "hardware": "CPU",
-        "libs": {
-            "torch": str(torch.__version__),
-            "cuda": str(torch.version.cuda) if torch.version.cuda else "",
-        },
-    }
-    if torch.cuda.is_available():
-        info["hardware"] = torch.cuda.get_device_name(0)
-    try:
-        import triton
-        info["libs"]["triton"] = str(triton.__version__)
-    except Exception:
-        info["libs"]["triton"] = ""
-    return info
-
-
-def _max_error_tensor(received, expected, rtol=1e-3, atol=1e-3):
-    diff = (received - expected).abs()
-    max_abs = diff.max().item() if diff.numel() else 0.0
-    denom = expected.abs().clamp_min(1e-12)
-    max_rel = (diff / denom).max().item() if diff.numel() else 0.0
-    close = torch.isclose(received, expected, rtol=rtol, atol=atol)
-    matched = close.count_nonzero().item()
-    total = close.numel()
-    ratio = matched / total if total else 1.0
-    return max_abs, max_rel, matched, total, ratio
-
-
-def _compute_error_metrics(output, expected, rtol=1e-3, atol=1e-3):
-    max_abs = 0.0
-    max_rel = 0.0
-    matched = 0
-    total = 0
-
-    def walk(o, e):
-        nonlocal max_abs, max_rel, matched, total
-        if isinstance(o, torch.Tensor) and isinstance(e, torch.Tensor):
-            a, r, m, t, _ = _max_error_tensor(o, e, rtol=rtol, atol=atol)
-            max_abs = max(max_abs, a)
-            max_rel = max(max_rel, r)
-            matched += m
-            total += t
-            return
-        if isinstance(o, (list, tuple)) and isinstance(e, (list, tuple)):
-            for oo, ee in zip(o, e):
-                walk(oo, ee)
-            return
-        if isinstance(o, dict) and isinstance(e, dict):
-            for key in o.keys() & e.keys():
-                walk(o[key], e[key])
-
-    walk(output, expected)
-    ratio = matched / total if total else 1.0
-    return {
-        "max_absolute_error": max_abs,
-        "max_relative_error": max_rel,
-        "extra": {"matched_ratio": ratio},
-    }
-
-
-def _time_reference(reference_kernel, data):
-    if reference_kernel is None:
-        return None
-    torch.cuda.synchronize()
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    reference_kernel(clone_data(data))
-    end_event.record()
-    torch.cuda.synchronize()
-    return start_event.elapsed_time(end_event)
-
-
-def _write_trace_record(
-    definition: str,
-    solution: str,
-    workload: dict | None,
-    status: str,
-    output,
-    data,
-    reference_kernel,
-    latency_ms: float | None,
-    reference_latency_ms: float | None,
-    log: str,
-):
-    if workload is None:
-        return
-    correctness = None
-    if reference_kernel is not None and output is not None:
-        expected = reference_kernel(clone_data(data))
-        correctness = _compute_error_metrics(output, expected)
-    performance = None
-    if latency_ms is not None:
-        performance = {
-            "latency_ms": latency_ms,
-            "reference_latency_ms": reference_latency_ms,
-            "speedup_factor": (reference_latency_ms / latency_ms) if reference_latency_ms else None,
-        }
-    record = {
-        "definition": definition,
-        "workload": workload,
-        "solution": solution,
-        "evaluation": {
-            "status": "PASSED" if status == "PASSED" else "FAILED",
-            "environment": _system_info_trace(),
-            "timestamp": datetime.datetime.utcnow().isoformat(),
-            "log": log,
-            "correctness": correctness,
-            "performance": performance,
-        },
-    }
-    op_type = os.environ.get("TRACE_OP_TYPE", "sparse_attention")
-    trace_ctx.append_trace_record(definition, record, op_type)
+    else:
+        return data
 
 
 class EvalRunner:
     """Base class for evaluation runners. Override methods as needed."""
 
-    use_cutlass = False
-    use_batched_benchmark = True
-    batch_size = 15
-    use_large_cache_clear = True
+    use_cutlass = False  # Set True to catch OpError
+    use_batched_benchmark = True  # Use batched iterations for more stable timing
+    batch_size = 15  # Number of iterations per benchmark batch
+    use_large_cache_clear = True  # Use clear_l2_cache_large for B200
 
     def __init__(self):
         self._custom_kernel = None
@@ -289,9 +152,9 @@ class EvalRunner:
     def setup(self):
         """Import task-specific modules. Called in subprocess."""
         if self.use_large_cache_clear:
-            from .utils import clear_l2_cache_large as clear_cache
+            from common.utils import clear_l2_cache_large as clear_cache
         else:
-            from .utils import clear_l2_cache as clear_cache
+            from common.utils import clear_l2_cache as clear_cache
         self._clear_cache = clear_cache
 
     def get_custom_kernel(self):
@@ -303,21 +166,21 @@ class EvalRunner:
     def get_check_implementation(self):
         raise NotImplementedError
 
-    def get_reference_kernel(self):
-        """Optional reference kernel for trace metrics."""
-        return None
-
     def get_compile_kernel(self):
+        """Return compile_kernel function or None if not needed."""
         return None
 
     def init_cuda(self):
+        """Initialize CUDA context. Override for cutlass."""
         torch.cuda.init()
 
     def handle_kernel_error(self, e: Exception) -> tuple[bool, str]:
+        """Handle exceptions from kernel execution."""
         print(f"Encountered {e}", file=sys.stderr)
         return False, str(e)
 
     def call_compile_kernel(self):
+        """Call compile_kernel with appropriate arguments."""
         import inspect
         compile_kernel = self.get_compile_kernel()
         if compile_kernel is None:
@@ -329,13 +192,14 @@ class EvalRunner:
         else:
             kwargs = {}
             for name, param in params.items():
-                if name == "use_loop":
-                    kwargs["use_loop"] = True
+                if name == 'use_loop':
+                    kwargs['use_loop'] = True
                 elif param.default is inspect.Parameter.empty:
-                    return
+                    return  # Required param we can't provide
             compile_kernel(**kwargs)
 
     def compile_kernel_once(self) -> tuple[bool, Optional[str]]:
+        """Compile kernel once before benchmarking."""
         try:
             self.init_cuda()
             self.setup()
@@ -346,12 +210,12 @@ class EvalRunner:
             return False, f"Compilation failed: {E}"
 
     def run_single_test(self, test: TestCase) -> tuple[bool, str]:
+        """Run a single test case."""
         self.init_cuda()
         self.setup()
         custom_kernel = self.get_custom_kernel()
         generate_input = self.get_generate_input()
         check_implementation = self.get_check_implementation()
-        reference_kernel = self.get_reference_kernel()
 
         data = generate_input(**test.args)
         torch.cuda.synchronize()
@@ -360,43 +224,31 @@ class EvalRunner:
         except Exception as E:
             return self.handle_kernel_error(E)
         torch.cuda.synchronize()
-        good, message = check_implementation(data, output)
-        if trace_ctx.get_trace_root() is not None:
-            _write_trace_record(
-                definition=os.environ.get("TRACE_DEFINITION", "sparse_attention"),
-                solution=os.environ.get("TRACE_SOLUTION", "submission"),
-                workload=trace_ctx.get_current_workload(),
-                status="PASSED" if good else "FAILED",
-                output=output,
-                data=data,
-                reference_kernel=reference_kernel,
-                latency_ms=None,
-                reference_latency_ms=None,
-                log=message or "",
-            )
-        return good, message
+        return check_implementation(data, output)
 
     def run_single_benchmark(
         self, test: TestCase, recheck: bool, max_repeats: int, max_time_ns: float
     ) -> BenchmarkResult:
+        """Run benchmark - single iteration mode."""
         self.init_cuda()
         self.setup()
         custom_kernel = self.get_custom_kernel()
         generate_input = self.get_generate_input()
         check_implementation = self.get_check_implementation()
-        reference_kernel = self.get_reference_kernel()
 
         durations = []
         correctness_error = None
         data = generate_input(**test.args)
         check_copy = clone_data(data)
 
+        # Ensure kernel is compiled
         try:
             self.call_compile_kernel()
             torch.cuda.synchronize()
         except Exception as E:
             return BenchmarkResult(stats=None, error=f"Compilation failed: {E}")
 
+        # Correctness check
         try:
             output = custom_kernel(clone_data(data))
         except Exception as E:
@@ -404,8 +256,8 @@ class EvalRunner:
         good, message = check_implementation(check_copy, output)
         if not good:
             correctness_error = message
-        first_output = output
 
+        # Timing runs
         bm_start_time = time.perf_counter_ns()
         for i in range(max_repeats):
             if recheck and "seed" in test.args:
@@ -422,7 +274,7 @@ class EvalRunner:
             output = custom_kernel(data)
             end_event.record()
             torch.cuda.synchronize()
-            duration = start_event.elapsed_time(end_event) * 1e6
+            duration = start_event.elapsed_time(end_event) * 1e6  # ms to ns
 
             if recheck:
                 good, message = check_implementation(check_copy, output)
@@ -433,46 +285,30 @@ class EvalRunner:
             durations.append(duration)
 
             total_bm_duration = time.perf_counter_ns() - bm_start_time
-            if i > 1 and total_bm_duration > 1e8:
+            if i > 1 and total_bm_duration > 1e8:  # at least 2 runs and 100ms total
                 stats = calculate_stats(durations)
-                if (
-                    stats.err / stats.mean < 0.001
-                    or stats.mean * stats.runs > max_time_ns
-                    or total_bm_duration > 120e9
-                ):
+                if (stats.err / stats.mean < 0.001 or
+                    stats.mean * stats.runs > max_time_ns or
+                    total_bm_duration > 120e9):
                     break
 
-        stats = calculate_stats(durations)
-        if trace_ctx.get_trace_root() is not None:
-            ref_latency = _time_reference(reference_kernel, check_copy) if reference_kernel else None
-            _write_trace_record(
-                definition=os.environ.get("TRACE_DEFINITION", "sparse_attention"),
-                solution=os.environ.get("TRACE_SOLUTION", "submission"),
-                workload=trace_ctx.get_current_workload(),
-                status="PASSED" if correctness_error is None else "FAILED",
-                output=first_output,
-                data=check_copy,
-                reference_kernel=reference_kernel,
-                latency_ms=stats.mean / 1e6,
-                reference_latency_ms=ref_latency,
-                log=correctness_error or "",
-            )
-        return BenchmarkResult(stats=stats, error=correctness_error)
+        return BenchmarkResult(stats=calculate_stats(durations), error=correctness_error)
 
     def run_single_benchmark_batched(
         self, test: TestCase, recheck: bool, max_repeats: int, max_time_ns: float
     ) -> BenchmarkResult:
+        """Run benchmark - batched iteration mode."""
         self.init_cuda()
         self.setup()
         custom_kernel = self.get_custom_kernel()
         generate_input = self.get_generate_input()
         check_implementation = self.get_check_implementation()
-        reference_kernel = self.get_reference_kernel()
 
         durations = []
         data_list = []
         correctness_error = None
 
+        # Generate batch of inputs
         for i in range(self.batch_size):
             if "seed" in test.args:
                 test.args["seed"] += 42
@@ -481,6 +317,7 @@ class EvalRunner:
 
         check_copy = clone_data(data_list)
 
+        # Correctness check
         outputs = []
         try:
             for data in data_list:
@@ -495,6 +332,7 @@ class EvalRunner:
                 correctness_error = message
                 break
 
+        # Timing runs
         bm_start_time = time.perf_counter_ns()
         for i in range(max_repeats):
             torch.cuda.synchronize()
@@ -523,31 +361,15 @@ class EvalRunner:
             total_bm_duration = time.perf_counter_ns() - bm_start_time
             if i > 1 and total_bm_duration > 1e8:
                 stats = calculate_stats(durations)
-                if (
-                    stats.err / stats.mean < 0.001
-                    or stats.mean * stats.runs > max_time_ns
-                    or total_bm_duration > 120e9
-                ):
+                if (stats.err / stats.mean < 0.001 or
+                    stats.mean * stats.runs > max_time_ns or
+                    total_bm_duration > 120e9):
                     break
 
-        stats = calculate_stats(durations)
-        if trace_ctx.get_trace_root() is not None:
-            ref_latency = _time_reference(reference_kernel, check_copy[-1]) if reference_kernel else None
-            _write_trace_record(
-                definition=os.environ.get("TRACE_DEFINITION", "sparse_attention"),
-                solution=os.environ.get("TRACE_SOLUTION", "submission"),
-                workload=trace_ctx.get_current_workload(),
-                status="PASSED" if correctness_error is None else "FAILED",
-                output=outputs[-1] if outputs else None,
-                data=check_copy[-1],
-                reference_kernel=reference_kernel,
-                latency_ms=stats.mean / 1e6,
-                reference_latency_ms=ref_latency,
-                log=correctness_error or "",
-            )
-        return BenchmarkResult(stats=stats, error=correctness_error)
+        return BenchmarkResult(stats=calculate_stats(durations), error=correctness_error)
 
     def run_single_profile(self, test: TestCase) -> str:
+        """Run profiling."""
         from torch.profiler import profile, ProfilerActivity
 
         self.init_cuda()
@@ -569,13 +391,7 @@ def _make_test_runner(runner: EvalRunner, test: TestCase):
     return runner.run_single_test(test)
 
 
-def _make_benchmark_runner(
-    runner: EvalRunner,
-    test: TestCase,
-    recheck: bool,
-    max_repeats: int,
-    max_time_ns: float,
-):
+def _make_benchmark_runner(runner: EvalRunner, test: TestCase, recheck: bool, max_repeats: int, max_time_ns: float):
     if runner.use_batched_benchmark:
         return runner.run_single_benchmark_batched(test, recheck, max_repeats, max_time_ns)
     return runner.run_single_benchmark(test, recheck, max_repeats, max_time_ns)
@@ -590,6 +406,7 @@ def _make_profile_runner(runner: EvalRunner, test: TestCase):
 
 
 def run_testing(logger: PopcornOutput, pool: multiprocessing.Pool, tests: list[TestCase], runner: EvalRunner):
+    """Run testing mode."""
     if runner.use_cutlass:
         logger.log("compile", "start")
         compile_success, compile_error = pool.apply(_make_compile_runner, (runner,))
@@ -618,6 +435,7 @@ def run_testing(logger: PopcornOutput, pool: multiprocessing.Pool, tests: list[T
 
 
 def run_benchmarking(logger: PopcornOutput, pool: multiprocessing.Pool, tests: list[TestCase], runner: EvalRunner):
+    """Run benchmarking mode."""
     if runner.use_cutlass:
         logger.log("compile", "start")
         compile_success, compile_error = pool.apply(_make_compile_runner, (runner,))
@@ -627,6 +445,7 @@ def run_benchmarking(logger: PopcornOutput, pool: multiprocessing.Pool, tests: l
             return 112
         logger.log("compile", "pass")
 
+    # Warmup
     pool.apply(_make_benchmark_runner, (runner, tests[0], False, 100, 10e7))
 
     passed = True
@@ -650,6 +469,7 @@ def run_benchmarking(logger: PopcornOutput, pool: multiprocessing.Pool, tests: l
 
 
 def run_leaderboard(logger: PopcornOutput, pool: multiprocessing.Pool, tests: list[TestCase], runner: EvalRunner):
+    """Run leaderboard mode."""
     if runner.use_cutlass:
         logger.log("compile", "start")
         compile_success, compile_error = pool.apply(_make_compile_runner, (runner,))
@@ -659,6 +479,7 @@ def run_leaderboard(logger: PopcornOutput, pool: multiprocessing.Pool, tests: li
             return 112
         logger.log("compile", "pass")
 
+    # Warmup all test shapes to ensure consistent benchmarking
     for test in tests:
         pool.apply(_make_benchmark_runner, (runner, test, False, 50, 5e8))
 
@@ -684,6 +505,7 @@ def run_leaderboard(logger: PopcornOutput, pool: multiprocessing.Pool, tests: li
 
 
 def run_profiling(logger: PopcornOutput, pool: multiprocessing.Pool, tests: list[TestCase], runner: EvalRunner):
+    """Run profiling mode."""
     logger.log("benchmark-count", len(tests))
     for idx, test in enumerate(tests):
         logger.log(f"benchmark.{idx}.spec", test.spec)
@@ -697,6 +519,7 @@ def run_profiling(logger: PopcornOutput, pool: multiprocessing.Pool, tests: list
 
 
 def main(runner: EvalRunner):
+    """Main entry point for eval scripts."""
     fd = os.getenv("POPCORN_FD")
     if not fd:
         return 111

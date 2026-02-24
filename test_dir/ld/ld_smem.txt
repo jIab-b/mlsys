@@ -6,26 +6,26 @@ Running on:
 * CPU: `x86_64`
 * Device count: `1`
 * Runtime: `CUDA`
-* Platform: `Linux-4.4.0-x86_64-with-glibc2.39`
-* Torch: `2.9.1+cu129`
+* Platform: `Linux-4.4.0-x86_64-with-glibc2.35`
+* Torch: `2.9.1+cu130`
 * Hostname: `modal`
 
 
 ## Benchmarks:
 ```
 batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ⏱ 195.9 ± 0.57 µs
- ⚡ 188.4 µs 🐌 217.1 µs
+ ⏱ 158.9 ± 0.87 µs
+ ⚡ 148.5 µs 🐌 214.8 µs
  ❌ mismatch found! first mismatch at (0, 1141): got=1492 ref=1461
 
 batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ⏱ 316.8 ± 0.41 µs
- ⚡ 309.2 µs 🐌 328.7 µs
- ❌ mismatch found! first mismatch at (3, 1947): got=22 ref=4019
+ ⏱ 245.9 ± 0.76 µs
+ ⚡ 236.5 µs 🐌 287.6 µs
+ ❌ mismatch found! first mismatch at (0, 1865): got=4045 ref=3015
 
 batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ⏱ 542.5 ± 0.54 µs
- ⚡ 533.5 µs 🐌 558.0 µs
+ ⏱ 406.8 ± 1.14 µs
+ ⚡ 397.2 µs 🐌 473.1 µs
  ❌ mismatch found! first mismatch at (2, 1362): got=6295 ref=1338
 ```
 
