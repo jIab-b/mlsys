@@ -125,10 +125,21 @@ def print_results(results: dict):
     return "\n".join(lines) if lines else "No results."
 
 
+def _load_solution(source_path: str | None = None) -> Solution:
+    if source_path is None:
+        from scripts.pack_solution import pack_solution
+
+        solution_path = pack_solution()
+    else:
+        from scripts.pack_solution import pack_solution_from_path
+
+        solution_path = pack_solution_from_path(Path(source_path))
+    return Solution.model_validate_json(solution_path.read_text())
+
+
 @app.local_entrypoint()
-def main():
-    from scripts.pack_solution import pack_solution
-    solution = Solution.model_validate_json(pack_solution().read_text())
+def main(source_path: str = None):
+    solution = _load_solution(source_path)
     print(f"Running: {solution.name} ({solution.definition})")
     out = print_results(run_benchmark.remote(solution))
     print(out)
@@ -138,12 +149,17 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("-o", "--output", type=str, default=None)
+    parser.add_argument(
+        "--source-path",
+        type=str,
+        default=None,
+        help="Optional source file or directory path to pack into solution.json before benchmarking.",
+    )
     args = parser.parse_args()
 
     with modal.enable_output():
         with app.run():
-            from scripts.pack_solution import pack_solution
-            solution = Solution.model_validate_json(pack_solution().read_text())
+            solution = _load_solution(args.source_path)
             print(f"Running: {solution.name} ({solution.definition})")
             out = print_results(run_benchmark.remote(solution))
             print(out)
