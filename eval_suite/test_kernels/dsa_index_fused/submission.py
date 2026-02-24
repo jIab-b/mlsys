@@ -1,4 +1,4 @@
-"""Standalone DSA top-k=2048 submission (no cross-file imports)."""
+"""DSA top-k=2048 submission – scale after MMA (fused computation order)."""
 
 torch = __import__("torch")
 
@@ -6,18 +6,6 @@ PAGE_SIZE = 64
 NUM_INDEX_HEADS = 64
 INDEX_HEAD_DIM = 128
 TOPK = 2048
-_DEBUG_PRINTED_POST_ONCE = False
-_DEBUG_POST_TOKENS = (0, 1, 2, 3, 4, 60, 61, 62, 63)
-
-
-def _fixed_debug_tok(seq_len, device):
-    out = torch.zeros((len(_DEBUG_POST_TOKENS),), dtype=torch.int64, device=device)
-    if seq_len <= 0:
-        return out
-    last = seq_len - 1
-    for i, t in enumerate(_DEBUG_POST_TOKENS):
-        out[i] = t if t <= last else last
-    return out
 
 
 def decode_fp8_kv_cache_parts(k_index_cache_fp8):
@@ -37,14 +25,8 @@ def decode_fp8_kv_cache_parts(k_index_cache_fp8):
     return fp8_float, scale
 
 
-def dequant_fp8_kv_cache(k_index_cache_fp8):
-    fp8_float, scale = decode_fp8_kv_cache_parts(k_index_cache_fp8)
-    return fp8_float * scale
-
-
 @torch.no_grad()
 def custom_kernel(data):
-    global _DEBUG_PRINTED_POST_ONCE
     q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
 
     batch_size, num_index_heads, index_head_dim = q_index_fp8.shape
@@ -57,7 +39,6 @@ def custom_kernel(data):
     device = q_index_fp8.device
     q = q_index_fp8.to(torch.float32)
     k_raw_all, k_scale_all = decode_fp8_kv_cache_parts(k_index_cache_fp8)
-    k_all = k_raw_all * k_scale_all
 
     topk_indices = torch.full((batch_size, TOPK), -1, dtype=torch.int32, device=device)
 
@@ -69,27 +50,13 @@ def custom_kernel(data):
         num_pages_for_seq = (seq_len + page_size - 1) // page_size
         page_indices = block_table[b, :num_pages_for_seq].to(torch.long)
 
-        k_paged = k_all[page_indices]
-        k = k_paged.reshape(-1, index_head_dim)[:seq_len]
+        k_raw = k_raw_all[page_indices].reshape(-1, index_head_dim)[:seq_len]
+        k_scale = k_scale_all[page_indices].reshape(-1, 1)[:seq_len]
 
-        scores = q[b] @ k.T
+        scores = q[b] @ k_raw.T
+        scores = scores * k_scale.squeeze(-1).unsqueeze(0)
         scores_relu = torch.relu(scores)
         final_scores = (scores_relu * weights[b][:, None]).sum(dim=0)
-
-        if (not _DEBUG_PRINTED_POST_ONCE) and b == 0:
-            dbg_tok = _fixed_debug_tok(seq_len, device)
-            for i in range(len(_DEBUG_POST_TOKENS)):
-                t = int(dbg_tok[i].item())
-                page_slot = t // page_size
-                offset = t % page_size
-                global_page = int(page_indices[page_slot].item())
-                global_tok = global_page * page_size + offset
-                v = float(final_scores[t].item())
-                print(
-                    f"post_ep_sample{i}: local_tok={t} global_tok={global_tok} "
-                    f"post_ep_final_score={v:.7f}"
-                )
-            _DEBUG_PRINTED_POST_ONCE = True
 
         actual_topk = min(TOPK, seq_len)
         _, topk_idx = torch.topk(final_scores, actual_topk)

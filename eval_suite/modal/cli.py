@@ -16,6 +16,7 @@ TASKS = {
     "sparse_index": "sparse_index",
     "sparse_attn": "sparse_attn",
     "dsa_index_2048": "dsa_index_2048",
+    "dsa_index_fused": "dsa_index_fused",
     "dsa_attn_2048": "dsa_attn_2048",
 }
 

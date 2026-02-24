@@ -107,6 +107,7 @@ TASK_DIRS = [
     "test_kernels/sparse_index",
     "test_kernels/sparse_attn",
     "test_kernels/dsa_index_2048",
+    "test_kernels/dsa_index_fused",
     "test_kernels/dsa_attn_2048",
 ]
 
@@ -172,6 +173,7 @@ TASK_PATHS = {
     "sparse_index": "test_kernels/sparse_index",
     "sparse_attn": "test_kernels/sparse_attn",
     "dsa_index_2048": "test_kernels/dsa_index_2048",
+    "dsa_index_fused": "test_kernels/dsa_index_fused",
     "dsa_attn_2048": "test_kernels/dsa_attn_2048",
 }
 

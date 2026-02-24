@@ -1,5 +1,7 @@
 """FlashInfer-Bench Modal Cloud Benchmark Runner."""
 
+import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -7,16 +9,20 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
-from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
 app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
+env_image = {
+    "CUDA_HOME": "/usr/local/cuda",
+    "TVM_FFI_CUDA_ARCH_LIST": "10.0a",
+}
+
 image = (
-    modal.Image.from_registry()
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry("pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel")
+    .env(env_image)
+    .pip_install("flashinfer-bench", "triton", "numpy")
 )
 
 @app.function(image=image, volumes={TRACE_SET_PATH: trace_volume})
@@ -25,12 +31,16 @@ def vol_shell():
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+def run_benchmark(solution_json: str, config_dict: dict | None = None) -> dict:
     import traceback
+    from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
     from flashinfer_bench.compile import BuilderRegistry
 
-    if config is None:
+    solution = Solution.model_validate_json(solution_json)
+    if config_dict is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+    else:
+        config = BenchmarkConfig(**config_dict)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
     if solution.definition not in trace_set.definitions:
@@ -47,6 +57,24 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     except Exception as e:
         return {"__error__": {"status": "COMPILE_ERROR", "log": f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"}}
 
+    # Smoke test: run first workload only; fail fast on runtime issues.
+    smoke_config = BenchmarkConfig(warmup_runs=0, iterations=1, num_trials=1)
+    smoke_trace_set = TraceSet(
+        root=trace_set.root,
+        definitions={definition.name: definition},
+        solutions={definition.name: [solution]},
+        workloads={definition.name: workloads[:1]},
+        traces={definition.name: []},
+    )
+    try:
+        smoke_result = Benchmark(smoke_trace_set, smoke_config).run_all(dump_traces=False)
+    except Exception as e:
+        return {"__error__": {"status": "RUNTIME_ERROR", "log": f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"}}
+    for trace in smoke_result.traces.get(definition.name, []):
+        if trace.evaluation and trace.evaluation.status.value != "PASSED":
+            ev = trace.evaluation
+            return {"__error__": {"status": ev.status.value, "log": ev.log or repr(ev)}}
+
     bench_trace_set = TraceSet(
         root=trace_set.root,
         definitions={definition.name: definition},
@@ -54,7 +82,10 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         workloads={definition.name: workloads},
         traces={definition.name: []},
     )
-    result_trace_set = Benchmark(bench_trace_set, config).run_all(dump_traces=True)
+    try:
+        result_trace_set = Benchmark(bench_trace_set, config).run_all(dump_traces=True)
+    except Exception as e:
+        return {"__error__": {"status": "RUNTIME_ERROR", "log": f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"}}
 
     results = {}
     for trace in result_trace_set.traces.get(definition.name, []):
@@ -68,6 +99,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             entry.update(max_abs_err=ev.correctness.max_absolute_error, max_rel_err=ev.correctness.max_relative_error)
         if ev.log:
             entry["log"] = ev.log
+        if ev.status.value != "PASSED":
+            return {"__error__": {"status": ev.status.value, "log": ev.log or repr(ev)}}
         results[trace.workload.uuid] = entry
     return results
 
@@ -96,27 +129,39 @@ def print_results(results: dict):
     return "\n".join(lines) if lines else "No results."
 
 
+def _load_solution_json(solution_json_path: str) -> str:
+    return Path(solution_json_path).read_text()
+
+
+def _print_solution_banner(solution_json: str):
+    data = json.loads(solution_json)
+    name = data.get("name", "<unknown>")
+    definition = data.get("definition", "<unknown>")
+    print(f"Running: {name} ({definition})")
+
+
 @app.local_entrypoint()
-def main():
-    from scripts.pack_solution import pack_solution
-    solution = Solution.model_validate_json(pack_solution().read_text())
-    print(f"Running: {solution.name} ({solution.definition})")
-    out = print_results(run_benchmark.remote(solution))
+def main(solution_json_path: str = str(PROJECT_ROOT / "solution.json"), output: str = None):
+    solution_json = _load_solution_json(solution_json_path)
+    _print_solution_banner(solution_json)
+    out = print_results(run_benchmark.remote(solution_json))
     print(out)
+    if output:
+        Path(output).write_text(out)
+        print(f"Saved to {output}")
 
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("-o", "--output", type=str, default=None)
+    parser.add_argument("--solution-json", type=str, default=str(PROJECT_ROOT / "solution.json"))
     args = parser.parse_args()
 
     with modal.enable_output():
         with app.run():
-            from scripts.pack_solution import pack_solution
-            solution = Solution.model_validate_json(pack_solution().read_text())
-            print(f"Running: {solution.name} ({solution.definition})")
-            out = print_results(run_benchmark.remote(solution))
+            solution_json = _load_solution_json(args.solution_json)
+            _print_solution_banner(solution_json)
+            out = print_results(run_benchmark.remote(solution_json))
             print(out)
             if args.output:
                 Path(args.output).write_text(out)
