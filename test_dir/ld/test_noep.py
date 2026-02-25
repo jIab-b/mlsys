@@ -39,12 +39,11 @@ constexpr int kNumTmemSlots = 8;
 static_assert(kNumTmemSlots * kStageTokens <= 512, "TMEM columns exceed hardware limit");
 
 constexpr int kWarpsPerWarpgroup = 4;
-constexpr int kNumEpSlots = kWarpsPerWarpgroup;
 constexpr int kNumEpTeams = 6;
 constexpr int kNumEpilogueWarps = kNumEpTeams * kWarpsPerWarpgroup;
 constexpr int kProducerWarp = kNumEpilogueWarps;
 constexpr int kMmaWarp = kProducerWarp + 1;
-constexpr int kNumWarps = 26;
+constexpr int kNumWarps = 32;
 constexpr int kThreadsPerBlock = kNumWarps * 32;
 
 constexpr int kMmaK = 32;
@@ -78,8 +77,8 @@ struct __align__(1024) SmemLayout {
     uint64_t tmem_reuse_mbar[kNumTmemSlots];
     uint64_t q_mbar;
 
-    // Epilogue partials: [stage][slot][token]
-    float stage_tile_raw[kNumStages * kNumEpSlots * kStageTokens];
+    // Epilogue raw TMEM staging (token-major, head-minor): [stage][token][head]
+    float stage_tile_raw[kNumStages * kStageTokens * kNumHeads];
 
     // TMEM scratch
     int tmem_addr_scratch;
@@ -409,93 +408,6 @@ __device__ inline void run_epilogue_warps(
                 addr.mma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
                 phase);
         }
-
-        ep_team_barrier_4warps(ep_team);
-        tcgen05_fence_after_thread_sync();
-
-        const int valid_tokens = s.stage_valid_tokens[stage];
-        const int tile_seq_start = tile_id * kStageTokens;
-        const int page_idx = s.stage_page_idx[stage];
-
-        // fetch token page ids
-        if (valid_tokens > 0 && group_lane < valid_tokens) {
-            const int out_idx = tile_seq_start + group_lane;
-            if (out_idx < out_stride) {
-                out_ids_b[out_idx] = page_idx * kPageSize + group_lane;
-            }
-        }
-        
-
-        //ep_team_barrier_4warps(ep_team);
-
-        if (valid_tokens > 0) {
-            const int tmem_col_base = tmem_slot * kStageTokens;
-            const float* stage_scale = s.k_stage_scale + stage * kStageTokens;
-            const float w = s.w_stage[head];
-            constexpr int kChunk = 16;
-            constexpr int kNumChunks = kStageTokens / kChunk;  // 4
-
-            // Per-chunk: load x16, compute, shuffle-reduce, store partial to smem
-            #pragma unroll
-            for (int ci = 0; ci < kNumChunks; ++ci) {
-                const int tok_off = ci * kChunk;
-                float vals[kChunk];
-                tcgen05_ld_32x32b_16(lane_base, tmem_col_base + tok_off, vals);
-                tcgen05_wait_ld();
-
-                if (active_lane) {
-                    // Scale, relu, weight
-                    #pragma unroll
-                    for (int t = 0; t < kChunk; ++t) {
-                        const int tok = tok_off + t;
-                        float v = 0.0f;
-                        if (tok < valid_tokens) {
-                            v = fmaxf(vals[t] * stage_scale[tok], 0.0f) * w;
-                        }
-                        vals[t] = v;
-                    }
-
-                    // 16-lane shuffle reduce
-                    #pragma unroll
-                    for (int off = 8; off > 0; off >>= 1) {
-                        #pragma unroll
-                        for (int t = 0; t < kChunk; ++t) {
-                            vals[t] += __shfl_down_sync(0x0000FFFF, vals[t], off, 16);
-                        }
-                    }
-
-                    // Lane 0 stores partial to smem
-                    if (lane16 == 0) {
-                        #pragma unroll
-                        for (int t = 0; t < kChunk; ++t) {
-                            const int tok = tok_off + t;
-                            if (tok < valid_tokens) {
-                                const int part_idx =
-                                    ((stage * kNumEpSlots + ep_slot) * kStageTokens) + tok;
-                                s.stage_tile_raw[part_idx] = vals[t];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        ep_team_barrier_4warps(ep_team);
-  
-        if (valid_tokens > 0 && group_lane < valid_tokens) {
-            const int tok = group_lane;
-            const int out_idx = tile_seq_start + tok;
-            if (out_idx < out_stride) {
-                const int part_base = stage * kNumEpSlots * kStageTokens + tok;
-                float sum = 0.0f;
-                #pragma unroll
-                for (int sidx = 0; sidx < kNumEpSlots; ++sidx) {
-                    sum += s.stage_tile_raw[part_base + sidx * kStageTokens];
-                }
-                out_scores_b[out_idx] = sum;
-            }
-        }
-        
 
         ep_team_barrier_4warps(ep_team);
 
@@ -912,7 +824,7 @@ def _get_module():
     global _module
     if _module is None:
         _module = load_inline(
-            name="dsa_topk_indexer_ext_ld_rmem",
+            name="dsa_topk_indexer_ext_ld_noep",
             cpp_sources=cpp_decl_src,
             cuda_sources=cuda_src,
             functions=["dsa_topk_indexer_launch"],

@@ -334,6 +334,22 @@ __device__ inline void tcgen05_ld_32x32b_32(int lane_base, int col_base, float o
         : "r"(addr));
 }
 
+
+__device__ inline void tcgen05_ld_32x32b_16(int lane_base, int col_base, float out_vals[16]) {
+    const int addr = (lane_base << 16) | col_base;
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+        : "=f"(out_vals[0]), "=f"(out_vals[1]), "=f"(out_vals[2]), "=f"(out_vals[3]),
+          "=f"(out_vals[4]), "=f"(out_vals[5]), "=f"(out_vals[6]), "=f"(out_vals[7]),
+          "=f"(out_vals[8]), "=f"(out_vals[9]), "=f"(out_vals[10]), "=f"(out_vals[11]),
+          "=f"(out_vals[12]), "=f"(out_vals[13]), "=f"(out_vals[14]), "=f"(out_vals[15])
+        : "r"(addr));
+}
+
+
+
 __device__ inline void ep_team_barrier_4warps(int ep_team) {
     if (ep_team == 0) {
         asm volatile("bar.sync 3, 128;" ::: "memory");
@@ -376,6 +392,7 @@ __device__ inline void run_epilogue_warps(
     const int head = ep_slot * 16 + lane16;
     const int lane_base = ep_slot * 32;
     constexpr int kTokensPerHalf = 32;
+    const int group_lane = ep_slot * 32 + lane;
 
     for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
         const int stage = tile_id % kNumStages;
@@ -390,97 +407,6 @@ __device__ inline void run_epilogue_warps(
             mbarrier_wait_parity(
                 addr.mma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
                 phase);
-        }
-
-        ep_team_barrier_4warps(ep_team);
-        tcgen05_fence_after_thread_sync();
-
-        const int valid_tokens = s.stage_valid_tokens[stage];
-        const int tile_seq_start = tile_id * kStageTokens;
-        const int page_idx = s.stage_page_idx[stage];
-        if (ep_slot == 0 && valid_tokens > 0) {
-            for (int tok = lane; tok < valid_tokens; tok += 32) {
-                const int out_idx = tile_seq_start + tok;
-                if (out_idx < out_stride) {
-                    out_scores_b[out_idx] = 0.0f;
-                    out_ids_b[out_idx] = page_idx * kPageSize + tok;
-                }
-            }
-        }
-
-        ep_team_barrier_4warps(ep_team);
-
-        if (valid_tokens > 0) {
-            const int tmem_col_base = tmem_slot * kStageTokens;
-            const float* stage_scale = s.k_stage_scale + stage * kStageTokens;
-            const float w = s.w_stage[head];
-            float lane_vals_lo[kTokensPerHalf];
-            float lane_vals_hi[kTokensPerHalf];
-            tcgen05_ld_32x32b_32(lane_base, tmem_col_base, lane_vals_lo);
-            tcgen05_ld_32x32b_32(lane_base, tmem_col_base + kTokensPerHalf, lane_vals_hi);
-            tcgen05_wait_ld();
-
-            if (active_lane) {
-                #pragma unroll
-                for (int t = 0; t < kTokensPerHalf; ++t) {
-                    const int tok0 = t;
-                    const int tok1 = t + kTokensPerHalf;
-                    float v0 = 0.0f;
-                    float v1 = 0.0f;
-                    if (tok0 < valid_tokens) {
-                        const float scaled0 = lane_vals_lo[t] * stage_scale[tok0];
-                        v0 = fmaxf(scaled0, 0.0f) * w;
-                    }
-                    if (tok1 < valid_tokens) {
-                        const float scaled1 = lane_vals_hi[t] * stage_scale[tok1];
-                        v1 = fmaxf(scaled1, 0.0f) * w;
-                    }
-                    lane_vals_lo[t] = v0;
-                    lane_vals_hi[t] = v1;
-                }
-
-                #pragma unroll
-                for (int off = 8; off > 0; off >>= 1) {
-                    #pragma unroll
-                    for (int t = 0; t < kTokensPerHalf; ++t) {
-                        lane_vals_lo[t] += __shfl_down_sync(0x0000FFFF, lane_vals_lo[t], off, 16);
-                        lane_vals_hi[t] += __shfl_down_sync(0x0000FFFF, lane_vals_hi[t], off, 16);
-                    }
-                }
-
-                if (lane16 == 0) {
-                    #pragma unroll
-                    for (int t = 0; t < kTokensPerHalf; ++t) {
-                        const int tok0 = t;
-                        const int tok1 = t + kTokensPerHalf;
-                        if (tok0 < valid_tokens) {
-                            const int part_idx0 = ((stage * kStageTokens + tok0) * kNumHeads) + ep_slot;
-                            s.stage_tile_raw[part_idx0] = lane_vals_lo[t];
-                        }
-                        if (tok1 < valid_tokens) {
-                            const int part_idx1 = ((stage * kStageTokens + tok1) * kNumHeads) + ep_slot;
-                            s.stage_tile_raw[part_idx1] = lane_vals_hi[t];
-                        }
-                    }
-                }
-            }
-        }
-
-        ep_team_barrier_4warps(ep_team);
-
-        if (ep_slot == 0 && valid_tokens > 0) {
-            for (int tok = lane; tok < valid_tokens; tok += 32) {
-                const int out_idx = tile_seq_start + tok;
-                if (out_idx < out_stride) {
-                    const int part_base = ((stage * kStageTokens + tok) * kNumHeads);
-                    float sum = 0.0f;
-                    #pragma unroll
-                    for (int sidx = 0; sidx < 4; ++sidx) {
-                        sum += s.stage_tile_raw[part_base + sidx];
-                    }
-                    out_scores_b[out_idx] = sum;
-                }
-            }
         }
 
         ep_team_barrier_4warps(ep_team);
@@ -898,7 +824,7 @@ def _get_module():
     global _module
     if _module is None:
         _module = load_inline(
-            name="dsa_topk_indexer_ext_ld_rmem",
+            name="dsa_topk_indexer_ext_ld_stub",
             cpp_sources=cpp_decl_src,
             cuda_sources=cuda_src,
             functions=["dsa_topk_indexer_launch"],
@@ -980,7 +906,4 @@ def custom_kernel(data: input_t) -> output_t:
         out_ids,
     )
 
-    k = min(topk, max_seq)
-    top_pos = torch.topk(out_scores, k, dim=1).indices
-    out_topk_indices[:, :k] = torch.gather(out_ids, 1, top_pos).to(torch.int32)
     return (out_topk_indices,)

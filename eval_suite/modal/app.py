@@ -215,9 +215,17 @@ def run_eval(submission_code: str, tests_content: str, mode: str = "test", works
     output = os.read(r, 1 << 20).decode()
     os.close(r)
 
+    import glob
+    cache_root = os.path.expanduser("~/.cache/torch_extensions/")
+    artifacts = [a for a in glob.glob(cache_root + "**/*", recursive=True) if os.path.isfile(a)]
+    cache_info = f"\n[CACHE] root: {cache_root} ({len(artifacts)} files)\n"
+    for a in artifacts:
+        cache_info += f"  {a}  ({os.path.getsize(a)} bytes)\n"
+    stdout = stdout.decode(errors="replace") + cache_info
+
     return {
         "popcorn": output,
-        "stdout": stdout.decode(errors="replace"),
+        "stdout": stdout,
         "stderr": stderr.decode(errors="replace"),
         "mode": mode,
         "system": _system_info(),

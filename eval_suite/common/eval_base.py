@@ -151,6 +151,7 @@ class EvalRunner:
 
     def setup(self):
         """Import task-specific modules. Called in subprocess."""
+        self._install_prebuilt_so()
         if self.use_large_cache_clear:
             from common.utils import clear_l2_cache_large as clear_cache
         else:
@@ -179,8 +180,34 @@ class EvalRunner:
         print(f"Encountered {e}", file=sys.stderr)
         return False, str(e)
 
+    no_compile = False  # Set via --no-compile CLI flag
+    prebuilt_so = None  # Set via --prebuilt-so <path> CLI arg
+
+    def _install_prebuilt_so(self):
+        """Monkey-patch load_inline to dlopen pre-built .so files. Crashes if not found."""
+        so_path = self.prebuilt_so
+        if not so_path:
+            return
+        import importlib.util
+        import glob as _glob
+        import torch.utils.cpp_extension as _ext
+        _cache = {}
+        def _fast_load_inline(name, *args, **kwargs):
+            if name not in _cache:
+                sos = _glob.glob(os.path.join(so_path, "**", f"{name}*.so"), recursive=True)
+                if not sos:
+                    raise RuntimeError(f"prebuilt-so: no .so matching '{name}' in {so_path}")
+                spec = importlib.util.spec_from_file_location(name, sos[0])
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _cache[name] = mod
+            return _cache[name]
+        _ext.load_inline = _fast_load_inline
+
     def call_compile_kernel(self):
         """Call compile_kernel with appropriate arguments."""
+        if self.no_compile:
+            return
         import inspect
         compile_kernel = self.get_compile_kernel()
         if compile_kernel is None:
@@ -528,6 +555,16 @@ def main(runner: EvalRunner):
         return 2
 
     mode = sys.argv[1]
+
+    # Parse optional flags
+    extra_args = sys.argv[3:]
+    if "--no-compile" in extra_args:
+        runner.no_compile = True
+    if "--prebuilt-so" in extra_args:
+        idx = extra_args.index("--prebuilt-so")
+        if idx + 1 < len(extra_args):
+            runner.prebuilt_so = extra_args[idx + 1]
+
     seed = os.getenv("POPCORN_SEED")
     os.unsetenv("POPCORN_SEED")
     seed = int(seed) if seed else None
