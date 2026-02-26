@@ -14,18 +14,18 @@ Running on:
 ## Benchmarks:
 ```
 batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ⏱ 80.0 ± 0.80 µs
- ⚡ 71.6 µs 🐌 140.3 µs
+ ⏱ 48.0 ± 0.37 µs
+ ⚡ 43.9 µs 🐌 69.7 µs
  ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=245
 
 batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ⏱ 112.6 ± 1.81 µs
- ⚡ 97.3 µs 🐌 273.0 µs
+ ⏱ 60.8 ± 0.34 µs
+ ⚡ 55.3 µs 🐌 77.9 µs
  ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=2748
 
 batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ⏱ 173.8 ± 0.76 µs
- ⚡ 160.8 µs 🐌 216.0 µs
+ ⏱ 83.6 ± 0.31 µs
+ ⚡ 77.8 µs 🐌 99.3 µs
  ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=99
 ```
 

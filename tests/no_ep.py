@@ -818,23 +818,13 @@ __device__ inline void run_epilogue_warps(
     SmemLayout& s,
     const SmemAddrs& addr
 ) {
-    // EP deterministic-combine variant:
-    // - owner team = tile_id % kNumEpTeams
-    // - load TMEM rows, apply scale+relu+weight in registers
-    // - reduce 16 heads in-warp to one partial per ep_slot and token
-    // - store partials to SMEM, then ep_slot 0 sums slots [0..3] in fixed order
+    // EP-disabled reference: keep only mbar synchronization plumbing.
     if (!_is_ep_warp(warp_id)) {
         return;
     }
 
     const int ep_team = warp_id >> 2;  // 0..kNumEpTeams-1
     const int ep_slot = warp_id & 3;   // 0..3
-    const int lane16 = lane & 15;
-    const bool active_lane = (lane < 16);
-    const int head = ep_slot * 16 + lane16;
-    const int lane_base = ep_slot * 32;
-    const int group_lane = ep_slot * 32 + lane;
-    constexpr float kNegInf = -3.402823466e+38F;
 
     for (int tile_id = ep_team; tile_id < num_tiles; tile_id += kNumEpTeams) {
         const int stage = tile_id % kNumStages;
@@ -858,84 +848,7 @@ __device__ inline void run_epilogue_warps(
         }
         ep_team_barrier_4warps(ep_team);
         tcgen05_fence_after_thread_sync();
-
-        const int valid_tokens = s.stage_valid_tokens[stage];
-        const int page_idx = s.stage_page_idx[stage];
-        const float* stage_scale = s.k_stage_scale + stage * kStageTokens;
-
-        // fetch token page ids
-        if (valid_tokens > 0) {
-            const int tmem_col_base = tmem_slot * kStageTokens;
-            const float w = s.w_stage[head];
-            constexpr int kChunk = 16;
-            constexpr int kNumChunks = kStageTokens / kChunk;  // 4
-
-            // Per-chunk: load x16, compute, shuffle-reduce, store partial to smem
-            #pragma unroll
-            for (int ci = 0; ci < kNumChunks; ++ci) {
-                const int tok_off = ci * kChunk;
-                float vals[kChunk];
-                tcgen05_ld_32x32b_16(lane_base, tmem_col_base + tok_off, vals);
-                tcgen05_wait_ld();
-
-                if (active_lane) {
-                    // ReLU + weight in-head; token scale is applied once after head reduction.
-                    #pragma unroll
-                    for (int t = 0; t < kChunk; ++t) {
-                        const int tok = tok_off + t;
-                        float v = 0.0f;
-                        if (tok < valid_tokens) {
-                            v = fmaxf(vals[t], 0.0f) * w;
-                        }
-                        vals[t] = v;
-                    }
-
-                    // 16-lane shuffle reduce
-                    #pragma unroll
-                    for (int off = 8; off > 0; off >>= 1) {
-                        #pragma unroll
-                        for (int t = 0; t < kChunk; ++t) {
-                            vals[t] += __shfl_down_sync(0x0000FFFF, vals[t], off, 16);
-                        }
-                    }
-
-                    // Lane 0 stores partial to smem
-                    if (lane16 == 0) {
-                        #pragma unroll
-                        for (int t = 0; t < kChunk; ++t) {
-                            const int tok = tok_off + t;
-                            if (tok < valid_tokens) {
-                                const int part_idx =
-                                    ((stage * kNumEpSlots + ep_slot) * kStageTokens) + tok;
-                                s.stage_tile_raw[part_idx] = vals[t];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         ep_team_barrier_4warps(ep_team);
-  
-        if (group_lane < kStageTokens) {
-            const int tok = group_lane;
-            const int part_base = stage * kNumEpSlots * kStageTokens + tok;
-            float sum = kNegInf;
-            int gid = -1;
-            if (tok < valid_tokens) {
-                sum = 0.0f;
-                #pragma unroll
-                for (int sidx = 0; sidx < kNumEpSlots; ++sidx) {
-                    sum += s.stage_tile_raw[part_base + sidx * kStageTokens];
-                }
-                sum *= stage_scale[tok];
-                gid = page_idx * kPageSize + tok;
-            }
-
-            const int slot = win_tile * kStageTokens + tok;
-            s.topk_stage_pack[buf][slot] = pack_score_id(sum, gid);
-
-        }
         ep_team_barrier_4warps(ep_team);
 
         if (ep_slot == 0 && lane == 0) {
