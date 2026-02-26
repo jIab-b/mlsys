@@ -1,0 +1,32 @@
+"**Modal ❌ failure**
+> ❌ Benchmarking failed
+
+Running on:
+* GPU: `NVIDIA B200`
+* CPU: `x86_64`
+* Device count: `1`
+* Runtime: `CUDA`
+* Platform: `Linux-4.4.0-x86_64-with-glibc2.35`
+* Torch: `2.9.1+cu130`
+* Hostname: `modal`
+
+
+## Benchmarks:
+```
+batch: 1; num_pages: 32; seq_len: 2048; seed: 100
+ ⏱ 405.7 ± 0.63 µs
+ ⚡ 399.4 µs 🐌 457.7 µs
+
+batch: 8; num_pages: 64; seq_len: 4096; seed: 101
+ ⏱ 583.9 ± 0.58 µs
+ ⚡ 578.5 µs 🐌 601.1 µs
+
+batch: 16; num_pages: 128; seq_len: 8192; seed: 102
+ ⏱ 851.7 ± 0.84 µs
+ ⚡ 846.8 µs 🐌 870.4 µs
+ ❌ mismatch found! first mismatch at (1, 1776): got=2883 ref=4834
+```
+
+## Program stdout:
+```
+```"

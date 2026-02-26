@@ -1,9 +1,0 @@
-        start     finish     time
-
-
-cpu run  $884.08   $884.03    118.9 seconds
-
-non cpu  $884.03   $883.92    92.7 seconds
-
-modified $883.92   $883.88 
-          $883.88   $883.85
