@@ -14,19 +14,19 @@ Running on:
 ## Benchmarks:
 ```
 batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ⏱ 48.0 ± 0.37 µs
- ⚡ 43.9 µs 🐌 69.7 µs
- ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=245
+ ⏱ 107.1 ± 0.61 µs
+ ⚡ 99.3 µs 🐌 136.2 µs
+ ❌ mismatch found! first mismatch at (0, 1): got=1591 ref=1529
 
 batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ⏱ 60.8 ± 0.34 µs
- ⚡ 55.3 µs 🐌 77.9 µs
- ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=2748
+ ⏱ 119.4 ± 0.49 µs
+ ⚡ 112.6 µs 🐌 141.3 µs
+ ❌ mismatch found! first mismatch at (0, 1): got=2043 ref=2403
 
 batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ⏱ 83.6 ± 0.31 µs
- ⚡ 77.8 µs 🐌 99.3 µs
- ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=99
+ ⏱ 149.0 ± 0.64 µs
+ ⚡ 141.3 µs 🐌 182.3 µs
+ ❌ mismatch found! first mismatch at (0, 1): got=729 ref=5974
 ```
 
 ## Program stdout:

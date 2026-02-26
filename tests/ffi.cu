@@ -1,24 +1,15 @@
-"""DSA index submission — multi-CTA, no in-kernel topk."""
-
-import torch
-from torch.utils.cpp_extension import load_inline
-
-from task import input_t, output_t
-
-
-_module = None
-
-
-cuda_src = """
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/function.h>
 #include <cuda.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <cassert>
 #include <cstddef>
 #include <climits>
 #include <cstdint>
+
+using TensorView = tvm::ffi::TensorView;
 
 // ---------------------------------------------------------------------------------
 // Constants
@@ -165,10 +156,10 @@ __device__ inline void mbarrier_wait_parity(int mbar_addr, int phase) {
     while (true) {
         uint32_t complete = 0;
         asm volatile(
-            "{\\n\\t"
-            ".reg .pred p;\\n\\t"
-            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2, %3;\\n\\t"
-            "selp.u32 %0, 1, 0, p;\\n\\t"
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2, %3;\n\t"
+            "selp.u32 %0, 1, 0, p;\n\t"
             "}"
             : "=r"(complete)
             : "r"(mbar_addr), "r"(phase), "r"(kSuspendNs)
@@ -265,10 +256,10 @@ __device__ inline void tcgen05_mma_f8f6f4(
 ) {
     uint32_t mask[4] = {0, 0, 0, 0};
     asm volatile(
-        "{\\n\\t"
-        ".reg .pred p;\\n\\t"
-        "setp.ne.b32 p, %4, 0;\\n\\t"
-        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, {%5, %6, %7, %8}, p;\\n\\t"
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
         "}"
         :: "r"(tmem_d), "l"(desc_a), "l"(desc_b), "r"(idesc), "r"(accumulate),
            "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
@@ -670,7 +661,7 @@ static CUtensorMap make_q_fp8_tmap(const int8_t* q_ptr, int batch_size) {
         CU_TENSOR_MAP_SWIZZLE_128B,
         CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TORCH_CHECK(st == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for q");
+    assert(st == CUDA_SUCCESS && "cuTensorMapEncodeTiled failed for q");
     return tmap;
 }
 
@@ -705,7 +696,7 @@ static CUtensorMap make_k_fp8_tmap(const int8_t* k_ptr, int num_pages) {
         CU_TENSOR_MAP_SWIZZLE_128B,
         CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TORCH_CHECK(st == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for payload");
+    assert(st == CUDA_SUCCESS && "cuTensorMapEncodeTiled failed for payload");
     return tmap;
 }
 
@@ -738,28 +729,55 @@ static CUtensorMap make_k_scale_tmap(const int8_t* k_ptr, int num_pages) {
         CU_TENSOR_MAP_SWIZZLE_NONE,
         CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TORCH_CHECK(st == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for scales");
+    assert(st == CUDA_SUCCESS && "cuTensorMapEncodeTiled failed for scales");
     return tmap;
 }
 
 // ---------------------------------------------------------------------------------
-// Launch entry — static scheduler
+// Persistent scratch buffer for scores + ids
+// ---------------------------------------------------------------------------------
+static float* g_scratch_scores = nullptr;
+static int*   g_scratch_ids = nullptr;
+static size_t g_scratch_elems = 0;
+
+static void ensure_scratch(size_t needed_elems) {
+    if (needed_elems <= g_scratch_elems) return;
+    if (g_scratch_scores) cudaFree(g_scratch_scores);
+    if (g_scratch_ids)    cudaFree(g_scratch_ids);
+    g_scratch_elems = needed_elems;
+    cudaMalloc(&g_scratch_scores, needed_elems * sizeof(float));
+    cudaMalloc(&g_scratch_ids,    needed_elems * sizeof(int));
+}
+
+// ---------------------------------------------------------------------------------
+// Launch entry — static scheduler, TVM FFI interface
 // ---------------------------------------------------------------------------------
 void dsa_topk_indexer_launch(
-    torch::Tensor q_index_fp8,
-    torch::Tensor k_index_cache_fp8,
-    torch::Tensor weights,
-    torch::Tensor seq_lens,
-    torch::Tensor block_table,
-    torch::Tensor out_scores,
-    torch::Tensor out_ids
+    TensorView q_index_fp8,
+    TensorView k_index_cache_fp8,
+    TensorView weights,
+    TensorView seq_lens,
+    TensorView block_table,
+    TensorView out_topk_indices
 ) {
     const int batch_size = static_cast<int>(q_index_fp8.size(0));
     const int num_pages = static_cast<int>(k_index_cache_fp8.size(0));
     const int max_num_pages = static_cast<int>(block_table.size(1));
-    const int out_stride = static_cast<int>(out_scores.size(1));
+    const int topk_count = static_cast<int>(out_topk_indices.size(1));
 
-    if (batch_size == 0 || out_stride == 0 || max_num_pages == 0) {
+    // Stub: fill out_topk_indices with -1 (no topk)
+    cudaMemset(out_topk_indices.data_ptr(), 0xFF,
+               static_cast<size_t>(batch_size) * topk_count * sizeof(int));
+
+    // TEMPORARILY: just return to test FFI plumbing works.
+    // Uncomment below to actually launch the kernel.
+    return;
+
+    (void)num_pages;
+    (void)max_num_pages;
+
+#if 0
+    if (batch_size == 0 || max_num_pages == 0) {
         return;
     }
 
@@ -771,6 +789,10 @@ void dsa_topk_indexer_launch(
         );
         g_kernel_attrs_set = true;
     }
+
+    const int out_stride = max_num_pages * kPageSize;
+    const size_t total_elems = static_cast<size_t>(batch_size) * out_stride;
+    ensure_scratch(total_elems);
 
     const int8_t* q_ptr = reinterpret_cast<const int8_t*>(q_index_fp8.data_ptr());
     const int8_t* k_ptr = reinterpret_cast<const int8_t*>(k_index_cache_fp8.data_ptr());
@@ -797,104 +819,15 @@ void dsa_topk_indexer_launch(
         reinterpret_cast<const float*>(weights.data_ptr()),
         reinterpret_cast<const int*>(seq_lens.data_ptr()),
         reinterpret_cast<const int*>(block_table.data_ptr()),
-        reinterpret_cast<float*>(out_scores.data_ptr()),
-        reinterpret_cast<int*>(out_ids.data_ptr()),
+        g_scratch_scores,
+        g_scratch_ids,
         batch_size,
         num_pages,
         max_num_pages,
         out_stride,
         tiles_per_cta
     );
-    cudaError_t launch_st = cudaGetLastError();
-    TORCH_CHECK(launch_st == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(launch_st));
+#endif
 }
-"""
 
-cpp_decl_src = """
-#include <torch/extension.h>
-void dsa_topk_indexer_launch(
-    torch::Tensor q_index_fp8,
-    torch::Tensor k_index_cache_fp8,
-    torch::Tensor weights,
-    torch::Tensor seq_lens,
-    torch::Tensor block_table,
-    torch::Tensor out_scores,
-    torch::Tensor out_ids);
-"""
-
-
-def _get_module():
-    global _module
-    if _module is None:
-        _module = load_inline(
-            name="dsa_topk_indexer_ext_revised",
-            cpp_sources=cpp_decl_src,
-            cuda_sources=cuda_src,
-            functions=["dsa_topk_indexer_launch"],
-            no_implicit_headers=True,
-            extra_cuda_cflags=[
-                "-O1",
-                "-gencode=arch=compute_100a,code=sm_100a",
-                "--split-compile=4",
-                "--relocatable-device-code=false",
-            ],
-            extra_ldflags=["-lcuda"],
-        )
-    return _module
-
-
-def compile_kernel():
-    _get_module()
-
-
-def _dsa_topk_indexer(
-    q_index_fp8: torch.Tensor,
-    k_index_cache_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    seq_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    out_scores: torch.Tensor,
-    out_ids: torch.Tensor,
-):
-    mod = _get_module()
-    mod.dsa_topk_indexer_launch(
-        q_index_fp8,
-        k_index_cache_fp8,
-        weights,
-        seq_lens,
-        block_table,
-        out_scores,
-        out_ids,
-    )
-    return out_scores, out_ids
-
-
-def custom_kernel(data: input_t) -> output_t:
-    q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
-    batch = int(q_index_fp8.shape[0])
-    topk = 2048
-    out_topk_indices = torch.full((batch, topk), -1, dtype=torch.int32, device=q_index_fp8.device)
-    if batch == 0:
-        return (out_topk_indices,)
-
-    max_seq = min(int(seq_lens.max().item()), int(block_table.shape[1]) * 64)
-    if max_seq <= 0:
-        return (out_topk_indices,)
-
-    out_scores = torch.full((batch, max_seq), float('-inf'), dtype=torch.float32, device=q_index_fp8.device)
-    out_ids = torch.full((batch, max_seq), -1, dtype=torch.int32, device=q_index_fp8.device)
-
-    _dsa_topk_indexer(
-        q_index_fp8,
-        k_index_cache_fp8,
-        weights,
-        seq_lens,
-        block_table,
-        out_scores,
-        out_ids,
-    )
-
-    k = min(topk, max_seq)
-    top_pos = torch.topk(out_scores, k, dim=1).indices
-    out_topk_indices[:, :k] = torch.gather(out_ids, 1, top_pos).to(torch.int32)
-    return (out_topk_indices,)
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsa_topk_indexer, dsa_topk_indexer_launch);

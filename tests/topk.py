@@ -1,4 +1,4 @@
-"""DSA index submission — multi-CTA, no in-kernel topk."""
+"""DSA index submission — multi-CTA + tiled top-k with CUDA graph capture."""
 
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -7,6 +7,7 @@ from task import input_t, output_t
 
 
 _module = None
+TOPK = 2048
 
 
 cuda_src = """
@@ -15,6 +16,9 @@ cuda_src = """
 #include <cuda.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
+#include <math.h>
 
 #include <cstddef>
 #include <climits>
@@ -635,6 +639,231 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
 }
 
 // ---------------------------------------------------------------------------------
+// Top-k kernels (tiled scan + radix-select + block sort)
+// ---------------------------------------------------------------------------------
+constexpr int kTopKMax = 2048;
+constexpr int kTopKBlockThreads = 256;
+constexpr int kTopKItemsPerThread = kTopKMax / kTopKBlockThreads;  // 8
+static_assert(kTopKItemsPerThread * kTopKBlockThreads == kTopKMax, "invalid topk tiling");
+
+__device__ inline uint32_t topk_float_to_ordered(float v) {
+    const uint32_t x = __float_as_uint(v);
+    const uint32_t mask = (x & 0x80000000U) ? 0xFFFFFFFFU : 0x80000000U;
+    return (v == v) ? (x ^ mask) : 0xFFFFFFFFU;
+}
+
+__global__ void init_topk_buffers_kernel(
+    float* out_scores,
+    int* out_ids,
+    int* out_topk_indices,
+    int total_scores,
+    int total_topk
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    for (int i = idx; i < total_scores; i += stride) {
+        out_scores[i] = -INFINITY;
+        out_ids[i] = -1;
+    }
+    for (int i = idx; i < total_topk; i += stride) {
+        out_topk_indices[i] = -1;
+    }
+}
+
+__global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
+    const float* out_scores,
+    const int* out_ids,
+    const int* seq_lens,
+    int* out_topk_indices,
+    int batch_size,
+    int out_stride
+) {
+    const int b = blockIdx.x;
+    if (b >= batch_size) {
+        return;
+    }
+
+    const int tid = threadIdx.x;
+    constexpr int topk = kTopKMax;
+
+    int seq_len = seq_lens[b];
+    if (seq_len < 0) seq_len = 0;
+    if (seq_len > out_stride) seq_len = out_stride;
+    const int k = (seq_len < topk) ? seq_len : topk;
+
+    if (k <= 0) {
+        return;
+    }
+
+    const float* row_scores = out_scores + static_cast<int64_t>(b) * out_stride;
+    const int* row_ids = out_ids + static_cast<int64_t>(b) * out_stride;
+    int* row_topk = out_topk_indices + static_cast<int64_t>(b) * topk;
+
+    __shared__ uint32_t digit_counts[256];
+    __shared__ uint32_t desired;
+    __shared__ uint32_t desired_mask;
+    __shared__ uint32_t k_to_find;
+    __shared__ uint32_t kth_value_converted;
+
+    __shared__ float candidate_scores[kTopKMax];
+    __shared__ int candidate_ids[kTopKMax];
+    __shared__ int write_cursor;
+
+    using BlockScan = cub::BlockScan<int, kTopKBlockThreads>;
+    using BlockRadixSort = cub::BlockRadixSort<float, kTopKBlockThreads, kTopKItemsPerThread, int>;
+    union TempStorage {
+        typename BlockScan::TempStorage scan;
+        typename BlockRadixSort::TempStorage sort;
+    };
+    __shared__ TempStorage temp_storage;
+
+    if (tid == 0) {
+        desired = 0U;
+        desired_mask = 0U;
+        k_to_find = static_cast<uint32_t>(k);
+    }
+    __syncthreads();
+
+    // 4-pass radix select over float32 bits (8 bits / pass).
+    for (int bit = 24; bit >= 0; bit -= 8) {
+        if (tid < 256) {
+            digit_counts[tid] = 0U;
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < seq_len; idx += kTopKBlockThreads) {
+            const uint32_t v = topk_float_to_ordered(row_scores[idx]);
+            if ((v & desired_mask) == desired) {
+                const int digit = static_cast<int>((v >> bit) & 0xFFU);
+                atomicAdd(&digit_counts[digit], 1U);
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            uint32_t remain = k_to_find;
+            uint32_t selected_digit = 0U;
+            for (int d = 255; d >= 0; --d) {
+                const uint32_t cnt = digit_counts[d];
+                if (cnt >= remain) {
+                    selected_digit = static_cast<uint32_t>(d);
+                    break;
+                }
+                remain -= cnt;
+            }
+            desired |= (selected_digit << bit);
+            desired_mask |= (0xFFU << bit);
+            k_to_find = remain;
+        }
+        __syncthreads();
+    }
+
+    kth_value_converted = desired;
+    __syncthreads();
+
+    for (int i = tid; i < kTopKMax; i += kTopKBlockThreads) {
+        candidate_scores[i] = -INFINITY;
+        candidate_ids[i] = -1;
+    }
+    if (tid == 0) {
+        write_cursor = 0;
+    }
+    __syncthreads();
+
+    // Phase 1: collect values strictly greater than kth value.
+    for (int base = 0; base < seq_len; base += kTopKBlockThreads) {
+        const int idx = base + tid;
+        int is_gt = 0;
+        float score = -INFINITY;
+        int token_id = -1;
+        if (idx < seq_len) {
+            score = row_scores[idx];
+            token_id = row_ids[idx];
+            const uint32_t v = topk_float_to_ordered(score);
+            is_gt = (v > kth_value_converted) ? 1 : 0;
+        }
+
+        int offset = 0;
+        int tile_count = 0;
+        BlockScan(temp_storage.scan).ExclusiveSum(is_gt, offset, tile_count);
+        __syncthreads();
+
+        if (is_gt) {
+            const int pos = write_cursor + offset;
+            if (pos < topk) {
+                candidate_scores[pos] = score;
+                candidate_ids[pos] = token_id;
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            write_cursor += tile_count;
+        }
+        __syncthreads();
+    }
+
+    // Phase 2: fill remaining slots with values equal to kth value.
+    for (int base = 0; base < seq_len && write_cursor < k; base += kTopKBlockThreads) {
+        const int idx = base + tid;
+        int is_eq = 0;
+        float score = -INFINITY;
+        int token_id = -1;
+        if (idx < seq_len) {
+            score = row_scores[idx];
+            token_id = row_ids[idx];
+            const uint32_t v = topk_float_to_ordered(score);
+            is_eq = (v == kth_value_converted) ? 1 : 0;
+        }
+
+        int offset = 0;
+        int tile_count = 0;
+        BlockScan(temp_storage.scan).ExclusiveSum(is_eq, offset, tile_count);
+        __syncthreads();
+
+        if (is_eq) {
+            const int pos = write_cursor + offset;
+            if (pos < k) {
+                candidate_scores[pos] = score;
+                candidate_ids[pos] = token_id;
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            int next_cursor = write_cursor + tile_count;
+            write_cursor = (next_cursor < k) ? next_cursor : k;
+        }
+        __syncthreads();
+    }
+
+    // Sort selected candidates by score descending to match torch.topk ordering.
+    float thread_keys[kTopKItemsPerThread];
+    int thread_vals[kTopKItemsPerThread];
+    #pragma unroll
+    for (int i = 0; i < kTopKItemsPerThread; ++i) {
+        const int idx = tid + i * kTopKBlockThreads;
+        thread_keys[i] = candidate_scores[idx];
+        thread_vals[i] = candidate_ids[idx];
+    }
+
+    BlockRadixSort(temp_storage.sort).SortDescending(thread_keys, thread_vals);
+    __syncthreads();
+
+    #pragma unroll
+    for (int i = 0; i < kTopKItemsPerThread; ++i) {
+        const int idx = tid + i * kTopKBlockThreads;
+        candidate_scores[idx] = thread_keys[i];
+        candidate_ids[idx] = thread_vals[i];
+    }
+    __syncthreads();
+
+    for (int i = tid; i < topk; i += kTopKBlockThreads) {
+        row_topk[i] = (i < k) ? candidate_ids[i] : -1;
+    }
+}
+
+// ---------------------------------------------------------------------------------
 // Host-side tensor-map helpers
 // ---------------------------------------------------------------------------------
 static bool g_kernel_attrs_set = false;
@@ -758,11 +987,9 @@ void dsa_topk_indexer_launch(
     const int num_pages = static_cast<int>(k_index_cache_fp8.size(0));
     const int max_num_pages = static_cast<int>(block_table.size(1));
     const int out_stride = static_cast<int>(out_scores.size(1));
-
     if (batch_size == 0 || out_stride == 0 || max_num_pages == 0) {
         return;
     }
-
     if (!g_kernel_attrs_set) {
         cudaFuncSetAttribute(
             dsa_topk_indexer_kernel,
@@ -778,7 +1005,6 @@ void dsa_topk_indexer_launch(
     CUtensorMap k_fp8_tmap = make_k_fp8_tmap(k_ptr, num_pages);
     CUtensorMap k_scale_tmap = make_k_scale_tmap(k_ptr, num_pages);
 
-    // Static scheduler: spread tiles across SMs.
     int ctas_per_batch;
     if (max_num_pages * batch_size <= kNumSMs) {
         ctas_per_batch = max_num_pages;
@@ -789,8 +1015,9 @@ void dsa_topk_indexer_launch(
     }
     const int tiles_per_cta = (max_num_pages + ctas_per_batch - 1) / ctas_per_batch;
 
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     dim3 grid(ctas_per_batch, batch_size);
-    dsa_topk_indexer_kernel<<<grid, kThreadsPerBlock, kDesiredDynamicSmemBytes>>>(
+    dsa_topk_indexer_kernel<<<grid, kThreadsPerBlock, kDesiredDynamicSmemBytes, stream>>>(
         q_fp8_tmap,
         k_fp8_tmap,
         k_scale_tmap,
@@ -808,6 +1035,322 @@ void dsa_topk_indexer_launch(
     cudaError_t launch_st = cudaGetLastError();
     TORCH_CHECK(launch_st == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(launch_st));
 }
+
+struct TopkLaunchConfig {
+    CUtensorMap q_fp8_tmap;
+    CUtensorMap k_fp8_tmap;
+    CUtensorMap k_scale_tmap;
+    int batch_size = 0;
+    int num_pages = 0;
+    int max_num_pages = 0;
+    int out_stride = 0;
+    int ctas_per_batch = 0;
+    int tiles_per_cta = 0;
+    int init_blocks = 0;
+    int total_scores = 0;
+    int total_topk = 0;
+};
+
+static inline void maybe_set_kernel_attrs() {
+    if (!g_kernel_attrs_set) {
+        cudaFuncSetAttribute(
+            dsa_topk_indexer_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            kDesiredDynamicSmemBytes
+        );
+        g_kernel_attrs_set = true;
+    }
+}
+
+static inline TopkLaunchConfig make_topk_launch_config(
+    torch::Tensor q_index_fp8,
+    torch::Tensor k_index_cache_fp8,
+    torch::Tensor block_table,
+    torch::Tensor out_scores
+) {
+    TopkLaunchConfig cfg;
+    cfg.batch_size = static_cast<int>(q_index_fp8.size(0));
+    cfg.num_pages = static_cast<int>(k_index_cache_fp8.size(0));
+    cfg.max_num_pages = static_cast<int>(block_table.size(1));
+    cfg.out_stride = static_cast<int>(out_scores.size(1));
+
+    const int8_t* q_ptr = reinterpret_cast<const int8_t*>(q_index_fp8.data_ptr());
+    const int8_t* k_ptr = reinterpret_cast<const int8_t*>(k_index_cache_fp8.data_ptr());
+    cfg.q_fp8_tmap = make_q_fp8_tmap(q_ptr, cfg.batch_size);
+    cfg.k_fp8_tmap = make_k_fp8_tmap(k_ptr, cfg.num_pages);
+    cfg.k_scale_tmap = make_k_scale_tmap(k_ptr, cfg.num_pages);
+
+    if (cfg.max_num_pages * cfg.batch_size <= kNumSMs) {
+        cfg.ctas_per_batch = cfg.max_num_pages;
+    } else {
+        cfg.ctas_per_batch = kNumSMs / cfg.batch_size;
+        if (cfg.ctas_per_batch < 1) cfg.ctas_per_batch = 1;
+        if (cfg.ctas_per_batch > cfg.max_num_pages) cfg.ctas_per_batch = cfg.max_num_pages;
+    }
+    cfg.tiles_per_cta = (cfg.max_num_pages + cfg.ctas_per_batch - 1) / cfg.ctas_per_batch;
+
+    cfg.total_scores = cfg.batch_size * cfg.out_stride;
+    cfg.total_topk = cfg.batch_size * kTopKMax;
+    const int total = (cfg.total_scores > cfg.total_topk) ? cfg.total_scores : cfg.total_topk;
+    cfg.init_blocks = (total + 255) / 256;
+    return cfg;
+}
+
+static inline void launch_topk_pipeline_no_checks(
+    const TopkLaunchConfig& cfg,
+    torch::Tensor weights,
+    torch::Tensor seq_lens,
+    torch::Tensor block_table,
+    torch::Tensor out_scores,
+    torch::Tensor out_ids,
+    torch::Tensor out_topk_indices,
+    cudaStream_t stream
+) {
+    init_topk_buffers_kernel<<<cfg.init_blocks, 256, 0, stream>>>(
+        reinterpret_cast<float*>(out_scores.data_ptr()),
+        reinterpret_cast<int*>(out_ids.data_ptr()),
+        reinterpret_cast<int*>(out_topk_indices.data_ptr()),
+        cfg.total_scores,
+        cfg.total_topk
+    );
+
+    dim3 grid(cfg.ctas_per_batch, cfg.batch_size);
+    dsa_topk_indexer_kernel<<<grid, kThreadsPerBlock, kDesiredDynamicSmemBytes, stream>>>(
+        cfg.q_fp8_tmap,
+        cfg.k_fp8_tmap,
+        cfg.k_scale_tmap,
+        reinterpret_cast<const float*>(weights.data_ptr()),
+        reinterpret_cast<const int*>(seq_lens.data_ptr()),
+        reinterpret_cast<const int*>(block_table.data_ptr()),
+        reinterpret_cast<float*>(out_scores.data_ptr()),
+        reinterpret_cast<int*>(out_ids.data_ptr()),
+        cfg.batch_size,
+        cfg.num_pages,
+        cfg.max_num_pages,
+        cfg.out_stride,
+        cfg.tiles_per_cta
+    );
+
+    tiled_topk_kernel<<<cfg.batch_size, kTopKBlockThreads, 0, stream>>>(
+        reinterpret_cast<const float*>(out_scores.data_ptr()),
+        reinterpret_cast<const int*>(out_ids.data_ptr()),
+        reinterpret_cast<const int*>(seq_lens.data_ptr()),
+        reinterpret_cast<int*>(out_topk_indices.data_ptr()),
+        cfg.batch_size,
+        cfg.out_stride
+    );
+}
+
+void dsa_topk_indexer_topk_launch(
+    torch::Tensor q_index_fp8,
+    torch::Tensor k_index_cache_fp8,
+    torch::Tensor weights,
+    torch::Tensor seq_lens,
+    torch::Tensor block_table,
+    torch::Tensor out_scores,
+    torch::Tensor out_ids,
+    torch::Tensor out_topk_indices
+) {
+    const int batch_size = static_cast<int>(q_index_fp8.size(0));
+    const int out_stride = static_cast<int>(out_scores.size(1));
+    const int max_num_pages = static_cast<int>(block_table.size(1));
+    if (batch_size == 0 || out_stride == 0 || max_num_pages == 0) {
+        return;
+    }
+    maybe_set_kernel_attrs();
+    TopkLaunchConfig cfg = make_topk_launch_config(q_index_fp8, k_index_cache_fp8, block_table, out_scores);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    launch_topk_pipeline_no_checks(cfg, weights, seq_lens, block_table, out_scores, out_ids, out_topk_indices, stream);
+    cudaError_t st = cudaGetLastError();
+    TORCH_CHECK(st == cudaSuccess, "topk launch failed: ", cudaGetErrorString(st));
+}
+
+struct TopkGraphState {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    int device = -1;
+    int batch_size = 0;
+    int num_pages = 0;
+    int max_num_pages = 0;
+    int out_stride = 0;
+    const void* q_ptr = nullptr;
+    const void* k_ptr = nullptr;
+    const void* w_ptr = nullptr;
+    const void* seq_ptr = nullptr;
+    const void* block_ptr = nullptr;
+    const void* scores_ptr = nullptr;
+    const void* ids_ptr = nullptr;
+    const void* topk_ptr = nullptr;
+};
+
+static TopkGraphState g_topk_graph_state;
+static bool g_graph_disabled = false;
+
+static void reset_topk_graph_state() {
+    if (g_topk_graph_state.exec != nullptr) {
+        cudaGraphExecDestroy(g_topk_graph_state.exec);
+        g_topk_graph_state.exec = nullptr;
+    }
+    if (g_topk_graph_state.graph != nullptr) {
+        cudaGraphDestroy(g_topk_graph_state.graph);
+        g_topk_graph_state.graph = nullptr;
+    }
+    g_topk_graph_state.device = -1;
+}
+
+void dsa_topk_indexer_topk_graph_launch(
+    torch::Tensor q_index_fp8,
+    torch::Tensor k_index_cache_fp8,
+    torch::Tensor weights,
+    torch::Tensor seq_lens,
+    torch::Tensor block_table,
+    torch::Tensor out_scores,
+    torch::Tensor out_ids,
+    torch::Tensor out_topk_indices
+) {
+    if (g_graph_disabled) {
+        dsa_topk_indexer_topk_launch(
+            q_index_fp8,
+            k_index_cache_fp8,
+            weights,
+            seq_lens,
+            block_table,
+            out_scores,
+            out_ids,
+            out_topk_indices
+        );
+        return;
+    }
+
+    const int batch_size = static_cast<int>(q_index_fp8.size(0));
+    const int num_pages = static_cast<int>(k_index_cache_fp8.size(0));
+    const int max_num_pages = static_cast<int>(block_table.size(1));
+    const int out_stride = static_cast<int>(out_scores.size(1));
+    if (batch_size == 0 || out_stride == 0 || max_num_pages == 0) {
+        return;
+    }
+
+    maybe_set_kernel_attrs();
+    const int device = q_index_fp8.get_device();
+    const void* q_ptr = q_index_fp8.data_ptr();
+    const void* k_ptr = k_index_cache_fp8.data_ptr();
+    const void* w_ptr = weights.data_ptr();
+    const void* seq_ptr = seq_lens.data_ptr();
+    const void* block_ptr = block_table.data_ptr();
+    const void* scores_ptr = out_scores.data_ptr();
+    const void* ids_ptr = out_ids.data_ptr();
+    const void* topk_ptr = out_topk_indices.data_ptr();
+
+    const bool matches =
+        g_topk_graph_state.exec != nullptr &&
+        g_topk_graph_state.device == device &&
+        g_topk_graph_state.batch_size == batch_size &&
+        g_topk_graph_state.num_pages == num_pages &&
+        g_topk_graph_state.max_num_pages == max_num_pages &&
+        g_topk_graph_state.out_stride == out_stride &&
+        g_topk_graph_state.q_ptr == q_ptr &&
+        g_topk_graph_state.k_ptr == k_ptr &&
+        g_topk_graph_state.w_ptr == w_ptr &&
+        g_topk_graph_state.seq_ptr == seq_ptr &&
+        g_topk_graph_state.block_ptr == block_ptr &&
+        g_topk_graph_state.scores_ptr == scores_ptr &&
+        g_topk_graph_state.ids_ptr == ids_ptr &&
+        g_topk_graph_state.topk_ptr == topk_ptr;
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    if (!matches) {
+        reset_topk_graph_state();
+        TopkLaunchConfig cfg = make_topk_launch_config(q_index_fp8, k_index_cache_fp8, block_table, out_scores);
+
+        cudaError_t cap_st = cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
+        if (cap_st != cudaSuccess) {
+            cudaGetLastError();
+            g_graph_disabled = true;
+            dsa_topk_indexer_topk_launch(
+                q_index_fp8,
+                k_index_cache_fp8,
+                weights,
+                seq_lens,
+                block_table,
+                out_scores,
+                out_ids,
+                out_topk_indices
+            );
+            return;
+        }
+
+        launch_topk_pipeline_no_checks(cfg, weights, seq_lens, block_table, out_scores, out_ids, out_topk_indices, stream);
+
+        cudaError_t end_st = cudaStreamEndCapture(stream, &g_topk_graph_state.graph);
+        if (end_st != cudaSuccess) {
+            cudaGetLastError();
+            if (g_topk_graph_state.graph != nullptr) {
+                cudaGraphDestroy(g_topk_graph_state.graph);
+                g_topk_graph_state.graph = nullptr;
+            }
+            g_graph_disabled = true;
+            dsa_topk_indexer_topk_launch(
+                q_index_fp8,
+                k_index_cache_fp8,
+                weights,
+                seq_lens,
+                block_table,
+                out_scores,
+                out_ids,
+                out_topk_indices
+            );
+            return;
+        }
+        cudaError_t inst_st = cudaGraphInstantiate(&g_topk_graph_state.exec, g_topk_graph_state.graph, nullptr, nullptr, 0);
+        if (inst_st != cudaSuccess) {
+            cudaGetLastError();
+            reset_topk_graph_state();
+            g_graph_disabled = true;
+            dsa_topk_indexer_topk_launch(
+                q_index_fp8,
+                k_index_cache_fp8,
+                weights,
+                seq_lens,
+                block_table,
+                out_scores,
+                out_ids,
+                out_topk_indices
+            );
+            return;
+        }
+
+        g_topk_graph_state.device = device;
+        g_topk_graph_state.batch_size = batch_size;
+        g_topk_graph_state.num_pages = num_pages;
+        g_topk_graph_state.max_num_pages = max_num_pages;
+        g_topk_graph_state.out_stride = out_stride;
+        g_topk_graph_state.q_ptr = q_ptr;
+        g_topk_graph_state.k_ptr = k_ptr;
+        g_topk_graph_state.w_ptr = w_ptr;
+        g_topk_graph_state.seq_ptr = seq_ptr;
+        g_topk_graph_state.block_ptr = block_ptr;
+        g_topk_graph_state.scores_ptr = scores_ptr;
+        g_topk_graph_state.ids_ptr = ids_ptr;
+        g_topk_graph_state.topk_ptr = topk_ptr;
+    }
+
+    cudaError_t replay_st = cudaGraphLaunch(g_topk_graph_state.exec, stream);
+    if (replay_st != cudaSuccess) {
+        cudaGetLastError();
+        reset_topk_graph_state();
+        g_graph_disabled = true;
+        dsa_topk_indexer_topk_launch(
+            q_index_fp8,
+            k_index_cache_fp8,
+            weights,
+            seq_lens,
+            block_table,
+            out_scores,
+            out_ids,
+            out_topk_indices
+        );
+    }
+}
 """
 
 cpp_decl_src = """
@@ -820,6 +1363,24 @@ void dsa_topk_indexer_launch(
     torch::Tensor block_table,
     torch::Tensor out_scores,
     torch::Tensor out_ids);
+void dsa_topk_indexer_topk_launch(
+    torch::Tensor q_index_fp8,
+    torch::Tensor k_index_cache_fp8,
+    torch::Tensor weights,
+    torch::Tensor seq_lens,
+    torch::Tensor block_table,
+    torch::Tensor out_scores,
+    torch::Tensor out_ids,
+    torch::Tensor out_topk_indices);
+void dsa_topk_indexer_topk_graph_launch(
+    torch::Tensor q_index_fp8,
+    torch::Tensor k_index_cache_fp8,
+    torch::Tensor weights,
+    torch::Tensor seq_lens,
+    torch::Tensor block_table,
+    torch::Tensor out_scores,
+    torch::Tensor out_ids,
+    torch::Tensor out_topk_indices);
 """
 
 
@@ -827,10 +1388,14 @@ def _get_module():
     global _module
     if _module is None:
         _module = load_inline(
-            name="dsa_topk_indexer_ext_revised",
+            name="dsa_topk_indexer_ext_tiled_topk",
             cpp_sources=cpp_decl_src,
             cuda_sources=cuda_src,
-            functions=["dsa_topk_indexer_launch"],
+            functions=[
+                "dsa_topk_indexer_launch",
+                "dsa_topk_indexer_topk_launch",
+                "dsa_topk_indexer_topk_graph_launch",
+            ],
             no_implicit_headers=True,
             extra_cuda_cflags=[
                 "-O1",
@@ -847,54 +1412,102 @@ def compile_kernel():
     _get_module()
 
 
-def _dsa_topk_indexer(
+_workspace = None
+
+
+def _need_workspace_rebuild(
+    ws,
     q_index_fp8: torch.Tensor,
     k_index_cache_fp8: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
-    out_scores: torch.Tensor,
-    out_ids: torch.Tensor,
+    max_seq: int,
 ):
-    mod = _get_module()
-    mod.dsa_topk_indexer_launch(
+    if ws is None:
+        return True
+    return (
+        ws["q"].shape != q_index_fp8.shape
+        or ws["k"].shape != k_index_cache_fp8.shape
+        or ws["w"].shape != weights.shape
+        or ws["seq"].shape != seq_lens.shape
+        or ws["block"].shape != block_table.shape
+        or ws["scores"].shape != (q_index_fp8.shape[0], max_seq)
+        or ws["ids"].shape != (q_index_fp8.shape[0], max_seq)
+        or ws["topk"].shape != (q_index_fp8.shape[0], TOPK)
+        or ws["q"].dtype != q_index_fp8.dtype
+        or ws["k"].dtype != k_index_cache_fp8.dtype
+        or ws["w"].dtype != weights.dtype
+        or ws["seq"].dtype != seq_lens.dtype
+        or ws["block"].dtype != block_table.dtype
+        or ws["q"].device != q_index_fp8.device
+    )
+
+
+def _get_workspace(
+    q_index_fp8: torch.Tensor,
+    k_index_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_seq: int,
+):
+    global _workspace
+    if _need_workspace_rebuild(
+        _workspace,
         q_index_fp8,
         k_index_cache_fp8,
         weights,
         seq_lens,
         block_table,
-        out_scores,
-        out_ids,
-    )
-    return out_scores, out_ids
+        max_seq,
+    ):
+        _workspace = {
+            "q": torch.empty_like(q_index_fp8),
+            "k": torch.empty_like(k_index_cache_fp8),
+            "w": torch.empty_like(weights),
+            "seq": torch.empty_like(seq_lens),
+            "block": torch.empty_like(block_table),
+            "scores": torch.empty((q_index_fp8.shape[0], max_seq), dtype=torch.float32, device=q_index_fp8.device),
+            "ids": torch.empty((q_index_fp8.shape[0], max_seq), dtype=torch.int32, device=q_index_fp8.device),
+            "topk": torch.empty((q_index_fp8.shape[0], TOPK), dtype=torch.int32, device=q_index_fp8.device),
+        }
+    return _workspace
 
 
 def custom_kernel(data: input_t) -> output_t:
     q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
     batch = int(q_index_fp8.shape[0])
-    topk = 2048
-    out_topk_indices = torch.full((batch, topk), -1, dtype=torch.int32, device=q_index_fp8.device)
     if batch == 0:
-        return (out_topk_indices,)
+        return (torch.empty((0, TOPK), dtype=torch.int32, device=q_index_fp8.device),)
 
     max_seq = min(int(seq_lens.max().item()), int(block_table.shape[1]) * 64)
     if max_seq <= 0:
-        return (out_topk_indices,)
+        return (torch.full((batch, TOPK), -1, dtype=torch.int32, device=q_index_fp8.device),)
 
-    out_scores = torch.full((batch, max_seq), float('-inf'), dtype=torch.float32, device=q_index_fp8.device)
-    out_ids = torch.full((batch, max_seq), -1, dtype=torch.int32, device=q_index_fp8.device)
-
-    _dsa_topk_indexer(
+    ws = _get_workspace(
         q_index_fp8,
         k_index_cache_fp8,
         weights,
         seq_lens,
         block_table,
-        out_scores,
-        out_ids,
+        max_seq,
     )
+    ws["q"].copy_(q_index_fp8)
+    ws["k"].copy_(k_index_cache_fp8)
+    ws["w"].copy_(weights)
+    ws["seq"].copy_(seq_lens)
+    ws["block"].copy_(block_table)
 
-    k = min(topk, max_seq)
-    top_pos = torch.topk(out_scores, k, dim=1).indices
-    out_topk_indices[:, :k] = torch.gather(out_ids, 1, top_pos).to(torch.int32)
-    return (out_topk_indices,)
+    mod = _get_module()
+    mod.dsa_topk_indexer_topk_graph_launch(
+        ws["q"],
+        ws["k"],
+        ws["w"],
+        ws["seq"],
+        ws["block"],
+        ws["scores"],
+        ws["ids"],
+        ws["topk"],
+    )
+    return (ws["topk"],)
