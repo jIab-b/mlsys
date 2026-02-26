@@ -1,0 +1,35 @@
+Running benchmark for task 'dsa_index_fused' on Modal...
+Compiling kernel (CPU)...
+Compile done. Starting GPU eval...
+"**Modal ❌ failure**
+> ❌ Benchmarking failed
+
+Running on:
+* GPU: `NVIDIA B200`
+* CPU: `x86_64`
+* Device count: `1`
+* Runtime: `CUDA`
+* Platform: `Linux-4.4.0-x86_64-with-glibc2.35`
+* Torch: `2.9.1+cu130`
+* Hostname: `modal`
+
+
+## Benchmarks:
+```
+batch: 1; num_pages: 32; seq_len: 2048; seed: 100
+ ⏱ 81.0 ± 0.35 µs
+ ⚡ 74.8 µs 🐌 91.1 µs
+ ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=245
+
+batch: 8; num_pages: 64; seq_len: 4096; seed: 101
+ ⏱ 115.8 ± 0.39 µs
+ ⚡ 109.6 µs 🐌 130.0 µs
+ ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=2748
+
+batch: 16; num_pages: 128; seq_len: 8192; seed: 102
+ ⏱ 182.3 ± 0.32 µs
+ ⚡ 177.1 µs 🐌 194.6 µs
+ ❌ mismatch found! first mismatch at (0, 0): got=-1 ref=99
+```
+
+## Program stdout:

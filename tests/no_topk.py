@@ -983,12 +983,9 @@ __device__ inline void run_topk_warps(
     if (!_is_topk_warp(warp_id)) {
         return;
     }
-
-    constexpr float kNegInf = -3.402823466e+38F;
     const int topk_warp = _topk_warp_rank(warp_id);
-    const int tid = topk_warp * 32 + lane;
-
     const int num_windows = (num_tiles + kTopkWindowTiles - 1) / kTopkWindowTiles;
+
     for (int win = 0; win < num_windows; ++win) {
         const int buf = win & 1;
         const int phase = (win >> 1) & 1;
@@ -997,105 +994,9 @@ __device__ inline void run_topk_warps(
             mbarrier_wait_parity(
                 addr.ep2topk_mbar + buf * static_cast<int>(sizeof(uint64_t)),
                 phase);
-        }
-        topk_team_barrier();
-
-        int stage_tiles = num_tiles - win * kTopkWindowTiles;
-        if (stage_tiles > kTopkWindowTiles) stage_tiles = kTopkWindowTiles;
-        const int stage_count = stage_tiles * kStageTokens;
-        const int running_fill = s.topk_fill;
-        int compacted_stage_count = stage_count;
-        int stage_valid = 0;
-        if (running_fill >= kTopk) {
-            compacted_stage_count = topk_prefilter_stage_by_tau_team(
-                topk_warp,
-                lane,
-                tid,
-                buf,
-                stage_count,
-                s.topk_threshold_key,
-                s);
-            stage_valid = compacted_stage_count;
-        } else {
-            stage_valid = topk_count_stage_valid_team(tid, buf, stage_count, s);
-        }
-        const int union_valid = running_fill + stage_valid;
-
-        if (union_valid <= kTopk) {
-            const int append_count = (running_fill >= kTopk) ? compacted_stage_count : stage_count;
-            const int new_fill = topk_append_stage_valid_team(
-                topk_warp, lane, tid, buf, append_count, running_fill, s);
-            if (tid == 0) {
-                s.topk_fill = new_fill;
-                if (new_fill <= 0) {
-                    s.topk_tau_score = kNegInf;
-                    s.topk_tau_id = -1;
-                    s.topk_threshold_key = 0ULL;
-                } else if ((running_fill >= kTopk) && (stage_valid == 0) && (new_fill == running_fill)) {
-                    // No new surviving candidates; keep the previous threshold/tau.
-                } else {
-                    uint64_t worst_key = topk_make_key(s.topk_scores[0], s.topk_ids[0]);
-                    for (int i = 1; i < new_fill; ++i) {
-                        const uint64_t key = topk_make_key(s.topk_scores[i], s.topk_ids[i]);
-                        if (key < worst_key) {
-                            worst_key = key;
-                        }
-                    }
-                    s.topk_threshold_key = worst_key;
-                    s.topk_tau_score = topk_ordered_to_float(static_cast<uint32_t>(worst_key >> 32));
-                    s.topk_tau_id = static_cast<int>(0xFFFFFFFFu - static_cast<uint32_t>(worst_key));
-                }
-            }
-        } else {
-            const int select_stage_count = (running_fill >= kTopk) ? compacted_stage_count : stage_count;
-            const uint64_t threshold_key =
-                topk_select_threshold_key_radix_team(
-                    topk_warp, lane, tid, running_fill, buf, select_stage_count, kTopk - 1, s);
-            const int new_fill = topk_compact_union_by_threshold_team(
-                topk_warp, lane, tid, running_fill, buf, select_stage_count, threshold_key, s);
-            topk_unpack_next_pairs_to_running_team(tid, new_fill, s);
-            if (tid == 0) {
-                s.topk_fill = new_fill;
-                s.topk_threshold_key = threshold_key;
-                s.topk_tau_score = topk_ordered_to_float(static_cast<uint32_t>(threshold_key >> 32));
-                s.topk_tau_id = static_cast<int>(0xFFFFFFFFu - static_cast<uint32_t>(threshold_key));
-            }
-        }
-        topk_team_barrier();
-
-        if (topk_warp == 0 && lane == 0) {
             mbarrier_arrive(addr.topk2ep_mbar + buf * static_cast<int>(sizeof(uint64_t)));
         }
         topk_team_barrier();
-    }
-
-    for (int i = tid; i < topk_count; i += kTopkTeamThreads) {
-        out_topk_b[i] = -1;
-    }
-    topk_team_barrier();
-
-    if (s.topk_fill <= 0) {
-        return;
-    }
-
-    int fill = s.topk_fill;
-    if (fill > kTopk) fill = kTopk;
-    if (s.topk_fill < kTopk) {
-        for (int i = tid; i < kTopk; i += kTopkTeamThreads) {
-            if (i >= fill) {
-                s.topk_scores[i] = kNegInf;
-                s.topk_ids[i] = INT_MAX;
-            }
-        }
-        topk_team_barrier();
-    }
-    topk_bitonic_sort_desc_team<kTopk>(topk_warp, lane, s.topk_scores, s.topk_ids);
-    topk_team_barrier();
-
-    int emit = fill;
-    if (emit > topk_count) emit = topk_count;
-    for (int i = tid; i < emit; i += kTopkTeamThreads) {
-        out_topk_b[i] = s.topk_ids[i];
     }
 }
 
