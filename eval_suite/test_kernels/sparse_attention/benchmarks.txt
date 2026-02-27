@@ -1,2 +1,0 @@
-batch: 1; num_pages: 16; seq_len: 1024; seed: 3
-batch: 4; num_pages: 16; seq_len: 1024; seed: 4

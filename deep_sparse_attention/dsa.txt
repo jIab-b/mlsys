@@ -14,20 +14,20 @@ Running on:
 ## Benchmarks:
 ```
 batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ⏱ 111.4 ± 1.15 µs
- ⚡ 102.4 µs 🐌 207.7 µs
+ ⏱ 78.4 ± 0.27 µs
+ ⚡ 73.7 µs 🐌 91.1 µs
  exact: 2/2048 positional mismatches
  set:   recall=1.0000 (0/2048 values wrong)
 
 batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ⏱ 127.6 ± 0.77 µs
- ⚡ 118.8 µs 🐌 173.1 µs
+ ⏱ 91.3 ± 0.33 µs
+ ⚡ 86.9 µs 🐌 109.6 µs
  exact: 4/16384 positional mismatches
  set:   recall=1.0000 (0/16384 values wrong)
 
 batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ⏱ 158.9 ± 0.64 µs
- ⚡ 152.5 µs 🐌 182.3 µs
+ ⏱ 123.9 ± 0.48 µs
+ ⚡ 117.8 µs 🐌 160.8 µs
  exact: 16/32768 positional mismatches
  set:   recall=1.0000 (0/32768 values wrong)
 ```

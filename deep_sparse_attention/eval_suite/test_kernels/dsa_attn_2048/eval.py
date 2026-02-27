@@ -11,7 +11,7 @@ torch.cuda.init()
 from common.eval_base import EvalRunner, main
 
 
-class DsaIndexFusedEvalRunner(EvalRunner):
+class DsaAttn2048EvalRunner(EvalRunner):
     use_cutlass = False
     use_batched_benchmark = False
 
@@ -25,8 +25,7 @@ class DsaIndexFusedEvalRunner(EvalRunner):
 
     def get_check_implementation(self):
         from reference import check_implementation
-        swap_ok = self.swap_ok
-        return lambda data, output: check_implementation(data, output, swap_ok=swap_ok)
+        return check_implementation
 
     def get_compile_kernel(self):
         try:
@@ -37,4 +36,4 @@ class DsaIndexFusedEvalRunner(EvalRunner):
 
 
 if __name__ == "__main__":
-    sys.exit(main(DsaIndexFusedEvalRunner()))
+    sys.exit(main(DsaAttn2048EvalRunner()))
