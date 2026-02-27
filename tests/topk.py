@@ -842,7 +842,7 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
     int thread_vals[kTopKItemsPerThread];
     #pragma unroll
     for (int i = 0; i < kTopKItemsPerThread; ++i) {
-        const int idx = tid + i * kTopKBlockThreads;
+        const int idx = tid * kTopKItemsPerThread + i;
         thread_keys[i] = candidate_scores[idx];
         thread_vals[i] = candidate_ids[idx];
     }
@@ -852,7 +852,7 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
 
     #pragma unroll
     for (int i = 0; i < kTopKItemsPerThread; ++i) {
-        const int idx = tid + i * kTopKBlockThreads;
+        const int idx = tid * kTopKItemsPerThread + i;
         candidate_scores[idx] = thread_keys[i];
         candidate_ids[idx] = thread_vals[i];
     }
