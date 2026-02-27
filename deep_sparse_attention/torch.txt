@@ -14,24 +14,20 @@ Running on:
 ## Benchmarks:
 ```
 batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ⏱ 113.8 ± 0.47 µs
- ⚡ 108.5 µs 🐌 137.2 µs
- exact: 2/2048 positional mismatches
- set:   recall=1.0000 (0/2048 values wrong)
+ ⏱ 290.3 ± 1.62 µs
+ ⚡ 268.0 µs 🐌 361.2 µs
 
 batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ⏱ 120.2 ± 0.47 µs
- ⚡ 112.6 µs 🐌 141.3 µs
- exact: 4/16384 positional mismatches
- set:   recall=1.0000 (0/16384 values wrong)
+ ⏱ 1453.5 ± 5.34 µs
+ ⚡ 1369.2 µs 🐌 1641.3 µs
 
 batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ⏱ 149.9 ± 0.73 µs
- ⚡ 137.2 µs 🐌 170.0 µs
- exact: 16/32768 positional mismatches
- set:   recall=1.0000 (0/32768 values wrong)
+ ⏱ 2947.1 ± 8.97 µs
+ ⚡ 2841.0 µs 🐌 3747.6 µs
 ```
 
 ## Program stdout:
 ```
+
+[CACHE] root: /root/.cache/torch_extensions/ (0 files)
 ```"

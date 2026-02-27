@@ -607,7 +607,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
 }
 
 constexpr int kTopKMax = 2048;
-constexpr int kTopKBlockThreads = 256;
+constexpr int kTopKBlockThreads = 1024;
 constexpr int kTopKItemsPerThread = kTopKMax / kTopKBlockThreads;
 static_assert(kTopKItemsPerThread * kTopKBlockThreads == kTopKMax, "invalid topk tiling");
 
@@ -635,6 +635,8 @@ __global__ void init_topk_buffers_kernel(
     }
 }
 
+constexpr int kTopKWarps = kTopKBlockThreads / 32;
+
 __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
     const float* out_scores,
     const int* out_ids,
@@ -649,6 +651,8 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
     }
 
     const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
     constexpr int topk = kTopKMax;
 
     int seq_len = seq_lens[b];
@@ -664,21 +668,23 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
     const int* row_ids = out_ids + static_cast<int64_t>(b) * out_stride;
     int* row_topk = out_topk_indices + static_cast<int64_t>(b) * topk;
 
+    // Shared memory layout — warp_hists (phase 1) is unioned with CUB sort (phase 3)
     __shared__ uint32_t digit_counts[256];
     __shared__ uint32_t desired;
     __shared__ uint32_t desired_mask;
     __shared__ uint32_t k_to_find;
     __shared__ uint32_t kth_value_converted;
 
-    __shared__ float candidate_scores[kTopKMax];
-    __shared__ int candidate_ids[kTopKMax];
+    __shared__ int candidate_idx[kTopKMax];  // stores original index into row_scores/row_ids
     __shared__ int write_cursor;
+    __shared__ int eq_cursor;
 
     using BlockScan = cub::BlockScan<int, kTopKBlockThreads>;
     using BlockRadixSort = cub::BlockRadixSort<float, kTopKBlockThreads, kTopKItemsPerThread, int>;
     union TempStorage {
-        typename BlockScan::TempStorage scan;
-        typename BlockRadixSort::TempStorage sort;
+        uint32_t warp_hists[kTopKWarps][256];  // phase 1: radix select
+        typename BlockScan::TempStorage scan;  // phase 2: gather scans
+        typename BlockRadixSort::TempStorage sort;  // phase 3: final sort
     };
     __shared__ TempStorage temp_storage;
 
@@ -689,18 +695,33 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
     }
     __syncthreads();
 
+    // --- Phase 1: Radix select with warp-level histograms ---
     for (int bit = 24; bit >= 0; bit -= 8) {
-        if (tid < 256) {
-            digit_counts[tid] = 0U;
+        // Zero warp-local histograms
+        #pragma unroll
+        for (int i = lane; i < 256; i += 32) {
+            temp_storage.warp_hists[warp_id][i] = 0U;
         }
         __syncthreads();
 
+        // Each thread scatters into its warp's histogram (no cross-warp contention)
         for (int idx = tid; idx < seq_len; idx += kTopKBlockThreads) {
             const uint32_t v = topk_float_to_ordered(row_scores[idx]);
             if ((v & desired_mask) == desired) {
                 const int digit = static_cast<int>((v >> bit) & 0xFFU);
-                atomicAdd(&digit_counts[digit], 1U);
+                atomicAdd(&temp_storage.warp_hists[warp_id][digit], 1U);
             }
+        }
+        __syncthreads();
+
+        // Reduce warp histograms into digit_counts
+        if (tid < 256) {
+            uint32_t sum = 0U;
+            #pragma unroll
+            for (int w = 0; w < kTopKWarps; ++w) {
+                sum += temp_storage.warp_hists[w][tid];
+            }
+            digit_counts[tid] = sum;
         }
         __syncthreads();
 
@@ -725,102 +746,117 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
     kth_value_converted = desired;
     __syncthreads();
 
+    // --- Phase 2: Fused gather (gt + eq in single pass) ---
     for (int i = tid; i < kTopKMax; i += kTopKBlockThreads) {
-        candidate_scores[i] = -INFINITY;
-        candidate_ids[i] = -1;
+        candidate_idx[i] = -1;
     }
     if (tid == 0) {
         write_cursor = 0;
+        eq_cursor = 0;
     }
     __syncthreads();
 
+    // Single pass: collect > kth elements first, == kth elements second
     for (int base = 0; base < seq_len; base += kTopKBlockThreads) {
         const int idx = base + tid;
         int is_gt = 0;
-        float score = -INFINITY;
-        int token_id = -1;
-        if (idx < seq_len) {
-            score = row_scores[idx];
-            token_id = row_ids[idx];
-            const uint32_t v = topk_float_to_ordered(score);
-            is_gt = (v > kth_value_converted) ? 1 : 0;
-        }
-
-        int offset = 0;
-        int tile_count = 0;
-        BlockScan(temp_storage.scan).ExclusiveSum(is_gt, offset, tile_count);
-        __syncthreads();
-
-        if (is_gt) {
-            const int pos = write_cursor + offset;
-            if (pos < topk) {
-                candidate_scores[pos] = score;
-                candidate_ids[pos] = token_id;
-            }
-        }
-        __syncthreads();
-
-        if (tid == 0) {
-            write_cursor += tile_count;
-        }
-        __syncthreads();
-    }
-
-    for (int base = 0; base < seq_len && write_cursor < k; base += kTopKBlockThreads) {
-        const int idx = base + tid;
         int is_eq = 0;
-        float score = -INFINITY;
-        int token_id = -1;
         if (idx < seq_len) {
-            score = row_scores[idx];
-            token_id = row_ids[idx];
-            const uint32_t v = topk_float_to_ordered(score);
+            const uint32_t v = topk_float_to_ordered(row_scores[idx]);
+            is_gt = (v > kth_value_converted) ? 1 : 0;
             is_eq = (v == kth_value_converted) ? 1 : 0;
         }
 
-        int offset = 0;
-        int tile_count = 0;
-        BlockScan(temp_storage.scan).ExclusiveSum(is_eq, offset, tile_count);
+        // Scan for > kth
+        int gt_offset = 0;
+        int gt_count = 0;
+        BlockScan(temp_storage.scan).ExclusiveSum(is_gt, gt_offset, gt_count);
+        __syncthreads();
+
+        if (is_gt) {
+            const int pos = write_cursor + gt_offset;
+            if (pos < topk) {
+                candidate_idx[pos] = idx;
+            }
+        }
+
+        // Scan for == kth
+        int eq_offset = 0;
+        int eq_count = 0;
+        BlockScan(temp_storage.scan).ExclusiveSum(is_eq, eq_offset, eq_count);
         __syncthreads();
 
         if (is_eq) {
-            const int pos = write_cursor + offset;
+            const int pos = eq_cursor + eq_offset;
             if (pos < k) {
-                candidate_scores[pos] = score;
-                candidate_ids[pos] = token_id;
+                candidate_idx[kTopKMax - 1 - pos] = idx;
             }
         }
-        __syncthreads();
 
         if (tid == 0) {
-            int next_cursor = write_cursor + tile_count;
-            write_cursor = (next_cursor < k) ? next_cursor : k;
+            write_cursor += gt_count;
+            int next_eq = eq_cursor + eq_count;
+            eq_cursor = (next_eq < k) ? next_eq : k;
         }
         __syncthreads();
     }
 
+    // Move eq elements (stored at back) into position after gt elements
+    // eq_to_move <= k <= 2048 = kTopKMax, and kTopKBlockThreads = 1024
+    // so we need at most 2 rounds. Use register buffering to avoid src/dst overlap race.
+    {
+        const int gt_total = write_cursor;
+        const int eq_total = eq_cursor;
+        const int eq_needed = (k > gt_total) ? (k - gt_total) : 0;
+        const int eq_to_move = (eq_needed < eq_total) ? eq_needed : eq_total;
+
+        for (int base = 0; base < eq_to_move; base += kTopKBlockThreads) {
+            const int my_i = base + tid;
+            int my_eq_val = -1;
+            if (my_i < eq_to_move) {
+                my_eq_val = candidate_idx[kTopKMax - 1 - my_i];
+            }
+            __syncthreads();
+            if (my_i < eq_to_move) {
+                candidate_idx[gt_total + my_i] = my_eq_val;
+            }
+            __syncthreads();
+        }
+
+        // Clear the temp eq slots (only those outside the valid [0..k) range)
+        for (int i = tid; i < eq_total; i += kTopKBlockThreads) {
+            const int slot = kTopKMax - 1 - i;
+            if (slot >= k) {
+                candidate_idx[slot] = -1;
+            }
+        }
+    }
+    __syncthreads();
+
+    // --- Phase 3: Sort + direct-to-global writeback ---
+    // Load scores from original positions; look up token IDs
     float thread_keys[kTopKItemsPerThread];
     int thread_vals[kTopKItemsPerThread];
     #pragma unroll
     for (int i = 0; i < kTopKItemsPerThread; ++i) {
-        const int idx = tid * kTopKItemsPerThread + i;
-        thread_keys[i] = candidate_scores[idx];
-        thread_vals[i] = candidate_ids[idx];
+        const int slot = tid * kTopKItemsPerThread + i;
+        const int orig_idx = candidate_idx[slot];
+        if (orig_idx >= 0) {
+            thread_keys[i] = row_scores[orig_idx];
+            thread_vals[i] = row_ids[orig_idx];
+        } else {
+            thread_keys[i] = -INFINITY;
+            thread_vals[i] = -1;
+        }
     }
 
     BlockRadixSort(temp_storage.sort).SortDescending(thread_keys, thread_vals);
-    __syncthreads();
 
+    // Write directly to global memory — no shared round-trip
     #pragma unroll
     for (int i = 0; i < kTopKItemsPerThread; ++i) {
-        const int idx = tid * kTopKItemsPerThread + i;
-        candidate_scores[idx] = thread_keys[i];
-        candidate_ids[idx] = thread_vals[i];
-    }
-    __syncthreads();
-
-    for (int i = tid; i < topk; i += kTopKBlockThreads) {
-        row_topk[i] = (i < k) ? candidate_ids[i] : -1;
+        const int slot = tid * kTopKItemsPerThread + i;
+        row_topk[slot] = (slot < k) ? thread_vals[i] : -1;
     }
 }
 
