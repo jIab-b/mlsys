@@ -668,23 +668,21 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
     const int* row_ids = out_ids + static_cast<int64_t>(b) * out_stride;
     int* row_topk = out_topk_indices + static_cast<int64_t>(b) * topk;
 
-    // Shared memory layout — warp_hists (phase 1) is unioned with CUB sort (phase 3)
     __shared__ uint32_t digit_counts[256];
     __shared__ uint32_t desired;
     __shared__ uint32_t desired_mask;
     __shared__ uint32_t k_to_find;
     __shared__ uint32_t kth_value_converted;
 
-    __shared__ int candidate_idx[kTopKMax];  // stores original index into row_scores/row_ids
+    __shared__ int candidate_idx[kTopKMax];
     __shared__ int write_cursor;
-    __shared__ int eq_cursor;
 
     using BlockScan = cub::BlockScan<int, kTopKBlockThreads>;
     using BlockRadixSort = cub::BlockRadixSort<float, kTopKBlockThreads, kTopKItemsPerThread, int>;
     union TempStorage {
-        uint32_t warp_hists[kTopKWarps][256];  // phase 1: radix select
-        typename BlockScan::TempStorage scan;  // phase 2: gather scans
-        typename BlockRadixSort::TempStorage sort;  // phase 3: final sort
+        uint32_t warp_hists[kTopKWarps][256];
+        typename BlockScan::TempStorage scan;
+        typename BlockRadixSort::TempStorage sort;
     };
     __shared__ TempStorage temp_storage;
 
@@ -695,16 +693,13 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
     }
     __syncthreads();
 
-    // --- Phase 1: Radix select with warp-level histograms ---
     for (int bit = 24; bit >= 0; bit -= 8) {
-        // Zero warp-local histograms
         #pragma unroll
         for (int i = lane; i < 256; i += 32) {
             temp_storage.warp_hists[warp_id][i] = 0U;
         }
         __syncthreads();
 
-        // Each thread scatters into its warp's histogram (no cross-warp contention)
         for (int idx = tid; idx < seq_len; idx += kTopKBlockThreads) {
             const uint32_t v = topk_float_to_ordered(row_scores[idx]);
             if ((v & desired_mask) == desired) {
@@ -714,7 +709,6 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
         }
         __syncthreads();
 
-        // Reduce warp histograms into digit_counts
         if (tid < 256) {
             uint32_t sum = 0U;
             #pragma unroll
@@ -746,28 +740,22 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
     kth_value_converted = desired;
     __syncthreads();
 
-    // --- Phase 2: Fused gather (gt + eq in single pass) ---
     for (int i = tid; i < kTopKMax; i += kTopKBlockThreads) {
         candidate_idx[i] = -1;
     }
     if (tid == 0) {
         write_cursor = 0;
-        eq_cursor = 0;
     }
     __syncthreads();
 
-    // Single pass: collect > kth elements first, == kth elements second
     for (int base = 0; base < seq_len; base += kTopKBlockThreads) {
         const int idx = base + tid;
         int is_gt = 0;
-        int is_eq = 0;
         if (idx < seq_len) {
             const uint32_t v = topk_float_to_ordered(row_scores[idx]);
             is_gt = (v > kth_value_converted) ? 1 : 0;
-            is_eq = (v == kth_value_converted) ? 1 : 0;
         }
 
-        // Scan for > kth
         int gt_offset = 0;
         int gt_count = 0;
         BlockScan(temp_storage.scan).ExclusiveSum(is_gt, gt_offset, gt_count);
@@ -779,62 +767,43 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
                 candidate_idx[pos] = idx;
             }
         }
+        __syncthreads();
 
-        // Scan for == kth
+        if (tid == 0) {
+            write_cursor += gt_count;
+        }
+        __syncthreads();
+    }
+
+    for (int base = 0; base < seq_len && write_cursor < k; base += kTopKBlockThreads) {
+        const int idx = base + tid;
+        int is_eq = 0;
+        if (idx < seq_len) {
+            const uint32_t v = topk_float_to_ordered(row_scores[idx]);
+            is_eq = (v == kth_value_converted) ? 1 : 0;
+        }
+
         int eq_offset = 0;
         int eq_count = 0;
         BlockScan(temp_storage.scan).ExclusiveSum(is_eq, eq_offset, eq_count);
         __syncthreads();
 
         if (is_eq) {
-            const int pos = eq_cursor + eq_offset;
+            const int pos = write_cursor + eq_offset;
             if (pos < k) {
-                candidate_idx[kTopKMax - 1 - pos] = idx;
+                candidate_idx[pos] = idx;
             }
         }
+        __syncthreads();
 
         if (tid == 0) {
-            write_cursor += gt_count;
-            int next_eq = eq_cursor + eq_count;
-            eq_cursor = (next_eq < k) ? next_eq : k;
+            const int next = write_cursor + eq_count;
+            write_cursor = (next < k) ? next : k;
         }
         __syncthreads();
     }
-
-    // Move eq elements (stored at back) into position after gt elements
-    // eq_to_move <= k <= 2048 = kTopKMax, and kTopKBlockThreads = 1024
-    // so we need at most 2 rounds. Use register buffering to avoid src/dst overlap race.
-    {
-        const int gt_total = write_cursor;
-        const int eq_total = eq_cursor;
-        const int eq_needed = (k > gt_total) ? (k - gt_total) : 0;
-        const int eq_to_move = (eq_needed < eq_total) ? eq_needed : eq_total;
-
-        for (int base = 0; base < eq_to_move; base += kTopKBlockThreads) {
-            const int my_i = base + tid;
-            int my_eq_val = -1;
-            if (my_i < eq_to_move) {
-                my_eq_val = candidate_idx[kTopKMax - 1 - my_i];
-            }
-            __syncthreads();
-            if (my_i < eq_to_move) {
-                candidate_idx[gt_total + my_i] = my_eq_val;
-            }
-            __syncthreads();
-        }
-
-        // Clear the temp eq slots (only those outside the valid [0..k) range)
-        for (int i = tid; i < eq_total; i += kTopKBlockThreads) {
-            const int slot = kTopKMax - 1 - i;
-            if (slot >= k) {
-                candidate_idx[slot] = -1;
-            }
-        }
-    }
     __syncthreads();
 
-    // --- Phase 3: Sort + direct-to-global writeback ---
-    // Load scores from original positions; look up token IDs
     float thread_keys[kTopKItemsPerThread];
     int thread_vals[kTopKItemsPerThread];
     #pragma unroll
@@ -852,7 +821,6 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
 
     BlockRadixSort(temp_storage.sort).SortDescending(thread_keys, thread_vals);
 
-    // Write directly to global memory — no shared round-trip
     #pragma unroll
     for (int i = 0; i < kTopKItemsPerThread; ++i) {
         const int slot = tid * kTopKItemsPerThread + i;
@@ -862,123 +830,33 @@ __global__ __launch_bounds__(kTopKBlockThreads) void tiled_topk_kernel(
 
 static bool g_kernel_attrs_set = false;
 
-static CUtensorMap make_q_fp8_tmap(const int8_t* q_ptr, int batch_size) {
+static inline CUtensorMap make_tmap(
+    void* ptr,
+    uint32_t rank,
+    const uint64_t* global_dim,
+    const uint64_t* global_strides,
+    const uint32_t* box_dim,
+    const uint32_t* element_strides,
+    CUtensorMapSwizzle swizzle,
+    const char* err_msg
+) {
     CUtensorMap tmap{};
-    constexpr uint32_t rank = 3;
-    uint64_t globalDim[rank] = {
-        (uint64_t)kHeadDim,
-        (uint64_t)kNumHeads,
-        (uint64_t)batch_size,
-    };
-    uint64_t globalStrides[rank - 1] = {
-        (uint64_t)kHeadDim,
-        (uint64_t)(kNumHeads * kHeadDim),
-    };
-    uint32_t boxDim[rank] = {
-        (uint32_t)kHeadDim,
-        (uint32_t)kNumHeads,
-        1U,
-    };
-    uint32_t elementStrides[rank] = {1U, 1U, 1U};
     auto st = cuTensorMapEncodeTiled(
         &tmap,
         CU_TENSOR_MAP_DATA_TYPE_UINT8,
         rank,
-        (void*)q_ptr,
-        globalDim,
-        globalStrides,
-        boxDim,
-        elementStrides,
+        ptr,
+        global_dim,
+        global_strides,
+        box_dim,
+        element_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B,
+        swizzle,
         CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TORCH_CHECK(st == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for q");
+    TORCH_CHECK(st == CUDA_SUCCESS, err_msg);
     return tmap;
 }
-
-static CUtensorMap make_k_fp8_tmap(const int8_t* k_ptr, int num_pages) {
-    CUtensorMap tmap{};
-    constexpr uint32_t rank = 3;
-    uint64_t globalDim[rank] = {
-        (uint64_t)kPayloadBytesPerToken,
-        (uint64_t)kPageSize,
-        (uint64_t)num_pages,
-    };
-    uint64_t globalStrides[rank - 1] = {
-        (uint64_t)kPayloadBytesPerToken,
-        (uint64_t)kPageBytes,
-    };
-    uint32_t boxDim[rank] = {
-        (uint32_t)kPayloadBytesPerToken,
-        (uint32_t)kPageSize,
-        1U,
-    };
-    uint32_t elementStrides[rank] = {1U, 1U, 1U};
-    auto st = cuTensorMapEncodeTiled(
-        &tmap,
-        CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        rank,
-        (void*)k_ptr,
-        globalDim,
-        globalStrides,
-        boxDim,
-        elementStrides,
-        CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B,
-        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TORCH_CHECK(st == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for payload");
-    return tmap;
-}
-
-static CUtensorMap make_k_scale_tmap(const int8_t* k_ptr, int num_pages) {
-    CUtensorMap tmap{};
-    constexpr uint32_t srank = 2;
-    const uint8_t* scale_base = reinterpret_cast<const uint8_t*>(k_ptr) + kPackedFp8Bytes;
-    uint64_t sglobalDim[srank] = {
-        (uint64_t)(kPageSize * kScaleBytesPerToken),
-        (uint64_t)num_pages,
-    };
-    uint64_t sglobalStrides[srank - 1] = {
-        (uint64_t)kPageBytes,
-    };
-    uint32_t sboxDim[srank] = {
-        (uint32_t)(kPageSize * kScaleBytesPerToken),
-        1U,
-    };
-    uint32_t selementStrides[srank] = {1U, 1U};
-    auto st = cuTensorMapEncodeTiled(
-        &tmap,
-        CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        srank,
-        (void*)scale_base,
-        sglobalDim,
-        sglobalStrides,
-        sboxDim,
-        selementStrides,
-        CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_NONE,
-        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TORCH_CHECK(st == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for scales");
-    return tmap;
-}
-
-struct TopkLaunchConfig {
-    CUtensorMap q_fp8_tmap;
-    CUtensorMap k_fp8_tmap;
-    CUtensorMap k_scale_tmap;
-    int batch_size = 0;
-    int num_pages = 0;
-    int max_num_pages = 0;
-    int out_stride = 0;
-    int ctas_per_batch = 0;
-    int tiles_per_cta = 0;
-    int init_blocks = 0;
-    int total_scores = 0;
-    int total_topk = 0;
-};
 
 static inline void maybe_set_kernel_attrs() {
     if (!g_kernel_attrs_set) {
@@ -991,42 +869,9 @@ static inline void maybe_set_kernel_attrs() {
     }
 }
 
-static inline TopkLaunchConfig make_topk_launch_config(
+static inline void launch_topk_pipeline(
     torch::Tensor q_index_fp8,
     torch::Tensor k_index_cache_fp8,
-    torch::Tensor block_table,
-    torch::Tensor out_scores
-) {
-    TopkLaunchConfig cfg;
-    cfg.batch_size = static_cast<int>(q_index_fp8.size(0));
-    cfg.num_pages = static_cast<int>(k_index_cache_fp8.size(0));
-    cfg.max_num_pages = static_cast<int>(block_table.size(1));
-    cfg.out_stride = static_cast<int>(out_scores.size(1));
-
-    const int8_t* q_ptr = reinterpret_cast<const int8_t*>(q_index_fp8.data_ptr());
-    const int8_t* k_ptr = reinterpret_cast<const int8_t*>(k_index_cache_fp8.data_ptr());
-    cfg.q_fp8_tmap = make_q_fp8_tmap(q_ptr, cfg.batch_size);
-    cfg.k_fp8_tmap = make_k_fp8_tmap(k_ptr, cfg.num_pages);
-    cfg.k_scale_tmap = make_k_scale_tmap(k_ptr, cfg.num_pages);
-
-    if (cfg.max_num_pages * cfg.batch_size <= kNumSMs) {
-        cfg.ctas_per_batch = cfg.max_num_pages;
-    } else {
-        cfg.ctas_per_batch = kNumSMs / cfg.batch_size;
-        if (cfg.ctas_per_batch < 1) cfg.ctas_per_batch = 1;
-        if (cfg.ctas_per_batch > cfg.max_num_pages) cfg.ctas_per_batch = cfg.max_num_pages;
-    }
-    cfg.tiles_per_cta = (cfg.max_num_pages + cfg.ctas_per_batch - 1) / cfg.ctas_per_batch;
-
-    cfg.total_scores = cfg.batch_size * cfg.out_stride;
-    cfg.total_topk = cfg.batch_size * kTopKMax;
-    const int total = (cfg.total_scores > cfg.total_topk) ? cfg.total_scores : cfg.total_topk;
-    cfg.init_blocks = (total + 255) / 256;
-    return cfg;
-}
-
-static inline void launch_topk_pipeline_no_checks(
-    const TopkLaunchConfig& cfg,
     torch::Tensor weights,
     torch::Tensor seq_lens,
     torch::Tensor block_table,
@@ -1035,38 +880,117 @@ static inline void launch_topk_pipeline_no_checks(
     torch::Tensor out_topk_indices,
     cudaStream_t stream
 ) {
-    init_topk_buffers_kernel<<<cfg.init_blocks, 256, 0, stream>>>(
+    const int batch_size = static_cast<int>(q_index_fp8.size(0));
+    const int num_pages = static_cast<int>(k_index_cache_fp8.size(0));
+    const int max_num_pages = static_cast<int>(block_table.size(1));
+    const int out_stride = static_cast<int>(out_scores.size(1));
+
+    const int8_t* q_ptr = reinterpret_cast<const int8_t*>(q_index_fp8.data_ptr());
+    const int8_t* k_ptr = reinterpret_cast<const int8_t*>(k_index_cache_fp8.data_ptr());
+    constexpr uint32_t rank3 = 3;
+    constexpr uint32_t rank2 = 2;
+    uint32_t e3[rank3] = {1U, 1U, 1U};
+    uint32_t e2[rank2] = {1U, 1U};
+
+    uint64_t q_dim[rank3] = {
+        (uint64_t)kHeadDim,
+        (uint64_t)kNumHeads,
+        (uint64_t)batch_size,
+    };
+    uint64_t q_strides[rank3 - 1] = {
+        (uint64_t)kHeadDim,
+        (uint64_t)(kNumHeads * kHeadDim),
+    };
+    uint32_t q_box[rank3] = {
+        (uint32_t)kHeadDim,
+        (uint32_t)kNumHeads,
+        1U,
+    };
+    CUtensorMap q_fp8_tmap = make_tmap(
+        (void*)q_ptr, rank3, q_dim, q_strides, q_box, e3, CU_TENSOR_MAP_SWIZZLE_128B,
+        "cuTensorMapEncodeTiled failed for q");
+
+    uint64_t k_dim[rank3] = {
+        (uint64_t)kPayloadBytesPerToken,
+        (uint64_t)kPageSize,
+        (uint64_t)num_pages,
+    };
+    uint64_t k_strides[rank3 - 1] = {
+        (uint64_t)kPayloadBytesPerToken,
+        (uint64_t)kPageBytes,
+    };
+    uint32_t k_box[rank3] = {
+        (uint32_t)kPayloadBytesPerToken,
+        (uint32_t)kPageSize,
+        1U,
+    };
+    CUtensorMap k_fp8_tmap = make_tmap(
+        (void*)k_ptr, rank3, k_dim, k_strides, k_box, e3, CU_TENSOR_MAP_SWIZZLE_128B,
+        "cuTensorMapEncodeTiled failed for payload");
+
+    const uint8_t* scale_base = reinterpret_cast<const uint8_t*>(k_ptr) + kPackedFp8Bytes;
+    uint64_t s_dim[rank2] = {
+        (uint64_t)(kPageSize * kScaleBytesPerToken),
+        (uint64_t)num_pages,
+    };
+    uint64_t s_strides[rank2 - 1] = {
+        (uint64_t)kPageBytes,
+    };
+    uint32_t s_box[rank2] = {
+        (uint32_t)(kPageSize * kScaleBytesPerToken),
+        1U,
+    };
+    CUtensorMap k_scale_tmap = make_tmap(
+        (void*)scale_base, rank2, s_dim, s_strides, s_box, e2, CU_TENSOR_MAP_SWIZZLE_NONE,
+        "cuTensorMapEncodeTiled failed for scales");
+
+    int ctas_per_batch = 0;
+    if (max_num_pages * batch_size <= kNumSMs) {
+        ctas_per_batch = max_num_pages;
+    } else {
+        ctas_per_batch = kNumSMs / batch_size;
+        if (ctas_per_batch < 1) ctas_per_batch = 1;
+        if (ctas_per_batch > max_num_pages) ctas_per_batch = max_num_pages;
+    }
+    const int tiles_per_cta = (max_num_pages + ctas_per_batch - 1) / ctas_per_batch;
+
+    const int total_scores = batch_size * out_stride;
+    const int total_topk = batch_size * kTopKMax;
+    const int total = (total_scores > total_topk) ? total_scores : total_topk;
+    const int init_blocks = (total + 255) / 256;
+
+    init_topk_buffers_kernel<<<init_blocks, 256, 0, stream>>>(
         reinterpret_cast<float*>(out_scores.data_ptr()),
         reinterpret_cast<int*>(out_ids.data_ptr()),
         reinterpret_cast<int*>(out_topk_indices.data_ptr()),
-        cfg.total_scores,
-        cfg.total_topk
+        total_scores,
+        total_topk
     );
 
-    dim3 grid(cfg.ctas_per_batch, cfg.batch_size);
+    dim3 grid(ctas_per_batch, batch_size);
     dsa_topk_indexer_kernel<<<grid, kThreadsPerBlock, kDesiredDynamicSmemBytes, stream>>>(
-        cfg.q_fp8_tmap,
-        cfg.k_fp8_tmap,
-        cfg.k_scale_tmap,
+        q_fp8_tmap,
+        k_fp8_tmap,
+        k_scale_tmap,
         reinterpret_cast<const float*>(weights.data_ptr()),
         reinterpret_cast<const int*>(seq_lens.data_ptr()),
         reinterpret_cast<const int*>(block_table.data_ptr()),
         reinterpret_cast<float*>(out_scores.data_ptr()),
         reinterpret_cast<int*>(out_ids.data_ptr()),
-        cfg.batch_size,
-        cfg.num_pages,
-        cfg.max_num_pages,
-        cfg.out_stride,
-        cfg.tiles_per_cta
+        batch_size,
+        num_pages,
+        max_num_pages,
+        out_stride,
+        tiles_per_cta
     );
 
-    tiled_topk_kernel<<<cfg.batch_size, kTopKBlockThreads, 0, stream>>>(
+    tiled_topk_kernel<<<batch_size, kTopKBlockThreads, 0, stream>>>(
         reinterpret_cast<const float*>(out_scores.data_ptr()),
         reinterpret_cast<const int*>(out_ids.data_ptr()),
         reinterpret_cast<const int*>(seq_lens.data_ptr()),
         reinterpret_cast<int*>(out_topk_indices.data_ptr()),
-        cfg.batch_size,
-        cfg.out_stride
+        batch_size,
+        out_stride
     );
 }
 
@@ -1087,9 +1011,18 @@ void dsa_topk_indexer_topk_launch(
         return;
     }
     maybe_set_kernel_attrs();
-    TopkLaunchConfig cfg = make_topk_launch_config(q_index_fp8, k_index_cache_fp8, block_table, out_scores);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    launch_topk_pipeline_no_checks(cfg, weights, seq_lens, block_table, out_scores, out_ids, out_topk_indices, stream);
+    launch_topk_pipeline(
+        q_index_fp8,
+        k_index_cache_fp8,
+        weights,
+        seq_lens,
+        block_table,
+        out_scores,
+        out_ids,
+        out_topk_indices,
+        stream
+    );
     cudaError_t st = cudaGetLastError();
     TORCH_CHECK(st == cudaSuccess, "topk launch failed: ", cudaGetErrorString(st));
 }
@@ -1189,7 +1122,6 @@ void dsa_topk_indexer_topk_graph_launch(
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     if (!matches) {
         reset_topk_graph_state();
-        TopkLaunchConfig cfg = make_topk_launch_config(q_index_fp8, k_index_cache_fp8, block_table, out_scores);
 
         cudaError_t cap_st = cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
         if (cap_st != cudaSuccess) {
@@ -1208,7 +1140,17 @@ void dsa_topk_indexer_topk_graph_launch(
             return;
         }
 
-        launch_topk_pipeline_no_checks(cfg, weights, seq_lens, block_table, out_scores, out_ids, out_topk_indices, stream);
+        launch_topk_pipeline(
+            q_index_fp8,
+            k_index_cache_fp8,
+            weights,
+            seq_lens,
+            block_table,
+            out_scores,
+            out_ids,
+            out_topk_indices,
+            stream
+        );
 
         cudaError_t end_st = cudaStreamEndCapture(stream, &g_topk_graph_state.graph);
         if (end_st != cudaSuccess) {
@@ -1335,8 +1277,7 @@ def compile_kernel():
 _workspace = None
 
 
-def _need_workspace_rebuild(
-    ws,
+def _workspace_signature(
     q_index_fp8: torch.Tensor,
     k_index_cache_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -1344,23 +1285,19 @@ def _need_workspace_rebuild(
     block_table: torch.Tensor,
     max_seq: int,
 ):
-    if ws is None:
-        return True
     return (
-        ws["q"].shape != q_index_fp8.shape
-        or ws["k"].shape != k_index_cache_fp8.shape
-        or ws["w"].shape != weights.shape
-        or ws["seq"].shape != seq_lens.shape
-        or ws["block"].shape != block_table.shape
-        or ws["scores"].shape != (q_index_fp8.shape[0], max_seq)
-        or ws["ids"].shape != (q_index_fp8.shape[0], max_seq)
-        or ws["topk"].shape != (q_index_fp8.shape[0], TOPK)
-        or ws["q"].dtype != q_index_fp8.dtype
-        or ws["k"].dtype != k_index_cache_fp8.dtype
-        or ws["w"].dtype != weights.dtype
-        or ws["seq"].dtype != seq_lens.dtype
-        or ws["block"].dtype != block_table.dtype
-        or ws["q"].device != q_index_fp8.device
+        tuple(q_index_fp8.shape),
+        tuple(k_index_cache_fp8.shape),
+        tuple(weights.shape),
+        tuple(seq_lens.shape),
+        tuple(block_table.shape),
+        max_seq,
+        q_index_fp8.dtype,
+        k_index_cache_fp8.dtype,
+        weights.dtype,
+        seq_lens.dtype,
+        block_table.dtype,
+        q_index_fp8.device,
     )
 
 
@@ -1373,24 +1310,27 @@ def _get_workspace(
     max_seq: int,
 ):
     global _workspace
-    if _need_workspace_rebuild(
-        _workspace,
+    sig = _workspace_signature(
         q_index_fp8,
         k_index_cache_fp8,
         weights,
         seq_lens,
         block_table,
         max_seq,
-    ):
+    )
+    if _workspace is None or _workspace.get("sig") != sig:
+        batch = q_index_fp8.shape[0]
+        device = q_index_fp8.device
         _workspace = {
+            "sig": sig,
             "q": torch.empty_like(q_index_fp8),
             "k": torch.empty_like(k_index_cache_fp8),
             "w": torch.empty_like(weights),
             "seq": torch.empty_like(seq_lens),
             "block": torch.empty_like(block_table),
-            "scores": torch.empty((q_index_fp8.shape[0], max_seq), dtype=torch.float32, device=q_index_fp8.device),
-            "ids": torch.empty((q_index_fp8.shape[0], max_seq), dtype=torch.int32, device=q_index_fp8.device),
-            "topk": torch.empty((q_index_fp8.shape[0], TOPK), dtype=torch.int32, device=q_index_fp8.device),
+            "scores": torch.empty((batch, max_seq), dtype=torch.float32, device=device),
+            "ids": torch.empty((batch, max_seq), dtype=torch.int32, device=device),
+            "topk": torch.empty((batch, TOPK), dtype=torch.int32, device=device),
         }
     return _workspace
 
