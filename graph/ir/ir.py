@@ -88,39 +88,9 @@ class RawNode(Node):
         super().__init__(kind="Raw", args={"code": code}, meta=meta or {})
 
 
-@dataclass
-class LoadInlineNode(Node):
-    def __init__(
-        self,
-        name: str,
-        cuda_src_var: str = "CUDA_SRC",
-        cpp_sources: str = "",
-        extra_cuda_cflags: Optional[List[str]] = None,
-        extra_ldflags: Optional[List[str]] = None,
-        verbose: bool = False,
-        is_python_module: bool = False,
-        no_implicit_headers: bool = True,
-        sections: Optional[List[str]] = None,
-    ) -> None:
-        super().__init__(
-            kind="LoadInline",
-            args={
-                "name": name,
-                "cuda_src_var": cuda_src_var,
-                "cpp_sources": cpp_sources,
-                "extra_cuda_cflags": extra_cuda_cflags or [],
-                "extra_ldflags": extra_ldflags or [],
-                "verbose": verbose,
-                "is_python_module": is_python_module,
-                "no_implicit_headers": no_implicit_headers,
-                "sections": sections or [],
-            },
-        )
-
-
 class Graph:
     def __init__(self) -> None:
-        self.sections: Dict[str, List[Node]] = {"device": [], "host": [], "python": []}
+        self.nodes: List[Node] = []
         self.barriers: Dict[str, Barrier] = {}
         self.buffers: Dict[str, Tensor] = {}
         self.descriptors: Dict[str, Descriptor] = {}
@@ -167,19 +137,13 @@ class Graph:
     def set_default_tmem(self, name: str) -> None:
         self.default_tmem = name
 
-    def add_node(self, section: str, kind: str, **kwargs: Any) -> Node:
-        node = Node(kind=kind, args=kwargs)
-        self.sections[section].append(node)
+    def add_node(self, node: Node) -> Node:
+        self.nodes.append(node)
         return node
 
-    def add_raw(self, section: str, code: str, meta: Optional[Dict[str, str]] = None) -> Node:
+    def add_raw(self, code: str, meta: Optional[Dict[str, str]] = None) -> Node:
         node = RawNode(code=code, meta=meta or {})
-        self.sections[section].append(node)
-        return node
-
-    def add_load_inline(self, section: str, **kwargs: Any) -> Node:
-        node = LoadInlineNode(**kwargs)
-        self.sections[section].append(node)
+        self.nodes.append(node)
         return node
 
     def block(self, *nodes: Node) -> Node:

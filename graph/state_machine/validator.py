@@ -1,10 +1,24 @@
+"""Dynamic graph validator: state machine that walks the node tree.
+
+Tracks barrier lifecycle, buffer state, phase accounting, cluster ordering,
+tmem alloc/dealloc, pending ld/st, and enforces op contracts.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from ir import BarrierState, BufferState, Graph, MemSpace, Node, OpContract, SourceLoc
-from ptx_ops.utils.spec import (
+from graph.ir import (
+    BarrierState,
+    BufferState,
+    Graph,
+    MemSpace,
+    Node,
+    OpContract,
+    SourceLoc,
+)
+from graph.ptx_ops.contracts import CONTRACTS
+from graph.ptx_ops.spec import (
     BARRIER_SCOPES,
     CTA_MASK_BITS,
     GRAPH_SMEM_LIMIT_BYTES,
@@ -12,9 +26,7 @@ from ptx_ops.utils.spec import (
     ISSUE_SCOPES,
     OP_ARG_SPECS,
     TCGEN05_CP_SHAPE_TILE,
-    TCGEN05_LD_SHAPES,
     TCGEN05_MMA_SHAPES,
-    TCGEN05_NUM_VALUES,
     TCGEN05_SWIZZLE_ALIGN_BYTES,
     TCGEN05_SWIZZLE_VALID,
     TCGEN_DESC_SBO_LBO_LUT,
@@ -24,66 +36,7 @@ from ptx_ops.utils.spec import (
     TMA_SWIZZLE_SET,
     _canonical_op_name,
 )
-from ptx_ops.utils.validate import validate_ptx_op
-
-
-# Op contracts: dynamic pre/post conditions for barrier and buffer state.
-CONTRACTS: Dict[str, OpContract] = {
-    "tcgen05_alloc": OpContract(
-        name="tcgen05_alloc", issue_scope="one_warp",
-        buffer_pre={"tmem": BufferState.EMPTY}, buffer_post={"tmem": BufferState.FULL},
-    ),
-    "tcgen05_dealloc": OpContract(
-        name="tcgen05_dealloc", issue_scope="one_warp",
-        buffer_pre={"tmem": BufferState.FULL}, buffer_post={"tmem": BufferState.EMPTY},
-    ),
-    "tcgen05_cp": OpContract(name="tcgen05_cp", issue_scope="one_thread", buffer_pre={"tmem": BufferState.FULL}),
-    "tcgen05_mma": OpContract(name="tcgen05_mma", issue_scope="one_thread", buffer_pre={"tmem": BufferState.FULL}),
-    "tcgen05_ld": OpContract(name="tcgen05_ld", issue_scope="one_warp", buffer_pre={"tmem": BufferState.FULL}),
-    "tcgen05_st": OpContract(name="tcgen05_st", issue_scope="one_warp", buffer_pre={"tmem": BufferState.FULL}),
-    "tcgen05_commit": OpContract(name="tcgen05_commit", issue_scope="one_thread"),
-    "tcgen05_commit_mcast": OpContract(name="tcgen05_commit_mcast", issue_scope="one_thread"),
-    "tcgen05_wait": OpContract(name="tcgen05_wait", issue_scope="one_thread"),
-    "tcgen05_wait_ld": OpContract(name="tcgen05_wait_ld", issue_scope="one_thread"),
-    "tcgen05_wait_st": OpContract(name="tcgen05_wait_st", issue_scope="one_thread"),
-    "tcgen05_fence": OpContract(name="tcgen05_fence", issue_scope="one_thread"),
-    "tcgen05_fence_before_thread_sync": OpContract(name="tcgen05_fence_before_thread_sync", issue_scope="one_thread"),
-    "tcgen05_fence_after_thread_sync": OpContract(name="tcgen05_fence_after_thread_sync", issue_scope="one_thread"),
-    "mbarrier_init": OpContract(name="mbarrier_init", issue_scope="one_thread"),
-    "mbarrier_arrive_expect_tx": OpContract(name="mbarrier_arrive_expect_tx", issue_scope="one_thread"),
-    "mbarrier_arrive_expect_tx_cta": OpContract(name="mbarrier_arrive_expect_tx_cta", issue_scope="one_thread"),
-    "mbarrier_wait": OpContract(name="mbarrier_wait", issue_scope="all_warps"),
-    "mbarrier_wait_ticks": OpContract(name="mbarrier_wait_ticks", issue_scope="all_warps"),
-    "mbarrier_wait_relaxed": OpContract(name="mbarrier_wait_relaxed", issue_scope="all_warps"),
-    "mbarrier_fence_init_release": OpContract(name="mbarrier_fence_init_release", issue_scope="one_thread"),
-    "barrier_cluster_arrive": OpContract(name="barrier_cluster_arrive", issue_scope="all_warps"),
-    "barrier_cluster_wait": OpContract(name="barrier_cluster_wait", issue_scope="all_warps"),
-    "tma_gmem2smem": OpContract(name="tma_gmem2smem", issue_scope="one_thread"),
-    "tma_1d_gmem2smem": OpContract(name="tma_1d_gmem2smem", issue_scope="one_thread"),
-    "tma_2d_gmem2smem": OpContract(name="tma_2d_gmem2smem", issue_scope="one_thread"),
-    "tma_3d_gmem2smem": OpContract(name="tma_3d_gmem2smem", issue_scope="one_thread"),
-    "tma_1d_gmem2smem_mcast": OpContract(name="tma_1d_gmem2smem_mcast", issue_scope="one_thread"),
-    "tma_2d_gmem2smem_mcast": OpContract(name="tma_2d_gmem2smem_mcast", issue_scope="one_thread"),
-    "tma_3d_gmem2smem_mcast": OpContract(name="tma_3d_gmem2smem_mcast", issue_scope="one_thread"),
-    "tma_1d_smem2gmem": OpContract(name="tma_1d_smem2gmem", issue_scope="one_thread"),
-    "tma_2d_smem2gmem": OpContract(name="tma_2d_smem2gmem", issue_scope="one_thread"),
-    "tma_3d_smem2gmem": OpContract(name="tma_3d_smem2gmem", issue_scope="one_thread"),
-    "tma_store_out": OpContract(name="tma_store_out", issue_scope="one_thread"),
-    "tmap_create": OpContract(name="tmap_create", issue_scope="one_thread"),
-    "cp_async_bulk_prefetch": OpContract(name="cp_async_bulk_prefetch", issue_scope="one_thread"),
-    "cp_async_bulk_prefetch_1d": OpContract(name="cp_async_bulk_prefetch_1d", issue_scope="one_thread"),
-    "cp_async_bulk_prefetch_2d": OpContract(name="cp_async_bulk_prefetch_2d", issue_scope="one_thread"),
-    "cp_async_bulk_prefetch_3d": OpContract(name="cp_async_bulk_prefetch_3d", issue_scope="one_thread"),
-    "ptx_laneid": OpContract(name="ptx_laneid", issue_scope="one_thread"),
-    "ptx_activemask": OpContract(name="ptx_activemask", issue_scope="one_thread"),
-    "ptx_elect_one_sync": OpContract(name="ptx_elect_one_sync", issue_scope="one_thread"),
-    "ptx_elect_sync": OpContract(name="ptx_elect_sync", issue_scope="one_thread"),
-    "ptx_bar_sync": OpContract(name="ptx_bar_sync", issue_scope="all_warps"),
-    "cute_tmap": OpContract(name="cute_tmap", issue_scope="host"),
-    "cta_group_set": OpContract(name="cta_group_set", issue_scope="one_thread"),
-    "persistent_loop_begin": OpContract(name="persistent_loop_begin", issue_scope="all_warps"),
-    "persistent_loop_end": OpContract(name="persistent_loop_end", issue_scope="all_warps"),
-}
+from graph.ptx_ops.static import validate_ptx_op
 
 
 def _resolve_contract(kind: str) -> Optional[OpContract]:
@@ -192,7 +145,7 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
             raise ValueError(f"{op_name}: unknown buffer '{buf_name}'")
         resolved_bufs[key] = buf_name
 
-    # barrier presence checks (annotation-driven)
+    # barrier presence checks
     if "bar" in op_args:
         bar = op_args["bar"]
         if bar not in g.barriers:
@@ -371,7 +324,7 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
         for key, value in meta.items():
             if not key.startswith(prefix):
                 continue
-            suffix = key[len(prefix) :]
+            suffix = key[len(prefix):]
             if suffix.isdigit():
                 out[int(suffix)] = value
         return out
@@ -518,44 +471,17 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
                 if pair not in allowed:
                     raise ValueError(f"{op_name}: descriptor '{desc_b}' sbo/lbo {pair} not in LUT {sorted(allowed)}")
 
-    if canonical == "tma_gmem2smem":
-        size = op_args.get("size")
-        if isinstance(size, int) and size % 16 != 0:
-            raise ValueError(f"{op_name}: size {size} must be multiple of 16")
-        for key in ("dst_align", "src_align"):
-            align = op_args.get(key)
-            if isinstance(align, int) and align < 16:
-                raise ValueError(f"{op_name}: {key} {align} must be >= 16")
-    if canonical.startswith("tma_"):
-        size = op_args.get("size")
-        if isinstance(size, int) and size % 16 != 0:
-            raise ValueError(f"{op_name}: size {size} must be multiple of 16")
-
-    if canonical in {
-        "tma_1d_gmem2smem",
-        "tma_2d_gmem2smem",
-        "tma_3d_gmem2smem",
-        "tma_1d_gmem2smem_mcast",
-        "tma_2d_gmem2smem_mcast",
-        "tma_3d_gmem2smem_mcast",
-    }:
+    if canonical in ("tma_load", "tma_load_mcast"):
         tmap = op_args.get("tmap")
         if tmap not in g.tmaps:
             raise ValueError(f"{op_name}: unknown tmap '{tmap}'")
         _validate_tmap_meta(g.tmaps[tmap])
-        rank_required = {
-            "tma_1d_gmem2smem": 1,
-            "tma_2d_gmem2smem": 2,
-            "tma_3d_gmem2smem": 3,
-            "tma_1d_gmem2smem_mcast": 1,
-            "tma_2d_gmem2smem_mcast": 2,
-            "tma_3d_gmem2smem_mcast": 3,
-        }[canonical]
-        rank = g.tmaps[tmap].get("rank")
-        if isinstance(rank, int) and rank != rank_required:
-            raise ValueError(f"{op_name}: tmap '{tmap}' rank {rank} != {rank_required}")
+        rank_arg = op_args.get("rank")
+        tmap_rank = g.tmaps[tmap].get("rank")
+        if isinstance(rank_arg, int) and isinstance(tmap_rank, int) and rank_arg != tmap_rank:
+            raise ValueError(f"{op_name}: rank {rank_arg} != tmap '{tmap}' rank {tmap_rank}")
 
-        if canonical.endswith("_mcast"):
+        if canonical == "tma_load_mcast":
             cta_mask = op_args.get("cta_mask")
             if isinstance(cta_mask, int):
                 if cta_mask <= 0:
@@ -567,62 +493,19 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
                     if cta_mask & ~max_mask:
                         raise ValueError(f"{op_name}: cta_mask {cta_mask} outside cluster_ctas={state.cluster_ctas}")
 
-    if canonical in {"tma_1d_smem2gmem", "tma_2d_smem2gmem", "tma_3d_smem2gmem", "tma_store_out"}:
+    if canonical == "tma_store":
         tmap = op_args.get("tmap")
         if tmap not in g.tmaps:
             raise ValueError(f"{op_name}: unknown tmap '{tmap}'")
         _validate_tmap_meta(g.tmaps[tmap])
-        rank = g.tmaps[tmap].get("rank")
-        rank_required = {
-            "tma_1d_smem2gmem": 1,
-            "tma_2d_smem2gmem": 2,
-            "tma_3d_smem2gmem": 3,
-        }.get(canonical)
-        if rank_required is not None and isinstance(rank, int) and rank != rank_required:
-            raise ValueError(f"{op_name}: tmap '{tmap}' rank {rank} != {rank_required}")
-        if canonical == "tma_store_out":
-            req = op_args.get("rank")
-            if isinstance(req, int) and isinstance(rank, int) and req != rank:
-                raise ValueError(f"{op_name}: rank {req} != tmap rank {rank}")
-
-    if canonical == "mbarrier_init":
-        count = op_args.get("count")
-        if isinstance(count, int) and count <= 0:
-            raise ValueError(f"{op_name}: count must be > 0")
-    if canonical in ("mbarrier_wait", "mbarrier_wait_relaxed", "mbarrier_wait_ticks"):
-        phase = op_args.get("phase")
-        if isinstance(phase, int) and phase not in (0, 1):
-            raise ValueError(f"{op_name}: phase {phase} must be 0 or 1")
-    if canonical in ("mbarrier_arrive_expect_tx", "mbarrier_arrive_expect_tx_cta"):
-        size = op_args.get("size")
-        if isinstance(size, int) and size % 16 != 0:
-            raise ValueError(f"{op_name}: size {size} must be multiple of 16")
+        rank_arg = op_args.get("rank")
+        tmap_rank = g.tmaps[tmap].get("rank")
+        if isinstance(rank_arg, int) and isinstance(tmap_rank, int) and rank_arg != tmap_rank:
+            raise ValueError(f"{op_name}: rank {rank_arg} != tmap '{tmap}' rank {tmap_rank}")
 
     if canonical == "tcgen05_ld":
-        shape = op_args.get("shape")
-        num = op_args.get("num")
-        if isinstance(shape, str) and shape not in TCGEN05_LD_SHAPES:
-            raise ValueError(f"{op_name}: shape {shape} not in {sorted(TCGEN05_LD_SHAPES)}")
-        if isinstance(num, int) and num not in TCGEN05_NUM_VALUES:
-            raise ValueError(f"{op_name}: num {num} not in {sorted(TCGEN05_NUM_VALUES)}")
-        if "warp_id" not in op_args or "lane_id" not in op_args:
-            raise ValueError(f"{op_name}: requires warp_id and lane_id metadata for tcgen05.ld")
-        lane_val = op_args.get("lane_id")
-        if isinstance(lane_val, str) and lane_val.lower() in {"elect", "leader"}:
-            raise ValueError(f"{op_name}: lane_id=elect/leader invalid for tcgen05.ld")
         state.pending_ld = True
     if canonical == "tcgen05_st":
-        shape = op_args.get("shape")
-        num = op_args.get("num")
-        if isinstance(shape, str) and shape not in TCGEN05_LD_SHAPES:
-            raise ValueError(f"{op_name}: shape {shape} not in {sorted(TCGEN05_LD_SHAPES)}")
-        if isinstance(num, int) and num not in TCGEN05_NUM_VALUES:
-            raise ValueError(f"{op_name}: num {num} not in {sorted(TCGEN05_NUM_VALUES)}")
-        if "warp_id" not in op_args or "lane_id" not in op_args:
-            raise ValueError(f"{op_name}: requires warp_id and lane_id metadata for tcgen05.st")
-        lane_val = op_args.get("lane_id")
-        if isinstance(lane_val, str) and lane_val.lower() in {"elect", "leader"}:
-            raise ValueError(f"{op_name}: lane_id=elect/leader invalid for tcgen05.st")
         state.pending_st = True
     if canonical == "tcgen05_wait_ld":
         if state.pending_ld is False:
@@ -702,15 +585,7 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
             if isinstance(size, int) and isinstance(completed, int) and completed > size:
                 raise ValueError(f"{op_name}: barrier '{bar}' completed {completed} > expected {size}")
 
-    if canonical in (
-        "tma_gmem2smem",
-        "tma_1d_gmem2smem",
-        "tma_2d_gmem2smem",
-        "tma_3d_gmem2smem",
-        "tma_1d_gmem2smem_mcast",
-        "tma_2d_gmem2smem_mcast",
-        "tma_3d_gmem2smem_mcast",
-    ):
+    if canonical in ("tma_load", "tma_load_mcast"):
         bar = op_args.get("bar")
         if bar in state.bar_completed_bytes:
             size = op_args.get("size")
@@ -751,6 +626,10 @@ def _validate_op(op: Node, g: Graph, state: ValidationState) -> None:
         buf = resolved_bufs[key]
         state.buf_state[buf] = new_state
 
+
+# ---------------------------------------------------------------------------
+# State cloning / merging (for If/Else branches)
+# ---------------------------------------------------------------------------
 
 def _clone_state(state: ValidationState) -> ValidationState:
     return ValidationState(
@@ -803,6 +682,10 @@ def _merge_states(a: ValidationState, b: ValidationState) -> ValidationState:
     )
 
 
+# ---------------------------------------------------------------------------
+# Tree walker
+# ---------------------------------------------------------------------------
+
 def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None:
     for node in nodes:
         if node.kind == "KernelStart":
@@ -843,7 +726,6 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
                 )
             continue
         if node.kind == "KernelEnd":
-            # ensure tmem is deallocated before leaving kernel
             for buf, st in state.buf_state.items():
                 if st is not None and st != BufferState.EMPTY:
                     raise ValueError(f"Kernel end: buffer {buf} not deallocated ({st})")
@@ -888,8 +770,7 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
             state.last_alloc_cols = merged.last_alloc_cols
             continue
 
-        if node.kind in ("Raw", "LoadInline", "Launch"):
-            # Raw nodes are opaque; validation happens only on annotated ops.
+        if node.kind in ("Raw", "Launch"):
             continue
         if node.kind == "Op":
             _validate_op(node, g, state)
@@ -909,6 +790,10 @@ def _validate_nodes(nodes: List[Node], g: Graph, state: ValidationState) -> None
 
         _validate_op(node, g, state)
 
+
+# ---------------------------------------------------------------------------
+# Helper: collect tmaps from host-side ops
+# ---------------------------------------------------------------------------
 
 def _collect_tmaps(nodes: List[Node], g: Graph) -> None:
     for node in nodes:
@@ -973,14 +858,17 @@ def _iter_op_nodes(nodes: Iterable[Node]) -> Iterable[Node]:
 
 
 def _validate_graph_ptx_spec(g: Graph) -> None:
-    for section in ("device", "host"):
-        for node in _iter_op_nodes(g.sections.get(section, [])):
-            if node.kind != "Op":
-                continue
-            op_name = str(node.args.get("op", ""))
-            op_args = dict(node.args.get("op_args", {}))
-            validate_ptx_op(op_name, op_args)
+    for node in _iter_op_nodes(g.nodes):
+        if node.kind != "Op":
+            continue
+        op_name = str(node.args.get("op", ""))
+        op_args = dict(node.args.get("op_args", {}))
+        validate_ptx_op(op_name, op_args)
 
+
+# ---------------------------------------------------------------------------
+# Protocol-level validation (second pass)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class _KernelProtocolState:
@@ -998,36 +886,10 @@ def _proto_add_optional(cur: Optional[int], delta: Optional[int]) -> Optional[in
     return cur + delta
 
 
-def _normalize_exec_scope(v: object) -> str:
-    if v is None:
-        return ""
-    return str(v).strip().lower()
-
-
-def _normalize_issuer(v: object) -> str:
-    if v is None:
-        return ""
-    return str(v).strip().lower()
-
-
-def _validate_exec_contract(op_name: str, op_args: Dict[str, object]) -> None:
-    exec_scope = _normalize_exec_scope(op_args.get("exec_scope"))
-    issuer = _normalize_issuer(op_args.get("issuer"))
-    if exec_scope not in {"thread", "warp", "warpgroup", "cta"}:
-        raise ValueError(
-            f"{op_name}: missing/invalid exec_scope "
-            "(expected one of thread|warp|warpgroup|cta)"
-        )
-    if issuer not in {"all", "single", "mask"}:
-        raise ValueError(f"{op_name}: missing/invalid issuer (expected all|single|mask)")
-    if issuer == "single" and "lane_pred" not in op_args:
-        raise ValueError(f"{op_name}: issuer=single requires lane_pred metadata")
-
-
 def _validate_graph_protocol(g: Graph, *, strict: bool = False) -> None:
     state = _KernelProtocolState()
 
-    for node in _iter_op_nodes(g.sections.get("device", [])):
+    for node in _iter_op_nodes(g.nodes):
         if node.kind == "KernelStart":
             state = _KernelProtocolState(active=True, name=str(node.args.get("name", "")))
             continue
@@ -1062,17 +924,6 @@ def _validate_graph_protocol(g: Graph, *, strict: bool = False) -> None:
         op_args = dict(node.args.get("op_args", {}))
         canonical = _canonical_op_name(op_name)
 
-        if strict and (
-            canonical.startswith("tcgen05_")
-            or canonical.startswith("tma_")
-            or canonical.startswith("mbarrier_")
-            or canonical.startswith("barrier_cluster_")
-            or canonical == "ptx_bar_sync"
-            or canonical == "tmap_create"
-            or canonical == "tma_store_out"
-        ):
-            _validate_exec_contract(op_name, op_args)
-
         if canonical == "cta_group_set":
             if op_args.get("value") == 2:
                 state.saw_group2_marker = True
@@ -1090,7 +941,7 @@ def _validate_graph_protocol(g: Graph, *, strict: bool = False) -> None:
             if bar not in state.bar_completed:
                 state.bar_completed[bar] = 0
 
-        if canonical.startswith("tma_") and canonical.endswith("gmem2smem"):
+        if canonical in ("tma_load", "tma_load_mcast"):
             bar = str(op_args.get("bar", ""))
             size = op_args.get("size")
             size_int = int(size) if isinstance(size, int) else None
@@ -1109,14 +960,19 @@ def _validate_graph_protocol(g: Graph, *, strict: bool = False) -> None:
             state.bar_expected[bar] = 0
             state.bar_completed[bar] = 0
 
-        if canonical in {"tma_store_out", "tma_1d_smem2gmem", "tma_2d_smem2gmem", "tma_3d_smem2gmem"}:
+        if canonical == "tma_store":
             tmap_name = op_args.get("tmap")
             if tmap_name is not None and tmap_name not in g.tmaps:
                 raise ValueError(f"{op_name}: unknown output tmap '{tmap_name}'")
 
 
+# ---------------------------------------------------------------------------
+# Top-level entry point
+# ---------------------------------------------------------------------------
+
 def validate_graph(g: Graph) -> None:
-    _collect_tmaps(g.sections.get("host", []), g)
+    """Run all validation passes on a Graph."""
+    _collect_tmaps(g.nodes, g)
     _validate_graph_ptx_spec(g)
     smem_bytes = _estimate_smem_bytes(g)
     if smem_bytes is not None and smem_bytes > GRAPH_SMEM_LIMIT_BYTES:
@@ -1133,5 +989,5 @@ def validate_graph(g: Graph) -> None:
         cluster_sync_done=False,
         cluster_ctas=None,
     )
-    _validate_nodes(g.sections.get("device", []), g, state)
+    _validate_nodes(g.nodes, g, state)
     _validate_graph_protocol(g, strict=bool(g.meta.get("strict_protocol", False)))

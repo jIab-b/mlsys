@@ -82,6 +82,35 @@ def ref_kernel(data):
     return _run_reference(*data)
 
 
+def _tensor_mismatch_stats(got: torch.Tensor, ref: torch.Tensor, name: str, rtol: float, atol: float):
+    got_f = got.float()
+    ref_f = ref.float()
+    diff = torch.abs(got_f - ref_f)
+    tol = atol + rtol * torch.abs(ref_f)
+    tol_mismatch = diff > tol
+    nan_mismatch = torch.logical_xor(torch.isnan(got_f), torch.isnan(ref_f))
+    posinf_mismatch = torch.logical_xor(torch.isposinf(got_f), torch.isposinf(ref_f))
+    neginf_mismatch = torch.logical_xor(torch.isneginf(got_f), torch.isneginf(ref_f))
+    mismatch = torch.logical_or(
+        torch.logical_or(tol_mismatch, nan_mismatch),
+        torch.logical_or(posinf_mismatch, neginf_mismatch),
+    )
+    num = int(mismatch.count_nonzero().item())
+    total = int(got.numel())
+    if num == 0:
+        return f"{name}: 0/{total} mismatches"
+
+    first = torch.nonzero(mismatch)[0]
+    idx = tuple(int(x) for x in first.tolist())
+    got_v = float(got_f[idx].item())
+    ref_v = float(ref_f[idx].item())
+    abs_diff = abs(got_v - ref_v)
+    return (
+        f"{name}: {num}/{total} mismatches; "
+        f"first_idx={idx}; got={got_v:.7g}; ref={ref_v:.7g}; abs_diff={abs_diff:.7g}"
+    )
+
+
 def check_implementation(data, output):
     exp_out, exp_lse = ref_kernel(data)
     got_out, got_lse = output
@@ -89,8 +118,12 @@ def check_implementation(data, output):
     if got_out.shape != exp_out.shape or got_lse.shape != exp_lse.shape:
         return False, f"shape mismatch: got={tuple(got_out.shape)},{tuple(got_lse.shape)} ref={tuple(exp_out.shape)},{tuple(exp_lse.shape)}"
 
-    ok_out = torch.allclose(got_out.float(), exp_out.float(), rtol=1e-3, atol=1e-3)
-    ok_lse = torch.allclose(got_lse.float(), exp_lse.float(), rtol=1e-3, atol=1e-3)
+    rtol = 1e-3
+    atol = 1e-3
+    ok_out = torch.allclose(got_out.float(), exp_out.float(), rtol=rtol, atol=atol)
+    ok_lse = torch.allclose(got_lse.float(), exp_lse.float(), rtol=rtol, atol=atol)
+    out_msg = _tensor_mismatch_stats(got_out, exp_out, "out", rtol, atol)
+    lse_msg = _tensor_mismatch_stats(got_lse, exp_lse, "lse", rtol, atol)
     if ok_out and ok_lse:
-        return True, ""
-    return False, "mismatch found! custom implementation doesn't match reference"
+        return True, f"match: {out_msg}; {lse_msg}"
+    return False, f"mismatch found! custom implementation doesn't match reference: {out_msg}; {lse_msg}"

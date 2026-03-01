@@ -185,7 +185,7 @@ def vol_shell():
 
 
 
-@app.function(image=image, volumes={str(VOLUME_MOUNT_PATH): volume}, gpu=_gpu_type(), timeout=600)
+@app.function(image=image, volumes={str(VOLUME_MOUNT_PATH): volume}, gpu=_gpu_type(), timeout=120)
 def run_eval(submission_code: str, tests_content: str, mode: str = "test", workspace_name: str = "sparse_attention") -> dict:
     """Run eval remotely with given submission and tests."""
     import sys

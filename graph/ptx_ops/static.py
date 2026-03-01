@@ -1,12 +1,19 @@
-"""Static per-op validation. No graph walking, no state tracking."""
+"""Static per-op validation. No graph walking, no state tracking.
+
+Takes raw op name + args dict, checks against PTX ISA constraints.
+"""
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from ptx_ops.utils.spec import (
+from graph.ptx_ops.spec import (
+    GRAPH_TMEM_MAX_COLS,
+    OP_ARG_SPECS,
     PTX_TCGEN05_CP_SHAPE_TILE,
     PTX_TCGEN05_MMA_SHAPES,
     PTX_TCGEN05_NO_TRANSPOSE_KINDS,
+    TCGEN05_LD_SHAPES,
+    TCGEN05_NUM_VALUES,
     TMA_INTERLEAVE_SET,
     TMA_SWIZZLE_SET,
     _canonical_op_name,
@@ -29,12 +36,31 @@ def _validate_cta_group(op_name: str, op_args: Dict[str, Any]) -> None:
         raise ValueError(f"{op_name}: cta_group must be 1 or 2, got {cta_group}")
 
 
+def validate_args(op_name: str, args: Dict[str, Any], loc_str: str = "") -> None:
+    """Check required args are present per OP_ARG_SPECS."""
+    spec = OP_ARG_SPECS.get(op_name)
+    if not spec:
+        return
+    required = spec.get("required", set())
+    missing = [k for k in required if k not in args]
+    if missing:
+        raise ValueError(f"{loc_str}{op_name}: missing args {missing}")
+
+
 def validate_ptx_op(op_name: str, op_args: Dict[str, Any]) -> None:
     """Validate a single op's arguments against PTX ISA constraints."""
     canonical = _canonical_op_name(op_name)
 
     if canonical.startswith("tcgen05_"):
         _validate_cta_group(op_name, op_args)
+
+    if canonical == "tcgen05_alloc":
+        cols = op_args.get("cols")
+        if isinstance(cols, int):
+            if cols < 32 or cols > GRAPH_TMEM_MAX_COLS:
+                raise ValueError(f"{op_name}: cols {cols} out of range [32, {GRAPH_TMEM_MAX_COLS}]")
+            if cols & (cols - 1) != 0:
+                raise ValueError(f"{op_name}: cols {cols} must be power of 2")
 
     if canonical == "tcgen05_cp":
         shape = op_args.get("shape")
@@ -69,7 +95,20 @@ def validate_ptx_op(op_name: str, op_args: Dict[str, Any]) -> None:
             if idesc < 0 or idesc > 0xFFFFFFFF:
                 raise ValueError(f"{op_name}: idesc must fit in 32-bit unsigned range")
 
-    if canonical.startswith("tma_"):
+    if canonical in ("tcgen05_ld", "tcgen05_st"):
+        shape = op_args.get("shape")
+        num = op_args.get("num")
+        if isinstance(shape, str) and shape not in TCGEN05_LD_SHAPES:
+            raise ValueError(f"{op_name}: shape {shape} not in {sorted(TCGEN05_LD_SHAPES)}")
+        if isinstance(num, int) and num not in TCGEN05_NUM_VALUES:
+            raise ValueError(f"{op_name}: num {num} not in {sorted(TCGEN05_NUM_VALUES)}")
+        if "warp_id" not in op_args or "lane_id" not in op_args:
+            raise ValueError(f"{op_name}: warp_id and lane_id metadata are required")
+        lane_val = op_args.get("lane_id")
+        if isinstance(lane_val, str) and lane_val.lower() in {"elect", "leader"}:
+            raise ValueError(f"{op_name}: lane_id=elect/leader invalid for {canonical}")
+
+    if canonical in ("tma_load", "tma_load_mcast", "tma_store"):
         _validate_cta_group(op_name, op_args)
         tmap_swizzle = op_args.get("tmap_swizzle") or op_args.get("swizzle")
         tmap_interleave = op_args.get("tmap_interleave") or op_args.get("interleave")
@@ -80,12 +119,26 @@ def validate_ptx_op(op_name: str, op_args: Dict[str, Any]) -> None:
         tmap_dtype = op_args.get("tmap_dtype") or op_args.get("dtype")
         if tmap_dtype is not None and not isinstance(tmap_dtype, str):
             raise ValueError(f"{op_name}: tmap dtype must be string when provided")
+        size = op_args.get("size")
+        if isinstance(size, int) and size % 16 != 0:
+            raise ValueError(f"{op_name}: size {size} must be multiple of 16")
 
     if canonical in ("mbarrier_wait", "mbarrier_wait_relaxed", "mbarrier_wait_ticks"):
         phase = op_args.get("phase")
         if isinstance(phase, int) and phase not in (0, 1):
             raise ValueError(f"{op_name}: mbarrier phase must be 0 or 1, got {phase}")
 
-    if canonical in ("tcgen05_ld", "tcgen05_st"):
-        if "warp_id" not in op_args or "lane_id" not in op_args:
-            raise ValueError(f"{op_name}: warp_id and lane_id metadata are required")
+    if canonical == "mbarrier_init":
+        count = op_args.get("count")
+        if isinstance(count, int) and count <= 0:
+            raise ValueError(f"{op_name}: count must be > 0")
+
+    if canonical in ("mbarrier_arrive_expect_tx", "mbarrier_arrive_expect_tx_cta"):
+        size = op_args.get("size")
+        if isinstance(size, int) and size % 16 != 0:
+            raise ValueError(f"{op_name}: size {size} must be multiple of 16")
+
+    if canonical == "cta_group_set":
+        value = op_args.get("value")
+        if not isinstance(value, int) or value not in (1, 2):
+            raise ValueError(f"{op_name}: cta_group_set value must be 1 or 2")
