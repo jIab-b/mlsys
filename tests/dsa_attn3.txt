@@ -1,4 +1,5 @@
 "**Modal ❌ failure**
+> ❌ Benchmarking failed
 
 Running on:
 * GPU: `NVIDIA B200`
@@ -10,60 +11,27 @@ Running on:
 * Hostname: `modal`
 
 
+## Benchmarks:
+```
+batch: 1; num_pages: 32; seq_len: 2048; seed: 100
+ ⏱ 189.4 ± 2.36 µs
+ ⚡ 183.3 µs 🐌 421.5 µs
+ mismatch found! custom implementation doesn't match reference: out: 8161/8192 mismatches; first_idx=(0, 0, 0); got=1.460333e+34; ref=0.121582; abs_diff=1.460333e+34; lse: 16/16 mismatches; first_idx=(0, 0); got=11.3277; ref=13.02796; abs_diff=1.700266
+ ❌ mismatch found! custom implementation doesn't match reference: out: 8161/8192 mismatches; first_idx=(0, 0, 0); got=1.460333e+34; ref=0.121582; abs_diff=1.460333e+34; lse: 16/16 mismatches; first_idx=(0, 0); got=11.3277; ref=13.02796; abs_diff=1.700266
+
+batch: 8; num_pages: 64; seq_len: 4096; seed: 101
+ ⏱ 135.9 ± 1.05 µs
+ ⚡ 122.9 µs 🐌 226.3 µs
+ mismatch found! custom implementation doesn't match reference: out: 65495/65536 mismatches; first_idx=(0, 0, 0); got=1.132812; ref=-0.05371094; abs_diff=1.186523; lse: 128/128 mismatches; first_idx=(0, 0); got=1.965926e+37; ref=13.21335; abs_diff=1.965926e+37
+ ❌ mismatch found! custom implementation doesn't match reference: out: 65495/65536 mismatches; first_idx=(0, 0, 0); got=1.132812; ref=-0.05371094; abs_diff=1.186523; lse: 128/128 mismatches; first_idx=(0, 0); got=1.965926e+37; ref=13.21335; abs_diff=1.965926e+37
+
+batch: 16; num_pages: 128; seq_len: 8192; seed: 102
+ ⏱ 140.4 ± 0.39 µs
+ ⚡ 131.1 µs 🐌 155.6 µs
+ mismatch found! custom implementation doesn't match reference: out: 130860/131072 mismatches; first_idx=(0, 0, 0); got=1.928545e-39; ref=0.04443359; abs_diff=0.04443359; lse: 256/256 mismatches; first_idx=(0, 0); got=4.1282e+36; ref=13.25865; abs_diff=4.1282e+36
+ ❌ mismatch found! custom implementation doesn't match reference: out: 130860/131072 mismatches; first_idx=(0, 0, 0); got=1.928545e-39; ref=0.04443359; abs_diff=0.04443359; lse: 256/256 mismatches; first_idx=(0, 0); got=4.1282e+36; ref=13.25865; abs_diff=4.1282e+36
+```
+
 ## Program stdout:
 ```
---- stderr ---
-multiprocessing.pool.RemoteTraceback: 
-"""
-Traceback (most recent call last):
-  File "/opt/conda/lib/python3.11/multiprocessing/pool.py", line 125, in worker
-    result = (True, func(*args, **kwds))
-                    ^^^^^^^^^^^^^^^^^^^
-  File "/__modal/volumes/vo-fpJzsF5Vh3fXKFeKjqGFTf/common/eval_base.py", line 430, in _make_benchmark_runner
-    return runner.run_single_benchmark(test, recheck, max_repeats, max_time_ns)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/__modal/volumes/vo-fpJzsF5Vh3fXKFeKjqGFTf/common/eval_base.py", line 285, in run_single_benchmark
-    good, message = check_implementation(check_copy, output)
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/__modal/volumes/vo-fpJzsF5Vh3fXKFeKjqGFTf/test_kernels/dsa_attn_2048/reference.py", line 115, in check_implementation
-    exp_out, exp_lse = ref_kernel(data)
-                       ^^^^^^^^^^^^^^^^
-  File "/__modal/volumes/vo-fpJzsF5Vh3fXKFeKjqGFTf/test_kernels/dsa_attn_2048/reference.py", line 82, in ref_kernel
-    return _run_reference(*data)
-           ^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/conda/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
-    return func(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^
-  File "/__modal/volumes/vo-fpJzsF5Vh3fXKFeKjqGFTf/test_kernels/dsa_attn_2048/reference.py", line 26, in _run_reference
-    kc_all = ckv_cache.reshape(-1, head_dim_ckv).to(torch.float32)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-torch.AcceleratorError: CUDA error: an illegal instruction was encountered
-Search for `cudaErrorIllegalInstruction' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
-CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
-For debugging consider passing CUDA_LAUNCH_BLOCKING=1
-Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
-
-"""
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "/__modal/volumes/vo-fpJzsF5Vh3fXKFeKjqGFTf/test_kernels/dsa_attn_2048/eval.py", line 39, in <module>
-    sys.exit(main(DsaAttn2048EvalRunner()))
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/__modal/volumes/vo-fpJzsF5Vh3fXKFeKjqGFTf/common/eval_base.py", line 591, in main
-    return run_benchmarking(logger, pool, tests, runner)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/__modal/volumes/vo-fpJzsF5Vh3fXKFeKjqGFTf/common/eval_base.py", line 482, in run_benchmarking
-    pool.apply(_make_benchmark_runner, (runner, tests[0], False, 100, 10e7))
-  File "/opt/conda/lib/python3.11/multiprocessing/pool.py", line 360, in apply
-    return self.apply_async(func, args, kwds).get()
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/conda/lib/python3.11/multiprocessing/pool.py", line 774, in get
-    raise self._value
-torch.AcceleratorError: CUDA error: an illegal instruction was encountered
-Search for `cudaErrorIllegalInstruction' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
-CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
-For debugging consider passing CUDA_LAUNCH_BLOCKING=1
-Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
 ```"

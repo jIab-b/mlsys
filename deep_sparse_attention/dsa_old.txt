@@ -1,0 +1,37 @@
+"**Modal ✅ success**
+> ✅ Benchmarking successful
+
+Running on:
+* GPU: `NVIDIA B200`
+* CPU: `x86_64`
+* Device count: `1`
+* Runtime: `CUDA`
+* Platform: `Linux-4.4.0-x86_64-with-glibc2.35`
+* Torch: `2.9.1+cu130`
+* Hostname: `modal`
+
+
+## Benchmarks:
+```
+batch: 1; num_pages: 32; seq_len: 2048; seed: 100
+ ⏱ 109.1 ± 0.58 µs
+ ⚡ 99.3 µs 🐌 134.1 µs
+ exact: 2/2048 positional mismatches
+ set:   recall=1.0000 (0/2048 values wrong)
+
+batch: 8; num_pages: 64; seq_len: 4096; seed: 101
+ ⏱ 122.0 ± 0.63 µs
+ ⚡ 112.6 µs 🐌 149.5 µs
+ exact: 4/16384 positional mismatches
+ set:   recall=1.0000 (0/16384 values wrong)
+
+batch: 16; num_pages: 128; seq_len: 8192; seed: 102
+ ⏱ 142.3 ± 0.56 µs
+ ⚡ 133.2 µs 🐌 168.9 µs
+ exact: 16/32768 positional mismatches
+ set:   recall=1.0000 (0/32768 values wrong)
+```
+
+## Program stdout:
+```
+```"

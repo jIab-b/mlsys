@@ -1,7 +1,8 @@
-"""DSA index submission — multi-CTA + tiled top-k with CUDA graph capture."""
-
 import torch
 from torch.utils.cpp_extension import load_inline
+
+from task import input_t, output_t
+
 
 _module = None
 TOPK = 2048
@@ -1332,14 +1333,13 @@ def _get_workspace(
     return _workspace
 
 
-def custom_kernel(data):
+def custom_kernel(data: input_t) -> output_t:
     q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table = data
     batch = int(q_index_fp8.shape[0])
     if batch == 0:
         return (torch.empty((0, TOPK), dtype=torch.int32, device=q_index_fp8.device),)
 
     max_seq = min(int(seq_lens.max().item()), int(block_table.shape[1]) * 64)
-    print(f"[custom_kernel] q={tuple(q_index_fp8.shape)} k={tuple(k_index_cache_fp8.shape)} w={tuple(weights.shape)} seq_lens={seq_lens.tolist()} block_table={tuple(block_table.shape)} max_seq={max_seq}", flush=True)
     if max_seq <= 0:
         return (torch.full((batch, TOPK), -1, dtype=torch.int32, device=q_index_fp8.device),)
 

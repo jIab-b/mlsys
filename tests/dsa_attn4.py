@@ -2,7 +2,7 @@
 
 Changes from v2:
 - Value MMA: 4 tiles write to separate TMEM col regions (16 cols each), no per-tile serialization
-- 2 warpgroups per stage for both score and value epilogues (each owns a stage slot)
+- 1 score-ep wargroup + 1 value-ep wargroup (single owner, stage-ordered)
 - Split-K: partitions topK blocks across CTAs, each writes f32 partials, combine kernel merges
 - Barrier cleanup: removed per-tile value_mma_mbar/value_tile_mbar, replaced with per-stage
 
@@ -11,9 +11,9 @@ Architecture:
 - 2 MMA warps:
     score MMA warp: Kc[64,512] @ Q_nope[16,512]^T + Kp[64,64] @ Q_pe[16,64]^T → [64,16] in TMEM
     value MMA warp: 4x Kc_slice[128,16] back-to-back → 4 separate 16-col TMEM regions
-- 2 score-epilogue warpgroups (2x4=8 warps): stage-ring, read scores, online softmax, write bf16 weights
-- 2 value-epilogue warpgroups (2x4=8 warps): stage-ring, read all 4 value tiles, online rescale + accum
-- Total: 1 + 2 + 8 + 8 = 19 warps = 608 threads
+- 1 score-epilogue warpgroup (4 warps): direct TMEM->regs, online softmax, write bf16 weights
+- 1 value-epilogue warpgroup (4 warps): read all 4 value tiles, online rescale + accum
+- Total: 1 + 2 + 4 + 4 = 11 warps = 352 threads
 
 Grid: split-K across CTAs per token. Combine kernel launched after.
 """
@@ -60,8 +60,8 @@ constexpr int kCkvRowBytes = kHeadDimCkv * sizeof(__nv_bfloat16);
 constexpr int kKpeRowBytes = kHeadDimKpe * sizeof(__nv_bfloat16);
 constexpr int kCkvChunkBytes = 128;
 constexpr int kCkvChunksPerRow = kCkvRowBytes / kCkvChunkBytes;
-constexpr int kNumScoreEpiWarpgroups = 2;
-constexpr int kNumValueEpiWarpgroups = 2;
+constexpr int kNumScoreEpiWarpgroups = 1;
+constexpr int kNumValueEpiWarpgroups = 1;
 constexpr int kScoreEpiWarps = kNumScoreEpiWarpgroups * 4;
 constexpr int kValueEpiWarps = kNumValueEpiWarpgroups * 4;
 constexpr int kScoreMmaWarp = kScoreEpiWarps + kValueEpiWarps;
@@ -291,6 +291,10 @@ __device__ inline void tcgen05_fence_after_thread_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 }
 
+__device__ inline void fence_proxy_async_shared_cta() {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
 __device__ inline void tcgen05_ld_32x32b_16(int lane_base, int col_base, float out_vals[16]) {
     const int addr = (lane_base << 16) | col_base;
     asm volatile(
@@ -397,6 +401,8 @@ __device__ inline void run_producer_warp(
             }
         }
         __syncwarp();
+        // Make producer-warp generic shared writes visible to tcgen05 async proxy.
+        fence_proxy_async_shared_cta();
 
         if (lane == 0) {
             int valid_count = 0;
@@ -582,67 +588,87 @@ __device__ inline float warp_reduce_sum(float v) {
     return v;
 }
 
-__device__ inline void load_score_vals(
+__device__ inline void score_ep_stage_regs(
     SmemLayout& s,
     int lane,
-    int epi_wg_id,
+    int head_group,
     int stage,
     int tmem_slot,
-    float sm_scale_log2e
-) {
-    if (s.stage_valid[stage] == 0) return;
-    float vals[16];
-    const int tmem_col_base = s.tmem_addr_scratch + tmem_slot * kStageTokens;
-    const int tok_base = epi_wg_id * 16;
-    tcgen05_ld_32x32b_16(0, tmem_col_base + tok_base, vals);
-    tcgen05_wait_ld();
-    if (lane < kNumHeads) {
-        #pragma unroll
-        for (int t = 0; t < kNumHeads; ++t) {
-            s.score_buf[(stage * kStageTokens + tok_base + lane) * kNumHeads + t] =
-                vals[t] * sm_scale_log2e;
-        }
-    }
-}
-
-__device__ inline void update_softmax(
-    SmemLayout& s,
-    int lane,
-    int epi_wg_id,
-    int stage,
+    float sm_scale_log2e,
     bool is_last_stage,
     float* lse_ptr
 ) {
+    if (s.stage_valid[stage] == 0) return;
+
+    constexpr int kHeadsPerWarp = 4;
+    constexpr int kTokChunks = kStageTokens / kNumHeads;
+    const int tmem_col_base = s.tmem_addr_scratch + tmem_slot * kStageTokens;
+
+    float m_local[kHeadsPerWarp] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
     #pragma unroll
-    for (int hi = 0; hi < 4; ++hi) {
-        const int head = epi_wg_id * 4 + hi;
+    for (int chunk = 0; chunk < kTokChunks; ++chunk) {
+        float vals[16];
+        const int tok_base = chunk * kNumHeads;
+        tcgen05_ld_32x32b_16(0, tmem_col_base + tok_base, vals);
+        tcgen05_wait_ld();
+        if (lane < kNumHeads) {
+            const int tok = tok_base + lane;
+            if (s.stage_indices[stage * kStageTokens + tok] >= 0) {
+                #pragma unroll
+                for (int hi = 0; hi < kHeadsPerWarp; ++hi) {
+                    const int head = head_group * kHeadsPerWarp + hi;
+                    m_local[hi] = fmaxf(m_local[hi], vals[head] * sm_scale_log2e);
+                }
+            }
+        }
+    }
 
-        const float s0 = s.score_buf[(stage * kStageTokens + lane     ) * kNumHeads + head];
-        const float s1 = s.score_buf[(stage * kStageTokens + lane + 32) * kNumHeads + head];
-        const bool v0 = s.stage_indices[stage * kStageTokens + lane     ] >= 0;
-        const bool v1 = s.stage_indices[stage * kStageTokens + lane + 32] >= 0;
+    float m_new[kHeadsPerWarp];
+    float alpha[kHeadsPerWarp];
+    float l_prev[kHeadsPerWarp];
+    #pragma unroll
+    for (int hi = 0; hi < kHeadsPerWarp; ++hi) {
+        const int head = head_group * kHeadsPerWarp + hi;
+        const float m_tile = warp_reduce_max(m_local[hi]);
+        const float m_prev = s.m_state[head];
+        l_prev[hi] = s.l_state[head];
+        m_new[hi] = fmaxf(m_prev, m_tile);
+        alpha[hi] = (m_prev == -INFINITY) ? 0.0f : exp2f(m_prev - m_new[hi]);
+    }
 
-        float m_local = fmaxf(v0 ? s0 : -INFINITY, v1 ? s1 : -INFINITY);
-        const float m_tile  = warp_reduce_max(m_local);
-        const float m_prev  = s.m_state[head];
-        const float l_prev  = s.l_state[head];
-        const float m_new = fmaxf(m_prev, m_tile);
-        const float alpha = (m_prev == -INFINITY) ? 0.0f : exp2f(m_prev - m_new);
+    float l_local[kHeadsPerWarp] = {0.0f, 0.0f, 0.0f, 0.0f};
+    #pragma unroll
+    for (int chunk = 0; chunk < kTokChunks; ++chunk) {
+        float vals[16];
+        const int tok_base = chunk * kNumHeads;
+        tcgen05_ld_32x32b_16(0, tmem_col_base + tok_base, vals);
+        tcgen05_wait_ld();
+        if (lane < kNumHeads) {
+            const int tok = tok_base + lane;
+            const bool valid = (s.stage_indices[stage * kStageTokens + tok] >= 0);
+            #pragma unroll
+            for (int hi = 0; hi < kHeadsPerWarp; ++hi) {
+                const int head = head_group * kHeadsPerWarp + hi;
+                const float score = vals[head] * sm_scale_log2e;
+                const float w = valid ? exp2f(score - m_new[hi]) : 0.0f;
+                s.attn_weights[(stage * kStageTokens + tok) * kNumHeads + head] = float_to_bf16(w);
+                l_local[hi] += w;
+            }
+        }
+    }
 
-        const float w0 = v0 ? exp2f(s0 - m_new) : 0.0f;
-        const float w1 = v1 ? exp2f(s1 - m_new) : 0.0f;
-        s.attn_weights[(stage * kStageTokens + lane     ) * kNumHeads + head] = float_to_bf16(w0);
-        s.attn_weights[(stage * kStageTokens + lane + 32) * kNumHeads + head] = float_to_bf16(w1);
-        const float l_tile = warp_reduce_sum(w0 + w1);
-
+    #pragma unroll
+    for (int hi = 0; hi < kHeadsPerWarp; ++hi) {
+        const int head = head_group * kHeadsPerWarp + hi;
+        const float l_tile = warp_reduce_sum(l_local[hi]);
         if (lane == 0) {
-            const float l_new = l_prev * alpha + l_tile;
-            s.stage_alpha[stage * kNumHeads + head] = alpha;
-            s.m_state[head] = m_new;
+            const float l_new = fmaf(l_prev[hi], alpha[hi], l_tile);
+            s.stage_alpha[stage * kNumHeads + head] = alpha[hi];
+            s.m_state[head] = m_new[hi];
             s.l_state[head] = l_new;
             if (is_last_stage) {
-                lse_ptr[head] = (l_new > 0.0f && m_new != -INFINITY)
-                    ? m_new + log2f(l_new) : -INFINITY;
+                lse_ptr[head] = (l_new > 0.0f && m_new[hi] != -INFINITY)
+                    ? m_new[hi] + log2f(l_new) : -INFINITY;
             }
         }
     }
@@ -658,30 +684,29 @@ __device__ inline void run_score_epilogue_warps(
     float* lse_ptr
 ) {
     if (warp_id >= kScoreEpiWarps) return;
-    const int ep_wg     = warp_id / 4;
-    const int epi_wg_id = warp_id % 4;
+    const int epi_wg_id = warp_id;
 
     for (int local = 0; local < stages_total; ++local) {
         const int stage = local % kNumStages;
         const int phase = (local / kNumStages) & 1;
-        if ((stage % kNumScoreEpiWarpgroups) != ep_wg) continue;
 
         if (lane == 0) {
             mbarrier_wait_parity(
                 addr.score_mma_mbar + stage * sizeof(uint64_t),
                 phase);
         }
-        __syncwarp();
+        wg_sync(10);
         tcgen05_fence_after_thread_sync();
 
-        load_score_vals(s, lane, epi_wg_id, stage, stage, sm_scale_log2e);
-        wg_sync(10 + ep_wg);
+        const bool is_last_stage = (local + 1 >= stages_total);
+        score_ep_stage_regs(
+            s, lane, epi_wg_id, stage, stage, sm_scale_log2e, is_last_stage, lse_ptr);
+        //wg_sync(10);
+        // Make attn_weights writes visible before signaling score->value handoff.
+        fence_proxy_async_shared_cta();
+        wg_sync(10);
 
-        const bool is_last_stage = (local + kNumScoreEpiWarpgroups >= stages_total);
-        update_softmax(s, lane, epi_wg_id, stage, is_last_stage, lse_ptr);
-        wg_sync(10 + ep_wg);
-
-        if (epi_wg_id == 0 && lane == 0) {
+        if (warp_id == 0 && lane == 0) {
             mbarrier_arrive(addr.score_epi_mbar + stage * sizeof(uint64_t));
             mbarrier_arrive(addr.score_tmem_reuse_mbar + stage * sizeof(uint64_t));
         }
@@ -696,20 +721,18 @@ __device__ inline void run_value_epilogue_warps(
     int stages_total
 ) {
     if (warp_id < kScoreEpiWarps || warp_id >= kScoreEpiWarps + kValueEpiWarps) return;
-    const int value_wg = (warp_id - kScoreEpiWarps) / 4;
-    const int value_epi_wg_id = (warp_id - kScoreEpiWarps) % 4;
+    const int value_epi_wg_id = warp_id - kScoreEpiWarps;
 
     for (int local = 0; local < stages_total; ++local) {
         const int stage = local % kNumStages;
         const int phase = (local / kNumStages) & 1;
-        if ((stage % kNumValueEpiWarpgroups) != value_wg) continue;
 
         if (lane == 0) {
             mbarrier_wait_parity(
                 addr.value_mma_mbar + stage * sizeof(uint64_t),
                 phase);
         }
-        wg_sync(12 + value_wg);
+        wg_sync(12);
 
         tcgen05_fence_after_thread_sync();
         const int lane_base = value_epi_wg_id * 32;
@@ -730,8 +753,8 @@ __device__ inline void run_value_epilogue_warps(
                 }
             }
         }
-        wg_sync(12 + value_wg);
-        if (value_epi_wg_id == 0 && lane == 0) {
+        wg_sync(12);
+        if (warp_id == kScoreEpiWarps && lane == 0) {
             mbarrier_arrive(addr.value_epi_mbar + stage * sizeof(uint64_t));
         }
     }
@@ -791,6 +814,9 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_sparse_attn_kernel_v3(
 
     init_query_and_state(s, tid, token, q_nope, q_pe);
     init_pipeline_barriers(s, addr, warp_id);
+    // Make Q shared writes visible to tcgen05 async proxy before score MMA.
+    fence_proxy_async_shared_cta();
+    __syncthreads();
 
     run_producer_warp(
         s, addr, lane, warp_id, token, sparse_indices,

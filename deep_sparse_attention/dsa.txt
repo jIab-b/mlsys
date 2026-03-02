@@ -1,37 +1,62 @@
-"**Modal ✅ success**
-> ✅ Benchmarking successful
-
-Running on:
-* GPU: `NVIDIA B200`
-* CPU: `x86_64`
-* Device count: `1`
-* Runtime: `CUDA`
-* Platform: `Linux-4.4.0-x86_64-with-glibc2.35`
-* Torch: `2.9.1+cu130`
-* Hostname: `modal`
-
-
-## Benchmarks:
-```
-batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ⏱ 112.7 ± 0.55 µs
- ⚡ 106.4 µs 🐌 133.3 µs
- exact: 2/2048 positional mismatches
- set:   recall=1.0000 (0/2048 values wrong)
-
-batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ⏱ 122.0 ± 0.66 µs
- ⚡ 113.6 µs 🐌 148.4 µs
- exact: 4/16384 positional mismatches
- set:   recall=1.0000 (0/16384 values wrong)
-
-batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ⏱ 144.6 ± 0.64 µs
- ⚡ 138.1 µs 🐌 168.9 µs
- exact: 16/32768 positional mismatches
- set:   recall=1.0000 (0/32768 values wrong)
-```
-
-## Program stdout:
-```
-```"
+{
+  "sol": "/home/beed/mlsys/deep_sparse_attention/dsa.py",
+  "definition": "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64",
+  "compile": {
+    "ok": true,
+    "status": "OK",
+    "cache_key": "ce17ec80a08abbcc82efae57",
+    "cache_saved": true,
+    "cache_dir": "/data/.torch_fi_cache/ce17ec80a08abbcc82efae57",
+    "compile_kernel": {
+      "stdout": "compile_kernel:found\n",
+      "stderr": "/opt/conda/lib/python3.11/site-packages/torch/cuda/__init__.py:182: UserWarning: CUDA initialization: Unexpected error from cudaGetDeviceCount(). Did you run some cuda functions before calling NumCudaDevices() that might have already set an error? Error 34: CUDA driver is a stub library (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:119.)\n  return torch._C._cuda_getDeviceCount() > 0\nW0302 15:08:41.387000 24 site-packages/torch/utils/cpp_extension.py:117] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'\n"
+    }
+  },
+  "run": {
+    "ok": false,
+    "status": "RUNTIME_ERROR",
+    "error": "INCORRECT_NUMERICAL",
+    "log": "[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[65] block_table=(1, 2) max_seq=65\n",
+    "cache_restored": true,
+    "results": {
+      "30cecff1-7ea4-474b-90fc-7f4a87206d8e": {
+        "status": "PASSED",
+        "workload": "30cecff1-7ea4-474b-90fc-7f4a87206d8e",
+        "log": "[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[2] block_table=(1, 1) max_seq=2\n",
+        "latency_ms": 0.20229120254516603,
+        "speedup": 6.8154896432499505,
+        "ref_latency_ms": 1.378713595867157,
+        "max_abs_err": 0.0,
+        "max_rel_err": 0.0
+      },
+      "cd594d26-4ac9-4b15-9305-f4c65c789c16": {
+        "status": "INCORRECT_NUMERICAL",
+        "workload": "cd594d26-4ac9-4b15-9305-f4c65c789c16",
+        "log": "[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[65] block_table=(1, 2) max_seq=65\n",
+        "max_abs_err": 62.0,
+        "max_rel_err": 0.9538461565971375
+      },
+      "44ddaa65-5d63-41d6-8849-7975b5f6efd5": {
+        "status": "INCORRECT_NUMERICAL",
+        "workload": "44ddaa65-5d63-41d6-8849-7975b5f6efd5",
+        "log": "[custom_kernel] q=(1, 64, 128) k=(11923, 64, 1, 132) w=(1, 64) seq_lens=[129] block_table=(1, 3) max_seq=129\n",
+        "max_abs_err": 116.0,
+        "max_rel_err": 1.5466666221618652
+      },
+      "b2098949-a0e4-4de5-9797-3d338dbc54b0": {
+        "status": "INCORRECT_NUMERICAL",
+        "workload": "b2098949-a0e4-4de5-9797-3d338dbc54b0",
+        "log": "[custom_kernel] q=(2, 64, 128) k=(11923, 64, 1, 132) w=(2, 64) seq_lens=[92, 48] block_table=(2, 2) max_seq=92\n",
+        "max_abs_err": 83.0,
+        "max_rel_err": 1.2028985023498535
+      },
+      "4667f9ad-92f3-4503-9eea-547a30e708dc": {
+        "status": "INCORRECT_NUMERICAL",
+        "workload": "4667f9ad-92f3-4503-9eea-547a30e708dc",
+        "log": "[custom_kernel] q=(2, 64, 128) k=(11923, 64, 1, 132) w=(2, 64) seq_lens=[33, 52] block_table=(2, 1) max_seq=52\n",
+        "max_abs_err": 48.0,
+        "max_rel_err": 0.3664122223854065
+      }
+    }
+  }
+}
