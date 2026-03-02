@@ -608,10 +608,9 @@ __device__ inline void load_score_vals(
     tcgen05_ld_32x32b_16(0, tmem_col_base, vals);
     tcgen05_wait_ld();
     if (lane < kNumHeads) {
-        const int head = lane;
         #pragma unroll
-        for (int t = 0; t < 16; ++t) {
-            s.score_buf[(stage * kStageTokens + tok_base + t) * kNumHeads + head] =
+        for (int t = 0; t < kNumHeads; ++t) {
+            s.score_buf[(stage * kStageTokens + tok_base + lane) * kNumHeads + t] =
                 vals[t] * sm_scale_log2e;
         }
     }
