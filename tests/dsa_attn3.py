@@ -58,28 +58,23 @@ constexpr int kMmaItersKpe = kHeadDimKpe / kMmaK;
 constexpr int kValMmaMTile = 128;
 constexpr int kValMmaMTiles = kHeadDimCkv / kValMmaMTile;
 constexpr int kValMmaKIters = kStageTokens / kMmaK;
-constexpr int kValTmemColsPerTile = kNumHeads;
 
-constexpr int kCkvRowBytes = kHeadDimCkv * static_cast<int>(sizeof(__nv_bfloat16));
-constexpr int kKpeRowBytes = kHeadDimKpe * static_cast<int>(sizeof(__nv_bfloat16));
+constexpr int kCkvRowBytes = kHeadDimCkv * sizeof(__nv_bfloat16);
+constexpr int kKpeRowBytes = kHeadDimKpe * sizeof(__nv_bfloat16);
 constexpr int kCkvChunkBytes = 128;
 constexpr int kCkvChunksPerRow = kCkvRowBytes / kCkvChunkBytes;
 constexpr int kNumScoreEpiWarpgroups = 2;
 constexpr int kNumValueEpiWarpgroups = 2;
-constexpr int kWarpsPerWarpgroup = 4;
-constexpr int kScoreEpiWarps = kNumScoreEpiWarpgroups * kWarpsPerWarpgroup;
-constexpr int kValueEpiWarps = kNumValueEpiWarpgroups * kWarpsPerWarpgroup;
+constexpr int kScoreEpiWarps = kNumScoreEpiWarpgroups * 4;
+constexpr int kValueEpiWarps = kNumValueEpiWarpgroups * 4;
 constexpr int kScoreMmaWarp = kScoreEpiWarps + kValueEpiWarps;
 constexpr int kValueMmaWarp = kScoreMmaWarp + 1;
 constexpr int kProducerWarp = kValueMmaWarp + 1;
 constexpr int kNumWarps = kProducerWarp + 1;
 constexpr int kThreadsPerBlock = kNumWarps * 32;
-constexpr int kScoreTmemCols = kStageTokens;
-constexpr int kScoreTmemSlots = kNumStages;
-constexpr int kScoreTmemTotal = kScoreTmemSlots * kScoreTmemCols;
+constexpr int kScoreTmemTotal = kNumStages * kStageTokens;
 constexpr int kValueTmemBase = kScoreTmemTotal;
-constexpr int kValueTmemColsTotal = kValMmaMTiles * kValTmemColsPerTile;
-constexpr int kTotalTmemCols = kScoreTmemTotal + kValueTmemColsTotal;
+constexpr int kTotalTmemCols = kScoreTmemTotal + kValMmaMTiles * kNumHeads;
 struct __align__(1024) SmemLayout {
     __nv_bfloat16 q_nope[kNumHeads * kHeadDimCkv];
     __nv_bfloat16 q_pe[kNumHeads * kHeadDimKpe];
@@ -103,7 +98,7 @@ struct __align__(1024) SmemLayout {
     int tmem_addr_scratch;
 };
 
-constexpr int kDesiredDynamicSmemBytes = static_cast<int>(sizeof(SmemLayout));
+constexpr int kDesiredDynamicSmemBytes = sizeof(SmemLayout);
 struct SmemAddrs {
     int q_nope;
     int q_pe;
@@ -151,15 +146,15 @@ __device__ inline uint32_t elect_sync() {
     return pred;
 }
 
-__device__ inline constexpr uint64_t desc_encode(uint64_t x) {
+__device__ inline uint64_t desc_encode(uint64_t x) {
     return (x & 0x3'FFFFULL) >> 4ULL;
 }
 
 __device__ inline uint64_t make_desc_kmajor_swizzle_128b(int smem_addr) {
     const int sbo = 8 * 128;
-    const uint64_t base_offset = (static_cast<uint32_t>(smem_addr) >> 7U) & 0x7ULL;
-    return desc_encode(static_cast<uint64_t>(smem_addr)) |
-           (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
+    const uint64_t base_offset = (smem_addr >> 7U) & 0x7ULL;
+    return desc_encode(smem_addr) |
+           (desc_encode(sbo) << 32ULL) |
            (base_offset << 49ULL) |
            (1ULL << 46ULL) |
            (2ULL << 61ULL);
@@ -168,9 +163,9 @@ __device__ inline uint64_t make_desc_kmajor_swizzle_128b(int smem_addr) {
 __device__ inline uint64_t make_desc_kmajor_no_swizzle(int smem_addr, int height_rows) {
     const int lbo = height_rows * 16;
     const int sbo = 8 * 16;
-    return desc_encode(static_cast<uint64_t>(smem_addr)) |
-           (desc_encode(static_cast<uint64_t>(lbo)) << 16ULL) |
-           (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
+    return desc_encode(smem_addr) |
+           (desc_encode(lbo) << 16ULL) |
+           (desc_encode(sbo) << 32ULL) |
            (1ULL << 46ULL);
 }
 
@@ -266,7 +261,7 @@ __device__ inline void tcgen05_dealloc(int base_tmem, int num_cols) {
 }
 
 __device__ inline void tcgen05_mma_f16(
-    uint32_t tmem_d,
+    int tmem_d,
     uint64_t desc_a,
     uint64_t desc_b,
     uint32_t idesc,
@@ -326,8 +321,8 @@ __device__ inline void init_query_and_state(
     const __nv_bfloat16* q_nope,
     const __nv_bfloat16* q_pe
 ) {
-    const __nv_bfloat16* qn_src = q_nope + static_cast<int64_t>(token) * kNumHeads * kHeadDimCkv;
-    const __nv_bfloat16* qp_src = q_pe + static_cast<int64_t>(token) * kNumHeads * kHeadDimKpe;
+    const __nv_bfloat16* qn_src = q_nope + 1LL * token * kNumHeads * kHeadDimCkv;
+    const __nv_bfloat16* qp_src = q_pe + 1LL * token * kNumHeads * kHeadDimKpe;
     for (int i = tid; i < kNumHeads * kHeadDimCkv; i += kThreadsPerBlock) {
         s.q_nope[i] = qn_src[i];
     }
@@ -354,12 +349,12 @@ __device__ inline void init_pipeline_barriers(
 ) {
     if (warp_id == kProducerWarp && elect_sync()) {
         for (int i = 0; i < kNumStages; ++i) {
-            mbarrier_init(addr.tma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
-            mbarrier_init(addr.score_mma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
-            mbarrier_init(addr.score_epi_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
-            mbarrier_init(addr.score_tmem_reuse_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
-            mbarrier_init(addr.value_mma_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
-            mbarrier_init(addr.value_epi_mbar + i * static_cast<int>(sizeof(uint64_t)), 1);
+            mbarrier_init(addr.tma_mbar + i * sizeof(uint64_t), 1);
+            mbarrier_init(addr.score_mma_mbar + i * sizeof(uint64_t), 1);
+            mbarrier_init(addr.score_epi_mbar + i * sizeof(uint64_t), 1);
+            mbarrier_init(addr.score_tmem_reuse_mbar + i * sizeof(uint64_t), 1);
+            mbarrier_init(addr.value_mma_mbar + i * sizeof(uint64_t), 1);
+            mbarrier_init(addr.value_epi_mbar + i * sizeof(uint64_t), 1);
         }
         s.tmem_addr_scratch = 0;
         asm volatile("fence.mbarrier_init.release.cluster;");
@@ -389,7 +384,7 @@ __device__ inline void run_producer_warp(
         if (lane == 0 && local >= kNumStages) {
             const int phase = ((local - kNumStages) / kNumStages) & 1;
             mbarrier_wait_parity(
-                addr.value_epi_mbar + stage * static_cast<int>(sizeof(uint64_t)),
+                addr.value_epi_mbar + stage * sizeof(uint64_t),
                 phase);
         }
 
@@ -413,7 +408,7 @@ __device__ inline void run_producer_warp(
             }
             s.stage_valid[stage] = valid_count;
 
-            const int mbar = addr.tma_mbar + stage * static_cast<int>(sizeof(uint64_t));
+            const int mbar = addr.tma_mbar + stage * sizeof(uint64_t);
             const int bytes = valid_count * (kCkvRowBytes + kKpeRowBytes);
             if (bytes > 0) {
                 mbarrier_arrive_expect_tx(mbar, bytes);
@@ -490,25 +485,25 @@ __device__ inline void run_mma_warps(
 
     if (warp_id == kScoreMmaWarp) {tcgen05_alloc(addr.tmem_addr_scratch, kTotalTmemCols);}
     if (warp_id == kScoreMmaWarp && lane == 0) {
-        const uint32_t tmem_base = static_cast<uint32_t>(s.tmem_addr_scratch);
+        const int tmem_base = s.tmem_addr_scratch;
         for (int local = 0; local < stages_total; ++local) {
             const int stage = local % kNumStages;
             const int tmem_slot = local % kNumStages;
             const int phase = (local / kNumStages) & 1;
 
             mbarrier_wait_parity(
-                addr.tma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
+                addr.tma_mbar + stage * sizeof(uint64_t),
                 phase);
 
             if (local >= kNumStages) {
                 const int reuse_phase = ((local - kNumStages) / kNumStages) & 1;
                 mbarrier_wait_parity(
-                    addr.score_tmem_reuse_mbar + stage * static_cast<int>(sizeof(uint64_t)),
+                    addr.score_tmem_reuse_mbar + stage * sizeof(uint64_t),
                     reuse_phase);
             }
 
             if (s.stage_valid[stage] > 0) {
-                const uint32_t tmem_d = tmem_base + static_cast<uint32_t>(tmem_slot * kScoreTmemCols);
+                const int tmem_d = tmem_base + tmem_slot * kStageTokens;
                 uint64_t kc_desc = make_desc_kmajor_swizzle_128b(
                     addr.kc_stage + stage * kStageTokens * kCkvRowBytes);
                 uint64_t qn_desc = make_desc_kmajor_no_swizzle(addr.q_nope, kNumHeads);
@@ -530,9 +525,9 @@ __device__ inline void run_mma_warps(
                     qp_desc += (kMmaK >> 4);
                 }
 
-                tcgen05_commit(addr.score_mma_mbar + stage * static_cast<int>(sizeof(uint64_t)));
+                tcgen05_commit(addr.score_mma_mbar + stage * sizeof(uint64_t));
             } else {
-                mbarrier_arrive(addr.score_mma_mbar + stage * static_cast<int>(sizeof(uint64_t)));
+                mbarrier_arrive(addr.score_mma_mbar + stage * sizeof(uint64_t));
             }
         }
     }
@@ -541,21 +536,21 @@ __device__ inline void run_mma_warps(
             const int stage = local % kNumStages;
             const int phase = (local / kNumStages) & 1;
             mbarrier_wait_parity(
-                addr.score_epi_mbar + stage * static_cast<int>(sizeof(uint64_t)),
+                addr.score_epi_mbar + stage * sizeof(uint64_t),
                 phase);
-            const uint32_t tmem_base = static_cast<uint32_t>(s.tmem_addr_scratch);
+            const int tmem_base = s.tmem_addr_scratch;
 
             const bool valid_stage = (s.stage_valid[stage] > 0);
             if (valid_stage) {
                 const uint64_t w_desc_base = make_desc_kmajor_no_swizzle(
-                    addr.attn_weights + stage * kStageTokens * kNumHeads * static_cast<int>(sizeof(__nv_bfloat16)),
+                    addr.attn_weights + stage * kStageTokens * kNumHeads * sizeof(__nv_bfloat16),
                     kNumHeads);
 
                 for (int tile = 0; tile < kValMmaMTiles; ++tile) {
-                    const uint32_t tmem_d = tmem_base + static_cast<uint32_t>(kValueTmemBase + tile * kValTmemColsPerTile);
+                    const int tmem_d = tmem_base + kValueTmemBase + tile * kNumHeads;
                     uint64_t kc_col_desc = make_desc_kmajor_swizzle_128b(
                         addr.kc_stage + stage * kStageTokens * kCkvRowBytes +
-                        tile * kValMmaMTile * static_cast<int>(sizeof(__nv_bfloat16)));
+                        tile * kValMmaMTile * sizeof(__nv_bfloat16));
                     uint64_t w_desc = w_desc_base;
 
                     for (int ki = 0; ki < kValMmaKIters; ++ki) {
@@ -564,11 +559,9 @@ __device__ inline void run_mma_warps(
                         w_desc += (kMmaK >> 4);
                     }
                 }
-                tcgen05_commit(addr.value_mma_mbar + stage * static_cast<int>(sizeof(uint64_t)));
+                tcgen05_commit(addr.value_mma_mbar + stage * sizeof(uint64_t));
             } else {
-                mbarrier_arrive(addr.value_mma_mbar + stage * static_cast<int>(sizeof(uint64_t)));
-            }
-            if (local >= kNumStages) {
+                mbarrier_arrive(addr.value_mma_mbar + stage * sizeof(uint64_t));
             }
         }
     }
@@ -602,8 +595,7 @@ __device__ inline void load_score_vals(
 ) {
     if (s.stage_valid[stage] == 0) return;
     float vals[16];
-    const int tmem_col_base =
-        static_cast<int>(static_cast<uint32_t>(s.tmem_addr_scratch)) + tmem_slot * kScoreTmemCols;
+    const int tmem_col_base = s.tmem_addr_scratch + tmem_slot * kStageTokens;
     const int tok_base = epi_wg_id * 16;
     tcgen05_ld_32x32b_16(0, tmem_col_base, vals);
     tcgen05_wait_ld();
@@ -669,8 +661,8 @@ __device__ inline void run_score_epilogue_warps(
     float* lse_ptr
 ) {
     if (warp_id >= kScoreEpiWarps) return;
-    const int ep_wg     = warp_id / kWarpsPerWarpgroup;
-    const int epi_wg_id = warp_id % kWarpsPerWarpgroup;
+    const int ep_wg     = warp_id / 4;
+    const int epi_wg_id = warp_id % 4;
 
     for (int local = 0; local < stages_total; ++local) {
         const int stage = local % kNumStages;
@@ -679,7 +671,7 @@ __device__ inline void run_score_epilogue_warps(
 
         if (lane == 0) {
             mbarrier_wait_parity(
-                addr.score_mma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
+                addr.score_mma_mbar + stage * sizeof(uint64_t),
                 phase);
         }
         tcgen05_fence_after_thread_sync();
@@ -692,8 +684,8 @@ __device__ inline void run_score_epilogue_warps(
         wg_sync(10 + ep_wg);
 
         if (epi_wg_id == 0 && lane == 0) {
-            mbarrier_arrive(addr.score_epi_mbar + stage * static_cast<int>(sizeof(uint64_t)));
-            mbarrier_arrive(addr.score_tmem_reuse_mbar + stage * static_cast<int>(sizeof(uint64_t)));
+            mbarrier_arrive(addr.score_epi_mbar + stage * sizeof(uint64_t));
+            mbarrier_arrive(addr.score_tmem_reuse_mbar + stage * sizeof(uint64_t));
         }
     }
 }
@@ -706,8 +698,8 @@ __device__ inline void run_value_epilogue_warps(
     int stages_total
 ) {
     if (warp_id < kScoreEpiWarps || warp_id >= kScoreEpiWarps + kValueEpiWarps) return;
-    const int value_wg = (warp_id - kScoreEpiWarps) / kWarpsPerWarpgroup;
-    const int value_epi_wg_id = (warp_id - kScoreEpiWarps) % kWarpsPerWarpgroup;
+    const int value_wg = (warp_id - kScoreEpiWarps) / 4;
+    const int value_epi_wg_id = (warp_id - kScoreEpiWarps) % 4;
 
     for (int local = 0; local < stages_total; ++local) {
         const int stage = local % kNumStages;
@@ -716,7 +708,7 @@ __device__ inline void run_value_epilogue_warps(
 
         if (lane == 0) {
             mbarrier_wait_parity(
-                addr.value_mma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
+                addr.value_mma_mbar + stage * sizeof(uint64_t),
                 phase);
         }
         wg_sync(12 + value_wg);
@@ -728,8 +720,7 @@ __device__ inline void run_value_epilogue_warps(
             for (int tile = 0; tile < kValMmaMTiles; ++tile) {
                 float vals[16];
                 const int tmem_col_base =
-                    static_cast<int>(static_cast<uint32_t>(s.tmem_addr_scratch)) +
-                    kValueTmemBase + tile * kValTmemColsPerTile;
+                    s.tmem_addr_scratch + kValueTmemBase + tile * kNumHeads;
                 tcgen05_ld_32x32b_16(0, tmem_col_base, vals);
                 tcgen05_wait_ld();
                 #pragma unroll
@@ -742,7 +733,7 @@ __device__ inline void run_value_epilogue_warps(
         }
         wg_sync(12 + value_wg);
         if (value_epi_wg_id == 0 && lane == 0) {
-            mbarrier_arrive(addr.value_epi_mbar + stage * static_cast<int>(sizeof(uint64_t)));
+            mbarrier_arrive(addr.value_epi_mbar + stage * sizeof(uint64_t));
         }
     }
 }
@@ -755,8 +746,8 @@ __device__ inline void writeback_outputs_splitk(
     int split_idx,
     int stride_split
 ) {
-    float* o_dst = o_accum_out + static_cast<int64_t>(split_idx) * stride_split;
-    float* o_token = o_dst + static_cast<int64_t>(token) * kNumHeads * kHeadDimCkv;
+    float* o_dst = o_accum_out + 1LL * split_idx * stride_split;
+    float* o_token = o_dst + 1LL * token * kNumHeads * kHeadDimCkv;
 
     for (int i = tid; i < kNumHeads * kHeadDimCkv; i += kThreadsPerBlock) {
         o_token[i] = s.o_accum[i];
@@ -807,8 +798,8 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_sparse_attn_kernel_v3(
         total_kv_tokens, &kc_tmap, &kp_tmap, stages_total, block_start);
 
     run_mma_warps(s, addr, lane, warp_id, stages_total);
-    float* lse_ptr = lse_accum + static_cast<int64_t>(split_idx) * lse_accum_stride_split
-                               + static_cast<int64_t>(token) * kNumHeads;
+    float* lse_ptr = lse_accum + 1LL * split_idx * lse_accum_stride_split
+                               + 1LL * token * kNumHeads;
     run_score_epilogue_warps(s, addr, lane, warp_id, stages_total, sm_scale_log2e, lse_ptr);
     run_value_epilogue_warps(s, addr, lane, warp_id, stages_total);
     __syncthreads();
@@ -817,7 +808,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_sparse_attn_kernel_v3(
 
     __syncthreads();
     if (warp_id == kScoreMmaWarp) {
-        tcgen05_dealloc(static_cast<int>(static_cast<uint32_t>(s.tmem_addr_scratch)), kTotalTmemCols);
+        tcgen05_dealloc(s.tmem_addr_scratch, kTotalTmemCols);
     }
 }
 
@@ -836,8 +827,8 @@ __global__ void dsa_combine_kernel(
     const int tid = threadIdx.x;
     const int nsplits = num_splits_per_token[token];
     const int hd_total = kNumHeads * kHeadDimCkv;
-    __nv_bfloat16* out_token = out + static_cast<int64_t>(token) * hd_total;
-    float* lse_token = out_lse + static_cast<int64_t>(token) * kNumHeads;
+    __nv_bfloat16* out_token = out + 1LL * token * hd_total;
+    float* lse_token = out_lse + 1LL * token * kNumHeads;
     __shared__ float s_m_global[kNumHeads];
     __shared__ float s_l_global[kNumHeads];
 
@@ -845,16 +836,16 @@ __global__ void dsa_combine_kernel(
         const int head = tid;
         float m_global = -INFINITY;
         for (int sp = 0; sp < nsplits; ++sp) {
-            const float* lse_split = lse_accum + static_cast<int64_t>(sp) * lse_accum_stride_split +
-                                     static_cast<int64_t>(token) * kNumHeads;
+            const float* lse_split = lse_accum + 1LL * sp * lse_accum_stride_split +
+                                     1LL * token * kNumHeads;
             float lse_val = lse_split[head];
             m_global = fmaxf(m_global, lse_val);
         }
         s_m_global[head] = m_global;
         float l_global = 0.0f;
         for (int sp = 0; sp < nsplits; ++sp) {
-            const float* lse_split = lse_accum + static_cast<int64_t>(sp) * lse_accum_stride_split +
-                                     static_cast<int64_t>(token) * kNumHeads;
+            const float* lse_split = lse_accum + 1LL * sp * lse_accum_stride_split +
+                                     1LL * token * kNumHeads;
             float lse_val = lse_split[head];
             if (lse_val != -INFINITY) {
                 l_global += exp2f(lse_val - m_global);
@@ -875,10 +866,10 @@ __global__ void dsa_combine_kernel(
 
         float val = 0.0f;
         for (int sp = 0; sp < nsplits; ++sp) {
-            const float* o_split = o_accum + static_cast<int64_t>(sp) * o_accum_stride_split +
-                                   static_cast<int64_t>(token) * hd_total;
-            const float* lse_split = lse_accum + static_cast<int64_t>(sp) * lse_accum_stride_split +
-                                     static_cast<int64_t>(token) * kNumHeads;
+            const float* o_split = o_accum + 1LL * sp * o_accum_stride_split +
+                                   1LL * token * hd_total;
+            const float* lse_split = lse_accum + 1LL * sp * lse_accum_stride_split +
+                                     1LL * token * kNumHeads;
             float lse_val = lse_split[head];
             if (lse_val != -INFINITY) {
                 float weight = exp2f(lse_val - m_global);
@@ -951,28 +942,28 @@ void dsa_sparse_attn_launch(
     TORCH_CHECK(out.is_cuda(), "out must be CUDA");
     TORCH_CHECK(lse.is_cuda(), "lse must be CUDA");
 
-    const int num_tokens = static_cast<int>(q_nope.size(0));
+    const int num_tokens = q_nope.size(0);
     if (num_tokens == 0) return;
 
-    const int num_pages = static_cast<int>(ckv_cache.size(0));
+    const int num_pages = ckv_cache.size(0);
     const int total_kv_tokens = num_pages * kPageSize;
     maybe_set_kernel_attrs();
 
     const uint8_t* kc_base = reinterpret_cast<const uint8_t*>(ckv_cache.data_ptr());
     const uint8_t* kp_base = reinterpret_cast<const uint8_t*>(kpe_cache.data_ptr());
 
-    constexpr uint32_t rank2 = 2;
+    const uint32_t rank2 = 2;
     uint32_t e2[rank2] = {1U, 1U};
 
     uint64_t kc_dim[rank2] = {
-        static_cast<uint64_t>(kCkvRowBytes),
-        static_cast<uint64_t>(total_kv_tokens),
+        kCkvRowBytes,
+        total_kv_tokens,
     };
     uint64_t kc_strides[rank2 - 1] = {
-        static_cast<uint64_t>(kCkvRowBytes),
+        kCkvRowBytes,
     };
     uint32_t kc_box[rank2] = {
-        static_cast<uint32_t>(kCkvChunkBytes),
+        kCkvChunkBytes,
         1U,
     };
     CUtensorMap kc_tmap = make_tmap(
@@ -987,14 +978,14 @@ void dsa_sparse_attn_launch(
     );
 
     uint64_t kp_dim[rank2] = {
-        static_cast<uint64_t>(kKpeRowBytes),
-        static_cast<uint64_t>(total_kv_tokens),
+        kKpeRowBytes,
+        total_kv_tokens,
     };
     uint64_t kp_strides[rank2 - 1] = {
-        static_cast<uint64_t>(kKpeRowBytes),
+        kKpeRowBytes,
     };
     uint32_t kp_box[rank2] = {
-        static_cast<uint32_t>(kKpeRowBytes),
+        kKpeRowBytes,
         1U,
     };
     CUtensorMap kp_tmap = make_tmap(
@@ -1007,8 +998,8 @@ void dsa_sparse_attn_launch(
         CU_TENSOR_MAP_SWIZZLE_NONE,
         "cuTensorMapEncodeTiled failed for kpe"
     );
-    constexpr int kBlocksPerToken = kTopK / kStageTokens;
-    constexpr int kFixedOverhead = 5;
+    const int kBlocksPerToken = kTopK / kStageTokens;
+    const int kFixedOverhead = 5;
     int device_id;
     cudaGetDevice(&device_id);
     int num_sms;
@@ -1055,7 +1046,7 @@ void dsa_sparse_attn_launch(
         cur_block = 0;
     }
 
-    const int num_ctas = static_cast<int>(split_info_host.size()) / 3;
+    const int num_ctas = split_info_host.size() / 3;
     int max_splits = 0;
     for (int i = 0; i < num_tokens; ++i) {
         max_splits = std::max(max_splits, splits_per_token[i]);
@@ -1072,7 +1063,7 @@ void dsa_sparse_attn_launch(
     torch::Tensor lse_accum_t = torch::full({max_splits, num_tokens, kNumHeads}, -INFINITY,
         opts.dtype(torch::kFloat32));
 
-    const float sm_scale_log2e = static_cast<float>(sm_scale) * 1.4426950408889634f;
+    const float sm_scale_log2e = sm_scale * 1.4426950408889634f;
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     dsa_sparse_attn_kernel_v3<<<num_ctas, kThreadsPerBlock, kDesiredDynamicSmemBytes, stream>>>(
         kc_tmap,
@@ -1095,7 +1086,7 @@ void dsa_sparse_attn_launch(
         cudaError_t st = cudaGetLastError();
         TORCH_CHECK(st == cudaSuccess, "dsa_sparse_attn_kernel_v3 launch failed: ", cudaGetErrorString(st));
     }
-    constexpr int kCombineThreads = 256;
+    const int kCombineThreads = 256;
     dsa_combine_kernel<<<num_tokens, kCombineThreads, 0, stream>>>(
         reinterpret_cast<const float*>(o_accum_t.data_ptr()),
         reinterpret_cast<const float*>(lse_accum_t.data_ptr()),
