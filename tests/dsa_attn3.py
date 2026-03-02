@@ -652,8 +652,8 @@ __device__ inline void update_softmax(
             s.m_state[head] = m_new;
             s.l_state[head] = l_new;
             if (is_last_stage) {
-                lse_ptr[head] = (l_new > 0.0f && m_new_b != -INFINITY)
-                    ? m_new_b + log2f(l_new) : -INFINITY;
+                lse_ptr[head] = (l_new > 0.0f && m_new != -INFINITY)
+                    ? m_new + log2f(l_new) : -INFINITY;
             }
         }
     }
@@ -719,18 +719,18 @@ __device__ inline void run_value_epilogue_warps(
                 addr.value_mma_mbar + stage * static_cast<int>(sizeof(uint64_t)),
                 phase);
         }
-        __syncwarp();
+        wg_sync(12 + value_wg);
+
         tcgen05_fence_after_thread_sync();
         const int dim_in_tile = value_epi_wg_id * 32 + lane;
 
         if (s.stage_valid[stage] > 0 && dim_in_tile < kValMmaMTile) {
-            const int lane_base = 0;
             for (int tile = 0; tile < kValMmaMTiles; ++tile) {
                 float vals[16];
                 const int tmem_col_base =
                     static_cast<int>(static_cast<uint32_t>(s.tmem_addr_scratch)) +
                     kValueTmemBase + tile * kValTmemColsPerTile;
-                tcgen05_ld_32x32b_16(lane_base, tmem_col_base, vals);
+                tcgen05_ld_32x32b_16(0, tmem_col_base, vals);
                 tcgen05_wait_ld();
                 #pragma unroll
                 for (int head = 0; head < kNumHeads; ++head) {
@@ -740,7 +740,7 @@ __device__ inline void run_value_epilogue_warps(
                 }
             }
         }
-        __syncwarp();
+        wg_sync(12 + value_wg);
         if (value_epi_wg_id == 0 && lane == 0) {
             mbarrier_arrive(addr.value_epi_mbar + stage * static_cast<int>(sizeof(uint64_t)));
         }
