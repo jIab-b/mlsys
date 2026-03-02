@@ -637,12 +637,11 @@ __device__ inline void update_softmax(
         const float m_tile  = warp_reduce_max(m_local);
         const float m_prev  = s.m_state[head];
         const float l_prev  = s.l_state[head];
-        const float m_new   = fmaxf(m_prev, m_tile);
-        const float m_new_b = __shfl_sync(0xffffffff, m_new, 0);
-        const float alpha   = (m_prev == -INFINITY) ? 0.0f : exp2f(m_prev - m_new_b);
+        const float m_new = fmaxf(m_prev, m_tile);
+        const float alpha = (m_prev == -INFINITY) ? 0.0f : exp2f(m_prev - m_new);
 
-        const float w0 = v0 ? exp2f(s0 - m_new_b) : 0.0f;
-        const float w1 = v1 ? exp2f(s1 - m_new_b) : 0.0f;
+        const float w0 = v0 ? exp2f(s0 - m_new) : 0.0f;
+        const float w1 = v1 ? exp2f(s1 - m_new) : 0.0f;
         s.attn_weights[(stage * kStageTokens + lane     ) * kNumHeads + head] = float_to_bf16(w0);
         s.attn_weights[(stage * kStageTokens + lane + 32) * kNumHeads + head] = float_to_bf16(w1);
         const float l_tile = warp_reduce_sum(w0 + w1);
@@ -650,7 +649,7 @@ __device__ inline void update_softmax(
         if (lane == 0) {
             const float l_new = l_prev * alpha + l_tile;
             s.stage_alpha[stage * kNumHeads + head] = alpha;
-            s.m_state[head] = m_new_b;
+            s.m_state[head] = m_new;
             s.l_state[head] = l_new;
             if (is_last_stage) {
                 lse_ptr[head] = (l_new > 0.0f && m_new_b != -INFINITY)
