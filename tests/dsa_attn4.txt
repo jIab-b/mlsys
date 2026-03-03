@@ -14,22 +14,22 @@ Running on:
 ## Benchmarks:
 ```
 batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ⏱ 164.7 ± 0.34 µs
- ⚡ 160.4 µs 🐌 178.2 µs
- mismatch found! custom implementation doesn't match reference: out: 8192/8192 mismatches; first_idx=(0, 0, 0); got=nan; ref=0.121582; abs_diff=nan; lse: 16/16 mismatches; first_idx=(0, 0); got=11.29044; ref=13.02796; abs_diff=1.737524
- ❌ mismatch found! custom implementation doesn't match reference: out: 8192/8192 mismatches; first_idx=(0, 0, 0); got=nan; ref=0.121582; abs_diff=nan; lse: 16/16 mismatches; first_idx=(0, 0); got=11.29044; ref=13.02796; abs_diff=1.737524
+ ⏱ 172.4 ± 0.41 µs
+ ⚡ 167.9 µs 🐌 188.4 µs
+ mismatch found! custom implementation doesn't match reference: out: 8192/8192 mismatches; first_idx=(0, 0, 0); got=nan; ref=0.121582; abs_diff=nan; lse: 16/16 mismatches; first_idx=(0, 0); got=11.32556; ref=13.02796; abs_diff=1.702402
+ ❌ mismatch found! custom implementation doesn't match reference: out: 8192/8192 mismatches; first_idx=(0, 0, 0); got=nan; ref=0.121582; abs_diff=nan; lse: 16/16 mismatches; first_idx=(0, 0); got=11.32556; ref=13.02796; abs_diff=1.702402
 
 batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ⏱ 125.2 ± 0.32 µs
- ⚡ 118.8 µs 🐌 141.3 µs
- mismatch found! custom implementation doesn't match reference: out: 65355/65536 mismatches; first_idx=(0, 0, 0); got=nan; ref=-0.05371094; abs_diff=nan; lse: 128/128 mismatches; first_idx=(0, 0); got=-inf; ref=13.21335; abs_diff=inf
- ❌ mismatch found! custom implementation doesn't match reference: out: 65355/65536 mismatches; first_idx=(0, 0, 0); got=nan; ref=-0.05371094; abs_diff=nan; lse: 128/128 mismatches; first_idx=(0, 0); got=-inf; ref=13.21335; abs_diff=inf
+ ⏱ 128.2 ± 0.49 µs
+ ⚡ 121.9 µs 🐌 156.6 µs
+ mismatch found! custom implementation doesn't match reference: out: 65332/65536 mismatches; first_idx=(0, 0, 0); got=nan; ref=-0.05371094; abs_diff=nan; lse: 128/128 mismatches; first_idx=(0, 0); got=-inf; ref=13.21335; abs_diff=inf
+ ❌ mismatch found! custom implementation doesn't match reference: out: 65332/65536 mismatches; first_idx=(0, 0, 0); got=nan; ref=-0.05371094; abs_diff=nan; lse: 128/128 mismatches; first_idx=(0, 0); got=-inf; ref=13.21335; abs_diff=inf
 
 batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ⏱ 140.7 ± 0.36 µs
- ⚡ 135.0 µs 🐌 153.6 µs
- mismatch found! custom implementation doesn't match reference: out: 130621/131072 mismatches; first_idx=(0, 0, 0); got=nan; ref=0.04443359; abs_diff=nan; lse: 256/256 mismatches; first_idx=(0, 0); got=-inf; ref=13.25865; abs_diff=inf
- ❌ mismatch found! custom implementation doesn't match reference: out: 130621/131072 mismatches; first_idx=(0, 0, 0); got=nan; ref=0.04443359; abs_diff=nan; lse: 256/256 mismatches; first_idx=(0, 0); got=-inf; ref=13.25865; abs_diff=inf
+ ⏱ 141.5 ± 0.36 µs
+ ⚡ 137.2 µs 🐌 161.8 µs
+ mismatch found! custom implementation doesn't match reference: out: 130587/131072 mismatches; first_idx=(0, 0, 0); got=nan; ref=0.04443359; abs_diff=nan; lse: 256/256 mismatches; first_idx=(0, 0); got=-inf; ref=13.25865; abs_diff=inf
+ ❌ mismatch found! custom implementation doesn't match reference: out: 130587/131072 mismatches; first_idx=(0, 0, 0); got=nan; ref=0.04443359; abs_diff=nan; lse: 256/256 mismatches; first_idx=(0, 0); got=-inf; ref=13.25865; abs_diff=inf
 ```
 
 ## Program stdout:

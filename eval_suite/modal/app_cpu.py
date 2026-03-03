@@ -48,7 +48,11 @@ TASKS = {k: k for k in TASK_PATHS}
 image = modal.Image.from_registry(BASE_IMAGE).env({
     "HF_HOME": "/kernel_data/hf",
     "HUGGINGFACE_HUB_CACHE": "/kernel_data/hf",
-}).run_commands(
+}).uv_pip_install(
+    "nvidia-cutlass-dsl",
+    "nvidia-cutlass",
+    "nvtx",
+).run_commands(
     "ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && "
     "echo /usr/local/cuda/lib64/stubs > /etc/ld.so.conf.d/cuda-stubs.conf && ldconfig"
 )
@@ -430,7 +434,15 @@ def main():
         compile_result = compile_kernel_remote.remote(submission_code, workspace)
         if not compile_result["ok"]:
             err = compile_result.get("stderr", "")
-            print(f"Compilation failed:\n{err}", file=sys.stderr)
+            stdout = compile_result.get("stdout", "")
+            formatted = _build_formatted(
+                {"compile": "fail", "compile_error": err.splitlines()[-1] if err else "unknown"},
+                stdout, err, None, args.mode,
+            )
+            Path(args.output).write_text(formatted)
+            if not args.suppress_stdout:
+                print(formatted)
+            print(f"Output saved to {args.output}", file=sys.stderr)
             sys.exit(1)
         print("Compile done. Starting GPU eval...", file=sys.stderr)
 

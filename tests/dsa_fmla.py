@@ -61,6 +61,7 @@ constexpr int kStageTokens = 64;
 constexpr int kNumStages = 2;
 
 constexpr int kMmaK = 32;
+constexpr int kSw128DescK = 64;  // SW128 atom requires 64-wide K tile for tile_to_shape
 constexpr int kMmaItersCkv = kHeadDimCkv / kMmaK;
 constexpr int kMmaItersKpe = kHeadDimKpe / kMmaK;
 constexpr int kValMmaMTile = 128;
@@ -358,6 +359,9 @@ __device__ inline void init_pipeline_barriers(
         s.tmem_addr_scratch = 0;
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
+
+        // Make Q shared writes visible to tcgen05 async proxy before score MMA.
+    fence_proxy_async_shared_cta();
     __syncthreads();
 }
 
@@ -505,10 +509,10 @@ __device__ inline void run_mma_warps(
 
             if (s.stage_valid[stage] > 0) {
                 const int tmem_d = tmem_base + tmem_slot * kStageTokens;
-                // Kc: K-major, 128B swizzle, single MMA tile [kStageTokens, kMmaK]
+                // Kc: K-major, 128B swizzle descriptor tile [64,64], execute in K=32 steps.
                 uint64_t kc_desc = make_umma_desc_from_smem<
                     cute::UMMA::Major::K, cute::UMMA::Layout_K_SW128_Atom<__nv_bfloat16>,
-                    kStageTokens, kMmaK * 2>( // k = k * 2 for swizzled layout compatability
+                    kStageTokens, kSw128DescK>(
                     addr.kc_stage + stage * kStageTokens * kCkvRowBytes);
                 // Q_nope: MN-major (transposed), single MMA tile [kNumHeads, kMmaK]
                 uint64_t qn_desc = make_umma_desc_from_smem<
@@ -554,18 +558,18 @@ __device__ inline void run_mma_warps(
 
             const bool valid_stage = (s.stage_valid[stage] > 0);
             if (valid_stage) {
-                // attn_weights: MN-major (transposed), single MMA tile [kNumHeads, kMmaK]
+                // attn_weights: K-major (non-transposed), non-swizzled tile [kNumHeads, kMmaK]
                 const uint64_t w_desc_base = make_umma_desc_from_smem<
-                    cute::UMMA::Major::MN, cute::UMMA::Layout_MN_INTER_Atom<__nv_bfloat16>,
+                    cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
                     kNumHeads, kMmaK>(
                     addr.attn_weights + stage * kStageTokens * kNumHeads * sizeof(__nv_bfloat16));
 
                 for (int tile = 0; tile < kValMmaMTiles; ++tile) {
                     const int tmem_d = tmem_base + kValueTmemBase + tile * kNumHeads;
-                    // Kc slice: K-major, 128B swizzle, single MMA tile [kStageTokens, kMmaK]
+                    // Kc value slice: transposed logical view, 128B swizzle descriptor tile [128,64].
                     uint64_t kc_col_desc = make_umma_desc_from_smem<
                         cute::UMMA::Major::K, cute::UMMA::Layout_K_SW128_Atom<__nv_bfloat16>,
-                        kStageTokens, kMmaK * 2>(
+                        kValMmaMTile, kSw128DescK>(
                         addr.kc_stage + stage * kStageTokens * kCkvRowBytes +
                         tile * kValMmaMTile * sizeof(__nv_bfloat16));
                     uint64_t w_desc = w_desc_base;

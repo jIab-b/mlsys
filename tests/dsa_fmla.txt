@@ -1,0 +1,37 @@
+"**Modal ❌ failure**
+> ❌ Benchmarking failed
+
+Running on:
+* GPU: `NVIDIA B200`
+* CPU: `x86_64`
+* Device count: `1`
+* Runtime: `CUDA`
+* Platform: `Linux-4.4.0-x86_64-with-glibc2.35`
+* Torch: `2.9.1+cu130`
+* Hostname: `modal`
+
+
+## Benchmarks:
+```
+batch: 1; num_pages: 32; seq_len: 2048; seed: 100
+ ⏱ 146.7 ± 0.31 µs
+ ⚡ 143.4 µs 🐌 163.8 µs
+ mismatch found! custom implementation doesn't match reference: out: 8192/8192 mismatches; first_idx=(0, 0, 0); got=nan; ref=0.121582; abs_diff=nan; lse: 16/16 mismatches; first_idx=(0, 0); got=11.31159; ref=13.02796; abs_diff=1.716372
+ ❌ mismatch found! custom implementation doesn't match reference: out: 8192/8192 mismatches; first_idx=(0, 0, 0); got=nan; ref=0.121582; abs_diff=nan; lse: 16/16 mismatches; first_idx=(0, 0); got=11.31159; ref=13.02796; abs_diff=1.716372
+
+batch: 8; num_pages: 64; seq_len: 4096; seed: 101
+ ⏱ 120.2 ± 0.32 µs
+ ⚡ 115.7 µs 🐌 131.1 µs
+ mismatch found! custom implementation doesn't match reference: out: 65374/65536 mismatches; first_idx=(0, 0, 0); got=nan; ref=-0.05371094; abs_diff=nan; lse: 128/128 mismatches; first_idx=(0, 0); got=-inf; ref=13.21335; abs_diff=inf
+ ❌ mismatch found! custom implementation doesn't match reference: out: 65374/65536 mismatches; first_idx=(0, 0, 0); got=nan; ref=-0.05371094; abs_diff=nan; lse: 128/128 mismatches; first_idx=(0, 0); got=-inf; ref=13.21335; abs_diff=inf
+
+batch: 16; num_pages: 128; seq_len: 8192; seed: 102
+ ⏱ 133.2 ± 0.33 µs
+ ⚡ 128.0 µs 🐌 146.4 µs
+ mismatch found! custom implementation doesn't match reference: out: 130549/131072 mismatches; first_idx=(0, 0, 0); got=0; ref=0.04443359; abs_diff=0.04443359; lse: 256/256 mismatches; first_idx=(0, 0); got=-inf; ref=13.25865; abs_diff=inf
+ ❌ mismatch found! custom implementation doesn't match reference: out: 130549/131072 mismatches; first_idx=(0, 0, 0); got=0; ref=0.04443359; abs_diff=0.04443359; lse: 256/256 mismatches; first_idx=(0, 0); got=-inf; ref=13.25865; abs_diff=inf
+```
+
+## Program stdout:
+```
+```"
