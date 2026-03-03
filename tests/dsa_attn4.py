@@ -772,7 +772,10 @@ __device__ inline void writeback_outputs_splitk(
     float* o_token = o_dst + 1LL * token * kNumHeads * kHeadDimCkv;
 
     for (int i = tid; i < kNumHeads * kHeadDimCkv; i += kThreadsPerBlock) {
-        o_token[i] = s.o_accum[i];
+        const int head = i / kHeadDimCkv;
+        const float l = s.l_state[head];
+        const float v = s.o_accum[i];
+        o_token[i] = (l > 0.0f) ? (v / l) : 0.0f;
     }
 }
 
