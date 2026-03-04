@@ -1,0 +1,21 @@
+ok so go over the tma/ mma , this is split into tma main load, the umma smem descritpor, 
+and the mma itself, we have 3 mmas, q_rope (a_kct * q_rope (64 , 512) * ( 512 , 16) ), 
+q_nope (a_kct * q_nope (64 , 512 ) * (512 , 16) ) , and the q_rope and q_nope here are 
+just loaded once at startup , not per stage. (this is first mma warp, done synchronously), 
+and the value mma is  4 * (a_kct / 4)^T * attn_weights  (128 , 64 ) * (64 , 16) ,
+
+
+for this to be correct we need to load data in the correct tma format , and then ensure our
+smem descriptors match , and in the case of value mma we must also transpose properly. 
+
+in the first 2 mmas, we do both back to back and accum to same D tmem buffer of shape 
+(64, 16) , with tmem mapping as tmem [rows] [cols] as [heads] [tokens] , and layout such each 
+thread in a warpgroup (4 warps of warp % 0-3 ) can access a single row of its aligned tmem, 
+and the 64 heads are stored as each warp only having threads 0 - 15 / 32 threads storing 
+any real data. so in practie, we have 16 threads from 4 warps storing 16 tokens from a single 
+head val. next, we need to apply rolling softmax to these loaded data , update previous state softmax
+/ max val / weights val for next mma, idk really how this works but it should be done in the quickest
+way possible. for value mma , we do not waste any threads, the 128 16 outpus are acc'd to 
+4 sets of 16 wide tmem cols, each storign the one /14 of the 512 , 16 (hidden state , num_heads)
+final output, we then need to load this , concat the values and apply scale, again dont really know
+how this works but it follows the same patterns as prior ep.

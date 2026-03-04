@@ -246,6 +246,23 @@ __device__ inline void tma_2d_gmem2smem(
         : "memory");
 }
 
+__device__ inline void tma_3d_gmem2smem(
+    int dst_smem_addr,
+    const void* tmap_ptr,
+    int x,
+    int y,
+    int z,
+    int mbar_addr,
+    uint64_t cache_policy
+) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
+        "[%0], [%1, {%2, %3, %4}], [%5], %6;"
+        :
+        : "r"(dst_smem_addr), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr), "l"(cache_policy)
+        : "memory");
+}
+
 __device__ inline void tma_2d_gmem2smem_gather4(
     int dst_smem_addr,
     const void* tmap_ptr,
@@ -337,21 +354,8 @@ __device__ inline __nv_bfloat16 float_to_bf16(float x) {
 
 __device__ inline void init_query_and_state(
     SmemLayout& s,
-    int tid,
-    int token,
-    const __nv_bfloat16* q_nope,
-    const __nv_bfloat16* q_pe
+    int tid
 ) {
-    const __nv_bfloat16* qn_src = q_nope + 1LL * token * kNumHeads * kHeadDimCkv;
-    const __nv_bfloat16* qp_src = q_pe + 1LL * token * kNumHeads * kHeadDimKpe;
-    // Stage Q in [N, K] order.
-    for (int i = tid; i < kNumHeads * kHeadDimCkv; i += kThreadsPerBlock) {
-        s.q_nope[i] = qn_src[i];
-    }
-    for (int i = tid; i < kNumHeads * kHeadDimKpe; i += kThreadsPerBlock) {
-        s.q_pe[i] = qp_src[i];
-    }
-
     if (tid < kNumHeads) {
         s.m_state[tid] = -INFINITY;
         s.l_state[tid] = 0.0f;
@@ -381,8 +385,34 @@ __device__ inline void init_pipeline_barriers(
         s.tmem_addr_scratch = 0;
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
+    __syncthreads();
+}
 
-        // Make Q shared writes visible to tcgen05 async proxy before score MMA.
+__device__ inline void load_q_data(
+    SmemLayout& s,
+    int tid,
+    int token,
+    const __nv_bfloat16* q_nope_gmem,
+    const __nv_bfloat16* q_pe_gmem
+) {
+    const __nv_bfloat16* qn_token =
+        q_nope_gmem + 1LL * token * kNumHeads * kHeadDimCkv;
+    const __nv_bfloat16* qp_token =
+        q_pe_gmem + 1LL * token * kNumHeads * kHeadDimKpe;
+
+    // Load Q and transpose from [N,K] in global to [K,N] in shared (K-major).
+    for (int idx = tid; idx < kNumHeads * kHeadDimCkv; idx += kThreadsPerBlock) {
+        const int h = idx / kHeadDimCkv;
+        const int k = idx - h * kHeadDimCkv;
+        s.q_nope[k * kNumHeads + h] = qn_token[idx];
+    }
+    for (int idx = tid; idx < kNumHeads * kHeadDimKpe; idx += kThreadsPerBlock) {
+        const int h = idx / kHeadDimKpe;
+        const int k = idx - h * kHeadDimKpe;
+        s.q_pe[k * kNumHeads + h] = qp_token[idx];
+    }
+
+    // Make generic shared writes visible to tcgen05 async proxy before score MMA.
     fence_proxy_async_shared_cta();
     __syncthreads();
 }
@@ -537,10 +567,10 @@ __device__ inline void run_mma_warps(
                     cute::UMMA::Major::K, cute::UMMA::Layout_K_SW128_Atom<__nv_bfloat16>,
                     kStageTokens, kSw128DescK>(
                     addr.kc_stage + stage * kStageTokens * kCkvRowBytes);
-                // Q_nope: MN-major (transposed logical use), tile [kNumHeads, kMmaK].
+                // Q_nope: K-major (stored as [K,N] = [512,16]), tile [kMmaK, kNumHeads].
                 uint64_t qn_desc = make_umma_desc_from_smem<
-                    cute::UMMA::Major::MN, cute::UMMA::Layout_MN_INTER_Atom<__nv_bfloat16>,
-                    kNumHeads, kMmaK>(addr.q_nope);
+                    cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
+                    kMmaK, kNumHeads>(addr.q_nope);
                 #pragma unroll
                 for (int ki = 0; ki < kMmaItersCkv; ++ki) {
                     tcgen05_mma_f16(tmem_d, kc_desc, qn_desc, kScoreIdesc, (ki > 0) ? 1 : 0);
@@ -553,10 +583,10 @@ __device__ inline void run_mma_warps(
                     cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
                     kStageTokens, kMmaK>(
                     addr.kp_stage + stage * kStageTokens * kKpeRowBytes);
-                // Q_pe: MN-major (transposed logical use), tile [kNumHeads, kMmaK].
+                // Q_pe: K-major (stored as [K,N] = [64,16]), tile [kMmaK, kNumHeads].
                 uint64_t qp_desc = make_umma_desc_from_smem<
-                    cute::UMMA::Major::MN, cute::UMMA::Layout_MN_INTER_Atom<__nv_bfloat16>,
-                    kNumHeads, kMmaK>(addr.q_pe);
+                    cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
+                    kMmaK, kNumHeads>(addr.q_pe);
                 #pragma unroll
                 for (int ki = 0; ki < kMmaItersKpe; ++ki) {
                     tcgen05_mma_f16(tmem_d, kp_desc, qp_desc, kScoreIdesc, 1);
@@ -856,8 +886,9 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_sparse_attn_kernel_v3(
     SmemLayout& s = smem_storage[0];
     const SmemAddrs addr = init_smem_addrs(&s);
 
-    init_query_and_state(s, tid, token, q_nope, q_pe);
+    init_query_and_state(s, tid);
     init_pipeline_barriers(s, addr, warp_id);
+    load_q_data(s, tid, token, q_nope, q_pe);
 
     run_producer_warp(
         s, addr, lane, warp_id, token, sparse_indices,
