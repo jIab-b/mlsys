@@ -89,11 +89,10 @@ struct __align__(1024) SmemLayout {
     __nv_bfloat16 kc_stage[kNumStages * kStageTokens * kHeadDimCkv];
     __nv_bfloat16 kp_stage[kNumStages * kStageTokens * kHeadDimKpe];
     int stage_indices[kNumStages * kStageTokens];
-    int stage_valid[kNumStages];
     __nv_bfloat16 attn_weights[kNumStages * kStageTokens * kNumHeads];
     float score_buf[kNumStages * kStageTokens * kNumHeads];
-    float score_m_partial[2 * kNumHeads];
-    float score_l_partial[2 * kNumHeads];
+    float score_m_partial[4 * kNumHeads];
+    float score_l_partial[4 * kNumHeads];
     float score_m_new[kNumHeads];
     float stage_alpha[kNumStages * kNumHeads];
     float m_state[kNumHeads];
@@ -454,15 +453,6 @@ __device__ inline void run_producer_warp(
         }
         __syncwarp();
 
-        if (lane == 0) {
-            int valid_count = 0;
-            for (int i = 0; i < kStageTokens; ++i) {
-                valid_count += (s.stage_indices[stage * kStageTokens + i] >= 0) ? 1 : 0;
-            }
-            s.stage_valid[stage] = valid_count;
-        }
-        __syncwarp();
-
         // Make producer-warp generic shared writes visible to tcgen05 async proxy.
         fence_proxy_async_shared_cta();
         // Order producer shared writes before stage-ready signaling to consumer MMA warp.
@@ -487,7 +477,7 @@ __device__ inline void run_mma_warps(
 
     constexpr uint32_t kScoreIdesc = (1U << 7U) |
                                      (1U << 10U) |
-                               //      (1U << 16U) |
+                                 //    (1U << 16U) |
                                      (1U << 4U) |
                                      ((uint32_t)(kNumHeads >> 3U) << 17U) |
                                      ((uint32_t)(kStageTokens >> 4U) << 24U);
@@ -520,44 +510,40 @@ __device__ inline void run_mma_warps(
                     reuse_phase);
             }
 
-            if (s.stage_valid[stage] > 0) {
-                const int tmem_d = tmem_base + tmem_slot * kStageTokens;
+            const int tmem_d = tmem_base + tmem_slot * kStageTokens;
 
-                uint64_t kc_desc = make_umma_desc_from_smem<
-                    cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
-                    kStageTokens, kMmaK>(
-                    addr.kc_stage + stage * kStageTokens * kCkvRowBytes);
+            uint64_t kc_desc = make_umma_desc_from_smem<
+                cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
+                kStageTokens, kMmaK>(
+                addr.kc_stage + stage * kStageTokens * kCkvRowBytes);
 
-                uint64_t qn_desc = make_umma_desc_from_smem<
-                    cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
-                    kNumHeads, kMmaK>(addr.q_nope);
-                #pragma unroll
-                for (int ki = 0; ki < kMmaItersCkv; ++ki) {
-                    tcgen05_mma_f16(tmem_d, kc_desc, qn_desc, kScoreIdesc, (ki > 0) ? 1 : 0);
-                    kc_desc += (kMmaK >> 3);
-                    qn_desc += (kMmaK >> 3);
-                }
-
-                // Kp: K-major, no swizzle, tile [kStageTokens, kMmaK]
-                uint64_t kp_desc = make_umma_desc_from_smem<
-                    cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
-                    kStageTokens, kMmaK>(
-                    addr.kp_stage + stage * kStageTokens * kKpeRowBytes);
-                // Q_pe: K-major, tile [kNumHeads, kMmaK]
-                uint64_t qp_desc = make_umma_desc_from_smem<
-                    cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
-                    kNumHeads, kMmaK>(addr.q_pe);
-                #pragma unroll
-                for (int ki = 0; ki < kMmaItersKpe; ++ki) {
-                    tcgen05_mma_f16(tmem_d, kp_desc, qp_desc, kScoreIdesc, 1);
-                    kp_desc += (kMmaK >> 4);
-                    qp_desc += (kMmaK >> 4);
-                }
-
-                tcgen05_commit(addr.score_mma_mbar + stage * sizeof(uint64_t));
-            } else {
-                mbarrier_arrive(addr.score_mma_mbar + stage * sizeof(uint64_t));
+            uint64_t qn_desc = make_umma_desc_from_smem<
+                cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
+                kNumHeads, kMmaK>(addr.q_nope);
+            #pragma unroll
+            for (int ki = 0; ki < kMmaItersCkv; ++ki) {
+                tcgen05_mma_f16(tmem_d, kc_desc, qn_desc, kScoreIdesc, (ki > 0) ? 1 : 0);
+                kc_desc += kStageTokens * kMmaK * sizeof(__nv_bfloat16) / 16;
+                qn_desc += kNumHeads * kMmaK * sizeof(__nv_bfloat16) / 16;
             }
+
+            // Kp: K-major, no swizzle, tile [kStageTokens, kMmaK]
+            uint64_t kp_desc = make_umma_desc_from_smem<
+                cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
+                kStageTokens, kMmaK>(
+                addr.kp_stage + stage * kStageTokens * kKpeRowBytes);
+            // Q_pe: K-major, tile [kNumHeads, kMmaK]
+            uint64_t qp_desc = make_umma_desc_from_smem<
+                cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
+                kNumHeads, kMmaK>(addr.q_pe);
+            #pragma unroll
+            for (int ki = 0; ki < kMmaItersKpe; ++ki) {
+                tcgen05_mma_f16(tmem_d, kp_desc, qp_desc, kScoreIdesc, 1);
+                kp_desc += kStageTokens * kMmaK * sizeof(__nv_bfloat16) / 16;
+                qp_desc += kNumHeads * kMmaK * sizeof(__nv_bfloat16) / 16;
+            }
+
+            tcgen05_commit(addr.score_mma_mbar + stage * sizeof(uint64_t));
         }
     }
     if (warp_id == kValueMmaWarp && lane == 0) {
@@ -571,34 +557,29 @@ __device__ inline void run_mma_warps(
             tcgen05_fence_after_thread_sync();
             const int tmem_base = s.tmem_addr_scratch;
 
-            const bool valid_stage = (s.stage_valid[stage] > 0);
-            if (valid_stage) {
-                // attn_weights: K-major, no swizzle, tile [kNumHeads, kMmaK]
-                const uint64_t w_desc_base = make_umma_desc_from_smem<
+            // attn_weights: K-major, no swizzle, tile [kNumHeads, kMmaK]
+            const uint64_t w_desc_base = make_umma_desc_from_smem<
+                cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
+                kNumHeads, kMmaK>(
+                addr.attn_weights + stage * kStageTokens * kNumHeads * sizeof(__nv_bfloat16));
+
+            for (int tile = 0; tile < kValMmaMTiles; ++tile) {
+                const int tmem_d = tmem_base + kValueTmemBase + tile * kNumHeads;
+                // Kc value slice: K-major, no swizzle, tile [kValMmaMTile, kMmaK]
+                uint64_t kc_col_desc = make_umma_desc_from_smem<
                     cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
-                    kNumHeads, kMmaK>(
-                    addr.attn_weights + stage * kStageTokens * kNumHeads * sizeof(__nv_bfloat16));
+                    kValMmaMTile, kMmaK>(
+                    addr.kc_stage + stage * kStageTokens * kCkvRowBytes +
+                    tile * kValMmaMTile * sizeof(__nv_bfloat16));
+                uint64_t w_desc = w_desc_base;
 
-                for (int tile = 0; tile < kValMmaMTiles; ++tile) {
-                    const int tmem_d = tmem_base + kValueTmemBase + tile * kNumHeads;
-                    // Kc value slice: K-major, no swizzle, tile [kValMmaMTile, kMmaK]
-                    uint64_t kc_col_desc = make_umma_desc_from_smem<
-                        cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
-                        kValMmaMTile, kMmaK>(
-                        addr.kc_stage + stage * kStageTokens * kCkvRowBytes +
-                        tile * kValMmaMTile * sizeof(__nv_bfloat16));
-                    uint64_t w_desc = w_desc_base;
-
-                    for (int ki = 0; ki < kValMmaKIters; ++ki) {
-                        tcgen05_mma_f16(tmem_d, kc_col_desc, w_desc, kValueIdesc, (ki > 0) ? 1 : 0);
-                        kc_col_desc += (kMmaK >> 4);
-                        w_desc += (kMmaK >> 4);
-                    }
+                for (int ki = 0; ki < kValMmaKIters; ++ki) {
+                    tcgen05_mma_f16(tmem_d, kc_col_desc, w_desc, kValueIdesc, (ki > 0) ? 1 : 0);
+                    kc_col_desc += kValMmaMTile * kMmaK * sizeof(__nv_bfloat16) / 16;
+                    w_desc += kNumHeads * kMmaK * sizeof(__nv_bfloat16) / 16;
                 }
-                tcgen05_commit(addr.value_mma_mbar + stage * sizeof(uint64_t));
-            } else {
-                mbarrier_arrive(addr.value_mma_mbar + stage * sizeof(uint64_t));
             }
+            tcgen05_commit(addr.value_mma_mbar + stage * sizeof(uint64_t));
         }
     }
 }
@@ -621,6 +602,20 @@ __device__ inline float warp_reduce_sum(float v) {
     return v;
 }
 
+__device__ inline float half_warp_reduce_max(float v) {
+    #pragma unroll
+    for (int mask = 8; mask > 0; mask >>= 1)
+        v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, mask));
+    return v;
+}
+
+__device__ inline float half_warp_reduce_sum(float v) {
+    #pragma unroll
+    for (int mask = 8; mask > 0; mask >>= 1)
+        v += __shfl_xor_sync(0xffffffff, v, mask);
+    return v;
+}
+
 __device__ inline void score_ep_stage_regs(
     SmemLayout& s,
     int lane,
@@ -631,39 +626,28 @@ __device__ inline void score_ep_stage_regs(
     bool is_last_stage,
     float* lse_ptr
 ) {
-    const int ep_slot = warp_id;
-    const bool active_slot = (ep_slot < 2);
-    const int lane_base = ep_slot * 32;
-    const int tok = lane_base + lane;
+    // tcgen05.ld.32x32b.x16: lanes 0-15 from each of 4 warps hold data.
+    // Each active thread holds 16 f32 values = 16 heads for one token.
+    // tok = warp_id * 16 + lane, active when lane < 16.
+    const bool active = (lane < 16);
+    const int tok = warp_id * 16 + lane;
     const int tmem_col_base = s.tmem_addr_scratch + tmem_slot * kStageTokens;
     float vals[16];
-    if (active_slot && s.stage_valid[stage] > 0) {
-        tcgen05_ld_32x32b_16(lane_base, tmem_col_base, vals);
-        tcgen05_wait_ld();
-    }
+    tcgen05_ld_32x32b_16(warp_id * 32, tmem_col_base, vals);
+    tcgen05_wait_ld();
 
+    // --- max reduction ---
     float m_local[kNumHeads];
     #pragma unroll
     for (int head = 0; head < kNumHeads; ++head) {
-        m_local[head] = -INFINITY;
-    }
-    if (active_slot) {
-        const bool valid = (tok < kStageTokens) && (s.stage_indices[stage * kStageTokens + tok] >= 0);
-        if (valid) {
-            #pragma unroll
-            for (int head = 0; head < kNumHeads; ++head) {
-                m_local[head] = vals[head] * sm_scale_log2e;
-            }
-        }
+        m_local[head] = active ? vals[head] * sm_scale_log2e : -INFINITY;
     }
 
-    if (active_slot) {
-        #pragma unroll
-        for (int head = 0; head < kNumHeads; ++head) {
-            const float m_warp = warp_reduce_max(m_local[head]);
-            if (lane == 0) {
-                s.score_m_partial[ep_slot * kNumHeads + head] = m_warp;
-            }
+    #pragma unroll
+    for (int head = 0; head < kNumHeads; ++head) {
+        const float m_warp = half_warp_reduce_max(m_local[head]);
+        if (lane == 0) {
+            s.score_m_partial[warp_id * kNumHeads + head] = m_warp;
         }
     }
     wg_sync(10);
@@ -671,9 +655,10 @@ __device__ inline void score_ep_stage_regs(
     if (warp_id == 0 && lane == 0) {
         #pragma unroll
         for (int head = 0; head < kNumHeads; ++head) {
-            const float m_tile = fmaxf(
-                s.score_m_partial[0 * kNumHeads + head],
-                s.score_m_partial[1 * kNumHeads + head]);
+            float m_tile = s.score_m_partial[head];
+            #pragma unroll
+            for (int w = 1; w < 4; ++w)
+                m_tile = fmaxf(m_tile, s.score_m_partial[w * kNumHeads + head]);
             const float m_prev = s.m_state[head];
             const float m_new = fmaxf(m_prev, m_tile);
             const float alpha = (m_prev == -INFINITY) ? 0.0f : exp2f(m_prev - m_new);
@@ -683,35 +668,28 @@ __device__ inline void score_ep_stage_regs(
     }
     wg_sync(10);
 
+    // --- softmax weights + l reduction ---
     float l_local[kNumHeads];
     #pragma unroll
     for (int head = 0; head < kNumHeads; ++head) {
-        l_local[head] = 0.0f;
+        float w = 0.0f;
+        if (active) {
+            const float score = vals[head] * sm_scale_log2e;
+            w = exp2f(score - s.score_m_new[head]);
+        }
+        if (active) {
+            const int base = stage * kStageTokens * kNumHeads;
+            const int dst = smem_idx_kmajor_inter(kNumHeads, head, tok);
+            s.attn_weights[base + dst] = float_to_bf16(w);
+        }
+        l_local[head] = w;
     }
 
-    if (active_slot) {
-        const bool valid = (tok < kStageTokens) && (s.stage_indices[stage * kStageTokens + tok] >= 0);
-        #pragma unroll
-        for (int head = 0; head < kNumHeads; ++head) {
-            float w = 0.0f;
-            if (valid) {
-                const float score = vals[head] * sm_scale_log2e;
-                w = exp2f(score - s.score_m_new[head]);
-            }
-            if (tok < kStageTokens) {
-                const int base = stage * kStageTokens * kNumHeads;
-                const int dst = smem_idx_kmajor_inter(kNumHeads, head, tok);
-                s.attn_weights[base + dst] = float_to_bf16(w);
-            }
-            l_local[head] = w;
-        }
-
-        #pragma unroll
-        for (int head = 0; head < kNumHeads; ++head) {
-            const float l_warp = warp_reduce_sum(l_local[head]);
-            if (lane == 0) {
-                s.score_l_partial[ep_slot * kNumHeads + head] = l_warp;
-            }
+    #pragma unroll
+    for (int head = 0; head < kNumHeads; ++head) {
+        const float l_warp = half_warp_reduce_sum(l_local[head]);
+        if (lane == 0) {
+            s.score_l_partial[warp_id * kNumHeads + head] = l_warp;
         }
     }
     wg_sync(10);
@@ -721,8 +699,10 @@ __device__ inline void score_ep_stage_regs(
         for (int head = 0; head < kNumHeads; ++head) {
             const float alpha = s.stage_alpha[stage * kNumHeads + head];
             const float l_prev = s.l_state[head];
-            const float l_tile = s.score_l_partial[0 * kNumHeads + head] +
-                                 s.score_l_partial[1 * kNumHeads + head];
+            float l_tile = s.score_l_partial[head];
+            #pragma unroll
+            for (int w = 1; w < 4; ++w)
+                l_tile += s.score_l_partial[w * kNumHeads + head];
             const float l_new = fmaf(l_prev, alpha, l_tile);
             const float m_new = s.score_m_new[head];
             s.m_state[head] = m_new;
@@ -798,7 +778,7 @@ __device__ inline void run_value_epilogue_warps(
         const int lane_base = value_epi_wg_id * 32;
         const int dim_in_tile = value_epi_wg_id * 32 + lane;
 
-        if (s.stage_valid[stage] > 0 && dim_in_tile < kValMmaMTile) {
+        if (dim_in_tile < kValMmaMTile) {
             for (int tile = 0; tile < kValMmaMTiles; ++tile) {
                 float vals[16];
                 const int tmem_col_base =

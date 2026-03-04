@@ -14,22 +14,22 @@ Running on:
 ## Benchmarks:
 ```
 batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ⏱ 4001.8 ± 3.14 µs
- ⚡ 3995.6 µs 🐌 4005.9 µs
- mismatch found! custom implementation doesn't match reference: out: 8169/8192 mismatches; first_idx=(0, 0, 0); got=-0.09960938; ref=0.121582; abs_diff=0.2211914; lse: 14/16 mismatches; first_idx=(0, 0); got=12.51894; ref=13.02796; abs_diff=0.5090265
- ❌ mismatch found! custom implementation doesn't match reference: out: 8169/8192 mismatches; first_idx=(0, 0, 0); got=-0.09960938; ref=0.121582; abs_diff=0.2211914; lse: 14/16 mismatches; first_idx=(0, 0); got=12.51894; ref=13.02796; abs_diff=0.5090265
+ ⏱ 4087.8 ± 1.18 µs
+ ⚡ 4085.8 µs 🐌 4089.9 µs
+ mismatch found! custom implementation doesn't match reference: out: 8143/8192 mismatches; first_idx=(0, 0, 0); got=-0.0402832; ref=0.121582; abs_diff=0.1618652; lse: 0/16 mismatches
+ ❌ mismatch found! custom implementation doesn't match reference: out: 8143/8192 mismatches; first_idx=(0, 0, 0); got=-0.0402832; ref=0.121582; abs_diff=0.1618652; lse: 0/16 mismatches
 
 batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ⏱ 3158.6 ± 1.36 µs
- ⚡ 3155.9 µs 🐌 3160.1 µs
- mismatch found! custom implementation doesn't match reference: out: 65241/65536 mismatches; first_idx=(0, 0, 0); got=0.03076172; ref=-0.05371094; abs_diff=0.08447266; lse: 128/128 mismatches; first_idx=(0, 0); got=12.25455; ref=13.21335; abs_diff=0.9587984
- ❌ mismatch found! custom implementation doesn't match reference: out: 65241/65536 mismatches; first_idx=(0, 0, 0); got=0.03076172; ref=-0.05371094; abs_diff=0.08447266; lse: 128/128 mismatches; first_idx=(0, 0); got=12.25455; ref=13.21335; abs_diff=0.9587984
+ ⏱ 3131.4 ± 0.01 µs
+ ⚡ 3131.4 µs 🐌 3131.4 µs
+ mismatch found! custom implementation doesn't match reference: out: 65129/65536 mismatches; first_idx=(0, 0, 0); got=0.03637695; ref=-0.05371094; abs_diff=0.09008789; lse: 0/128 mismatches
+ ❌ mismatch found! custom implementation doesn't match reference: out: 65129/65536 mismatches; first_idx=(0, 0, 0); got=0.03637695; ref=-0.05371094; abs_diff=0.09008789; lse: 0/128 mismatches
 
 batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ⏱ 3319.2 ± 0.69 µs
- ⚡ 3317.8 µs 🐌 3319.9 µs
- mismatch found! custom implementation doesn't match reference: out: 130455/131072 mismatches; first_idx=(0, 0, 0); got=0.1040039; ref=0.04443359; abs_diff=0.05957031; lse: 255/256 mismatches; first_idx=(0, 0); got=12.37484; ref=13.25865; abs_diff=0.8838129
- ❌ mismatch found! custom implementation doesn't match reference: out: 130455/131072 mismatches; first_idx=(0, 0, 0); got=0.1040039; ref=0.04443359; abs_diff=0.05957031; lse: 255/256 mismatches; first_idx=(0, 0); got=12.37484; ref=13.25865; abs_diff=0.8838129
+ ⏱ 3267.3 ± 1.39 µs
+ ⚡ 3264.5 µs 🐌 3268.7 µs
+ mismatch found! custom implementation doesn't match reference: out: 130240/131072 mismatches; first_idx=(0, 0, 0); got=0.0625; ref=0.04443359; abs_diff=0.01806641; lse: 0/256 mismatches
+ ❌ mismatch found! custom implementation doesn't match reference: out: 130240/131072 mismatches; first_idx=(0, 0, 0); got=0.0625; ref=0.04443359; abs_diff=0.01806641; lse: 0/256 mismatches
 ```
 
 ## Program stdout:
