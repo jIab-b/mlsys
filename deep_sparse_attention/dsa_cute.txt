@@ -14,22 +14,22 @@ Running on:
 ## Benchmarks:
 ```
 batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ⏱ 112.9 ± 0.56 µs
- ⚡ 104.5 µs 🐌 146.5 µs
+ ⏱ 116.9 ± 0.51 µs
+ ⚡ 108.4 µs 🐌 135.3 µs
  exact: 2/2048 positional mismatches
  set:   recall=1.0000 (0/2048 values wrong)
  ❌ exact: 2/2048 positional mismatches
 
 batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ⏱ 124.8 ± 0.64 µs
- ⚡ 116.7 µs 🐌 160.7 µs
+ ⏱ 121.0 ± 0.48 µs
+ ⚡ 114.2 µs 🐌 148.5 µs
  exact: 4/16384 positional mismatches
  set:   recall=1.0000 (0/16384 values wrong)
  ❌ exact: 4/16384 positional mismatches
 
 batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ⏱ 147.5 ± 0.88 µs
- ⚡ 137.2 µs 🐌 186.4 µs
+ ⏱ 142.3 ± 0.96 µs
+ ⚡ 135.2 µs 🐌 220.2 µs
  exact: 16/32768 positional mismatches
  set:   recall=1.0000 (0/32768 values wrong)
  ❌ exact: 16/32768 positional mismatches

@@ -1,7 +1,18 @@
-"""DSA index submission — multi-CTA + tiled top-k with CUDA graph capture."""
+"""DSA index submission — multi-CTA + tiled top-k with CUDA graph capture.
+Uses CuTe-style UMMA smem descriptors instead of hand-rolled encoding."""
 
+import os
 import torch
 from torch.utils.cpp_extension import load_inline
+
+
+def _cutlass_include_dir():
+    """Find the directory to pass to -I so that #include <cute/tensor.hpp> works."""
+    import glob, site
+    for sp in site.getsitepackages():
+        for match in glob.glob(os.path.join(sp, "**/cute/tensor.hpp"), recursive=True):
+            return os.path.dirname(os.path.dirname(match))
+    raise RuntimeError("cute/tensor.hpp not found in site-packages")
 
 _module = None
 TOPK = 2048
@@ -20,6 +31,8 @@ cuda_src = """
 #include <cstddef>
 #include <climits>
 #include <cstdint>
+
+#include <cute/tensor.hpp>
 
 constexpr int kNumHeads = 64;
 constexpr int kHeadDim = 128;
@@ -46,6 +59,7 @@ constexpr int kNumWarps = kMmaWarp + 1;
 constexpr int kThreadsPerBlock = kNumWarps * 32;
 
 constexpr int kMmaK = 32;
+constexpr int kSw128DescK = 128;  // SW128 atom K-width in fp8 elements: 128 bytes / sizeof(uint8_t)
 constexpr int kMmaIters = kHeadDim / kMmaK;
 constexpr int kDesiredDynamicSmemBytes = 120 * 1024;
 constexpr int kNumSMs = 148;
@@ -120,16 +134,14 @@ __device__ inline bool _is_ep_warp(int warp_id) {
     return warp_id < kNumEpilogueWarps;
 }
 
-__device__ inline constexpr uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3'FFFFULL) >> 4ULL;
-}
-
-__device__ inline uint64_t make_desc_kmajor_swizzle_128b(int smem_addr) {
-    const int sbo = 8 * 128;
-    return desc_encode(static_cast<uint64_t>(smem_addr)) |
-           (desc_encode(static_cast<uint64_t>(sbo)) << 32ULL) |
-           (1ULL << 46ULL) |
-           (2ULL << 61ULL);
+template <cute::UMMA::Major Major, typename SwizzleAtom, int Rows, int Cols>
+__device__ inline uint64_t make_umma_desc_from_smem(int smem_addr) {
+    auto layout = cute::tile_to_shape(SwizzleAtom{}, cute::Shape<cute::Int<Rows>, cute::Int<Cols>>{});
+    auto tensor = cute::make_tensor(
+        cute::make_smem_ptr(reinterpret_cast<uint8_t*>(smem_addr)),
+        layout
+    );
+    return static_cast<uint64_t>(cute::UMMA::make_umma_desc<Major>(tensor));
 }
 
 __device__ inline void mbarrier_init(int mbar_addr, int count) {
@@ -576,8 +588,12 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_topk_indexer_kernel(
                 const int q_a = addr.q_stage;
                 const int k_a = addr.k_stage_payload + stage * kStageTokens * kPayloadBytesPerToken;
 
-                uint64_t q_desc = make_desc_kmajor_swizzle_128b(q_a);
-                uint64_t k_desc = make_desc_kmajor_swizzle_128b(k_a);
+                uint64_t q_desc = make_umma_desc_from_smem<
+                    cute::UMMA::Major::K, cute::UMMA::Layout_K_SW128_Atom<uint8_t>,
+                    kNumHeads, kSw128DescK>(q_a);
+                uint64_t k_desc = make_umma_desc_from_smem<
+                    cute::UMMA::Major::K, cute::UMMA::Layout_K_SW128_Atom<uint8_t>,
+                    kStageTokens, kSw128DescK>(k_a);
                 const uint32_t tmem_d = static_cast<uint32_t>(tmem_slot * kStageTokens);
 
                 for (int ki = 0; ki < kMmaIters; ++ki) {
@@ -1248,7 +1264,7 @@ def _get_module():
     global _module
     if _module is None:
         _module = load_inline(
-            name="dsa_topk_indexer_ext_tiled_topk",
+            name="dsa_topk_indexer_ext_tiled_topk_cute",
             cpp_sources=cpp_decl_src,
             cuda_sources=cuda_src,
             functions=[
@@ -1261,6 +1277,7 @@ def _get_module():
                 "-gencode=arch=compute_100a,code=sm_100a",
                 "--split-compile=4",
                 "--relocatable-device-code=false",
+                f"-I{_cutlass_include_dir()}",
             ],
             extra_ldflags=["-lcuda"],
         )

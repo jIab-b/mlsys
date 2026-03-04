@@ -60,7 +60,7 @@ constexpr int kTopK = 2048;
 constexpr int kStageTokens = 64;
 constexpr int kNumStages = 2;
 
-constexpr int kMmaK = 32;
+constexpr int kMmaK = 16;
 constexpr int kSw128DescK = 64;  // SW128 atom requires 64-wide K tile for tile_to_shape
 constexpr int kMmaItersCkv = kHeadDimCkv / kMmaK;
 constexpr int kMmaItersKpe = kHeadDimKpe / kMmaK;
@@ -153,6 +153,27 @@ __device__ inline uint32_t elect_sync() {
         : "+r"(pred)
         : "r"(0xFFFFFFFF));
     return pred;
+}
+
+__device__ inline uint64_t desc_encode(uint64_t x) {
+    return (x & 0x3FFFFULL) >> 4ULL;
+}
+
+__device__ inline uint64_t make_smem_desc(int smem_addr, int lbo, int sbo, int swizzle) {
+    const uint64_t swz = static_cast<uint64_t>(swizzle & 0x7);
+    uint64_t desc = 0;
+    desc |= desc_encode(static_cast<uint64_t>(smem_addr));             // bits 0-13
+    desc |= desc_encode(static_cast<uint64_t>(lbo)) << 16ULL;          // bits 16-29
+    desc |= desc_encode(static_cast<uint64_t>(sbo)) << 32ULL;          // bits 32-45
+    desc |= 1ULL << 46ULL;                                              // bits 46-48 = 0b001
+    desc |= swz << 61ULL;                                               // bits 61-63 swizzle mode
+
+    // For swizzled modes, include base offset derived from start address.
+    if (swz == 1ULL || swz == 2ULL || swz == 4ULL || swz == 6ULL) {
+        const uint64_t base_offset = (static_cast<uint64_t>(smem_addr) >> 7ULL) & 0x7ULL;
+        desc |= base_offset << 49ULL;                                   // bits 49-51
+    }
+    return desc;
 }
 
 template <cute::UMMA::Major Major, typename SwizzleAtom, int Rows, int Cols>
@@ -323,6 +344,7 @@ __device__ inline void init_query_and_state(
 ) {
     const __nv_bfloat16* qn_src = q_nope + 1LL * token * kNumHeads * kHeadDimCkv;
     const __nv_bfloat16* qp_src = q_pe + 1LL * token * kNumHeads * kHeadDimKpe;
+    // Stage Q in [N, K] order.
     for (int i = tid; i < kNumHeads * kHeadDimCkv; i += kThreadsPerBlock) {
         s.q_nope[i] = qn_src[i];
     }
@@ -484,6 +506,7 @@ __device__ inline void run_mma_warps(
                                      ((uint32_t)(kStageTokens >> 4U) << 24U);
     constexpr uint32_t kValueIdesc = (1U << 7U) |
                                      (1U << 10U) |
+                                     (1U << 15U) |
                                      (1U << 4U) |
                                      ((uint32_t)(kNumHeads >> 3U) << 17U) |
                                      ((uint32_t)(kValMmaMTile >> 4U) << 24U);
@@ -509,12 +532,12 @@ __device__ inline void run_mma_warps(
 
             if (s.stage_valid[stage] > 0) {
                 const int tmem_d = tmem_base + tmem_slot * kStageTokens;
-                // Kc: K-major, 128B swizzle descriptor tile [64,64], execute in K=32 steps.
+                // Kc: K-major, 128B swizzle descriptor tile [64,64], execute in K=16 steps.
                 uint64_t kc_desc = make_umma_desc_from_smem<
                     cute::UMMA::Major::K, cute::UMMA::Layout_K_SW128_Atom<__nv_bfloat16>,
                     kStageTokens, kSw128DescK>(
                     addr.kc_stage + stage * kStageTokens * kCkvRowBytes);
-                // Q_nope: MN-major (transposed), single MMA tile [kNumHeads, kMmaK]
+                // Q_nope: MN-major (transposed logical use), tile [kNumHeads, kMmaK].
                 uint64_t qn_desc = make_umma_desc_from_smem<
                     cute::UMMA::Major::MN, cute::UMMA::Layout_MN_INTER_Atom<__nv_bfloat16>,
                     kNumHeads, kMmaK>(addr.q_nope);
@@ -530,7 +553,7 @@ __device__ inline void run_mma_warps(
                     cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
                     kStageTokens, kMmaK>(
                     addr.kp_stage + stage * kStageTokens * kKpeRowBytes);
-                // Q_pe: MN-major (transposed), single MMA tile [kNumHeads, kMmaK]
+                // Q_pe: MN-major (transposed logical use), tile [kNumHeads, kMmaK].
                 uint64_t qp_desc = make_umma_desc_from_smem<
                     cute::UMMA::Major::MN, cute::UMMA::Layout_MN_INTER_Atom<__nv_bfloat16>,
                     kNumHeads, kMmaK>(addr.q_pe);
@@ -835,9 +858,6 @@ __global__ __launch_bounds__(kThreadsPerBlock) void dsa_sparse_attn_kernel_v3(
 
     init_query_and_state(s, tid, token, q_nope, q_pe);
     init_pipeline_barriers(s, addr, warp_id);
-    // Make Q shared writes visible to tcgen05 async proxy before score MMA.
-    fence_proxy_async_shared_cta();
-    __syncthreads();
 
     run_producer_warp(
         s, addr, lane, warp_id, token, sparse_indices,
