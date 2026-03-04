@@ -166,6 +166,17 @@ __device__ inline uint64_t make_umma_desc_from_smem(int smem_addr) {
     return static_cast<uint64_t>(cute::UMMA::make_umma_desc<Major>(tensor));
 }
 
+__device__ inline uint64_t make_smem_desc_manual(int smem_addr, int lbo_bytes, int sbo_bytes) {
+    // PTX spec 9.7.16.4.1: matrix-descriptor-encode(x) = (x & 0x3FFFF) >> 4
+    uint64_t d = 0;
+    d |= (uint64_t)((smem_addr & 0x3FFFF) >> 4);          // bits 0-13: start addr
+    d |= (uint64_t)((lbo_bytes & 0x3FFFF) >> 4) << 16;    // bits 16-29: LBO
+    d |= (uint64_t)((sbo_bytes & 0x3FFFF) >> 4) << 32;    // bits 32-45: SBO
+    d |= (uint64_t)(1) << 46;                               // bits 46-48: 0b001
+    // bits 61-63: 0 = no swizzle
+    return d;
+}
+
 __device__ inline int smem_idx_kmajor_inter(int rows, int row, int col) {
     // Swizzle<0,4,3> K-major interleaved canonical index (bf16 elements).
     return ((row & 7) * 8) +
@@ -626,8 +637,7 @@ __device__ inline void score_ep_stage_regs(
     bool is_last_stage,
     float* lse_ptr
 ) {
-    // tcgen05.ld.32x32b.x16: lanes 0-15 from each of 4 warps hold data.
-    // Each active thread holds 16 f32 values = 16 heads for one token.
+    // tcgen05.ld.32x32b.x16: lanes 0-15 from each warp hold data.
     // tok = warp_id * 16 + lane, active when lane < 16.
     const bool active = (lane < 16);
     const int tok = warp_id * 16 + lane;
@@ -636,35 +646,35 @@ __device__ inline void score_ep_stage_regs(
     tcgen05_ld_32x32b_16(warp_id * 32, tmem_col_base, vals);
     tcgen05_wait_ld();
 
-    // --- max reduction ---
+    // --- per-head max within each warp (half-warp reduce over 16 active lanes) ---
     float m_local[kNumHeads];
     #pragma unroll
     for (int head = 0; head < kNumHeads; ++head) {
         m_local[head] = active ? vals[head] * sm_scale_log2e : -INFINITY;
     }
-
     #pragma unroll
     for (int head = 0; head < kNumHeads; ++head) {
-        const float m_warp = half_warp_reduce_max(m_local[head]);
-        if (lane == 0) {
-            s.score_m_partial[warp_id * kNumHeads + head] = m_warp;
-        }
+        m_local[head] = half_warp_reduce_max(m_local[head]);
+    }
+
+    // --- merge max across 4 warps, compute alpha (warp 0, lanes 0-15, one head per lane) ---
+    // Lane h in warp w writes its warp's max for head h.
+    if (lane < kNumHeads) {
+        s.score_m_partial[warp_id * kNumHeads + lane] = m_local[lane];
     }
     wg_sync(10);
 
-    if (warp_id == 0 && lane == 0) {
+    float m_new_h, alpha_h;
+    if (warp_id == 0 && lane < kNumHeads) {
+        float m_tile = s.score_m_partial[lane];
         #pragma unroll
-        for (int head = 0; head < kNumHeads; ++head) {
-            float m_tile = s.score_m_partial[head];
-            #pragma unroll
-            for (int w = 1; w < 4; ++w)
-                m_tile = fmaxf(m_tile, s.score_m_partial[w * kNumHeads + head]);
-            const float m_prev = s.m_state[head];
-            const float m_new = fmaxf(m_prev, m_tile);
-            const float alpha = (m_prev == -INFINITY) ? 0.0f : exp2f(m_prev - m_new);
-            s.score_m_new[head] = m_new;
-            s.stage_alpha[stage * kNumHeads + head] = alpha;
-        }
+        for (int w = 1; w < 4; ++w)
+            m_tile = fmaxf(m_tile, s.score_m_partial[w * kNumHeads + lane]);
+        const float m_prev = s.m_state[lane];
+        m_new_h = fmaxf(m_prev, m_tile);
+        alpha_h = (m_prev == -INFINITY) ? 0.0f : exp2f(m_prev - m_new_h);
+        s.score_m_new[lane] = m_new_h;
+        s.stage_alpha[stage * kNumHeads + lane] = alpha_h;
     }
     wg_sync(10);
 
@@ -674,43 +684,38 @@ __device__ inline void score_ep_stage_regs(
     for (int head = 0; head < kNumHeads; ++head) {
         float w = 0.0f;
         if (active) {
-            const float score = vals[head] * sm_scale_log2e;
-            w = exp2f(score - s.score_m_new[head]);
-        }
-        if (active) {
+            w = exp2f(vals[head] * sm_scale_log2e - s.score_m_new[head]);
             const int base = stage * kStageTokens * kNumHeads;
             const int dst = smem_idx_kmajor_inter(kNumHeads, head, tok);
             s.attn_weights[base + dst] = float_to_bf16(w);
         }
         l_local[head] = w;
     }
-
     #pragma unroll
     for (int head = 0; head < kNumHeads; ++head) {
-        const float l_warp = half_warp_reduce_sum(l_local[head]);
-        if (lane == 0) {
-            s.score_l_partial[warp_id * kNumHeads + head] = l_warp;
-        }
+        l_local[head] = half_warp_reduce_sum(l_local[head]);
+    }
+
+    // --- merge l across 4 warps, update state (warp 0, lanes 0-15) ---
+    if (lane < kNumHeads) {
+        s.score_l_partial[warp_id * kNumHeads + lane] = l_local[lane];
     }
     wg_sync(10);
 
-    if (warp_id == 0 && lane == 0) {
+    if (warp_id == 0 && lane < kNumHeads) {
+        const float alpha = s.stage_alpha[stage * kNumHeads + lane];
+        const float l_prev = s.l_state[lane];
+        float l_tile = s.score_l_partial[lane];
         #pragma unroll
-        for (int head = 0; head < kNumHeads; ++head) {
-            const float alpha = s.stage_alpha[stage * kNumHeads + head];
-            const float l_prev = s.l_state[head];
-            float l_tile = s.score_l_partial[head];
-            #pragma unroll
-            for (int w = 1; w < 4; ++w)
-                l_tile += s.score_l_partial[w * kNumHeads + head];
-            const float l_new = fmaf(l_prev, alpha, l_tile);
-            const float m_new = s.score_m_new[head];
-            s.m_state[head] = m_new;
-            s.l_state[head] = l_new;
-            if (is_last_stage) {
-                lse_ptr[head] = (l_new > 0.0f && m_new != -INFINITY)
-                    ? m_new + log2f(l_new) : -INFINITY;
-            }
+        for (int w = 1; w < 4; ++w)
+            l_tile += s.score_l_partial[w * kNumHeads + lane];
+        const float l_new = fmaf(l_prev, alpha, l_tile);
+        const float m_new = s.score_m_new[lane];
+        s.m_state[lane] = m_new;
+        s.l_state[lane] = l_new;
+        if (is_last_stage) {
+            lse_ptr[lane] = (l_new > 0.0f && m_new != -INFINITY)
+                ? m_new + log2f(l_new) : -INFINITY;
         }
     }
     wg_sync(10);
