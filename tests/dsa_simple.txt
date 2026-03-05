@@ -14,22 +14,22 @@ Running on:
 ## Benchmarks:
 ```
 batch: 1; num_pages: 32; seq_len: 2048; seed: 100
- ⏱ 4071.4 ± 3.13 µs
- ⚡ 4065.3 µs 🐌 4075.5 µs
- mismatch found! custom implementation doesn't match reference: out: 8143/8192 mismatches; first_idx=(0, 0, 0); got=-0.0402832; ref=0.121582; abs_diff=0.1618652; lse: 0/16 mismatches
- ❌ mismatch found! custom implementation doesn't match reference: out: 8143/8192 mismatches; first_idx=(0, 0, 0); got=-0.0402832; ref=0.121582; abs_diff=0.1618652; lse: 0/16 mismatches
+ ⏱ 4011.4 ± 1.36 µs
+ ⚡ 4010.0 µs 🐌 4014.1 µs
+ mismatch found! custom implementation doesn't match reference: out: 8136/8192 mismatches; first_idx=(0, 0, 0); got=0.04931641; ref=0.121582; abs_diff=0.07226562; lse: 0/16 mismatches
+ ❌ mismatch found! custom implementation doesn't match reference: out: 8136/8192 mismatches; first_idx=(0, 0, 0); got=0.04931641; ref=0.121582; abs_diff=0.07226562; lse: 0/16 mismatches
 
 batch: 8; num_pages: 64; seq_len: 4096; seed: 101
- ⏱ 3046.1 ± 0.77 µs
- ⚡ 3045.4 µs 🐌 3047.7 µs
- mismatch found! custom implementation doesn't match reference: out: 65129/65536 mismatches; first_idx=(0, 0, 0); got=0.03637695; ref=-0.05371094; abs_diff=0.09008789; lse: 0/128 mismatches
- ❌ mismatch found! custom implementation doesn't match reference: out: 65129/65536 mismatches; first_idx=(0, 0, 0); got=0.03637695; ref=-0.05371094; abs_diff=0.09008789; lse: 0/128 mismatches
+ ⏱ 3164.2 ± 0.01 µs
+ ⚡ 3164.2 µs 🐌 3164.2 µs
+ mismatch found! custom implementation doesn't match reference: out: 65093/65536 mismatches; first_idx=(0, 0, 0); got=-0.0255127; ref=-0.05371094; abs_diff=0.02819824; lse: 0/128 mismatches
+ ❌ mismatch found! custom implementation doesn't match reference: out: 65093/65536 mismatches; first_idx=(0, 0, 0); got=-0.0255127; ref=-0.05371094; abs_diff=0.02819824; lse: 0/128 mismatches
 
 batch: 16; num_pages: 128; seq_len: 8192; seed: 102
- ⏱ 3474.8 ± 1.35 µs
- ⚡ 3473.4 µs 🐌 3477.5 µs
- mismatch found! custom implementation doesn't match reference: out: 130240/131072 mismatches; first_idx=(0, 0, 0); got=0.0625; ref=0.04443359; abs_diff=0.01806641; lse: 0/256 mismatches
- ❌ mismatch found! custom implementation doesn't match reference: out: 130240/131072 mismatches; first_idx=(0, 0, 0); got=0.0625; ref=0.04443359; abs_diff=0.01806641; lse: 0/256 mismatches
+ ⏱ 3321.9 ± 0.01 µs
+ ⚡ 3321.9 µs 🐌 3321.9 µs
+ mismatch found! custom implementation doesn't match reference: out: 130140/131072 mismatches; first_idx=(0, 0, 0); got=-0.015625; ref=0.04443359; abs_diff=0.06005859; lse: 0/256 mismatches
+ ❌ mismatch found! custom implementation doesn't match reference: out: 130140/131072 mismatches; first_idx=(0, 0, 0); got=-0.015625; ref=0.04443359; abs_diff=0.06005859; lse: 0/256 mismatches
 ```
 
 ## Program stdout:

@@ -71,7 +71,7 @@ constexpr int kCkvRowBytes = kHeadDimCkv * sizeof(__nv_bfloat16);
 constexpr int kKpeRowBytes = kHeadDimKpe * sizeof(__nv_bfloat16);
 constexpr int kCkvChunkBytes = 128;
 constexpr int kCkvChunksPerRow = kCkvRowBytes / kCkvChunkBytes;
-constexpr int kNumScoreEpiWarpgroups = 1;
+constexpr int kNumScoreEpiWarpgroups = 2;
 constexpr int kNumValueEpiWarpgroups = 1;
 constexpr int kScoreEpiWarps = kNumScoreEpiWarpgroups * 4;
 constexpr int kValueEpiWarps = kNumValueEpiWarpgroups * 4;
@@ -90,6 +90,7 @@ struct __align__(1024) SmemLayout {
     __nv_bfloat16 kp_stage[kNumStages * kStageTokens * kHeadDimKpe];
     int stage_indices[kNumStages * kStageTokens];
     __nv_bfloat16 attn_weights[kNumStages * kStageTokens * kNumHeads];
+    __nv_bfloat16 kc_val_tile[kStageTokens * kValMmaMTile];
     float score_buf[kNumStages * kStageTokens * kNumHeads];
     float score_m_partial[4 * kNumHeads];
     float score_l_partial[4 * kNumHeads];
@@ -113,6 +114,7 @@ struct SmemAddrs {
     int q_nope;
     int q_pe;
     int kc_stage;
+    int kc_val_tile;
     int kp_stage;
     int attn_weights;
     int tma_mbar;
@@ -135,6 +137,7 @@ __device__ inline SmemAddrs init_smem_addrs(SmemLayout* s) {
     a.q_nope = off(s->q_nope);
     a.q_pe = off(s->q_pe);
     a.kc_stage = off(s->kc_stage);
+    a.kc_val_tile = off(s->kc_val_tile);
     a.kp_stage = off(s->kp_stage);
     a.attn_weights = off(s->attn_weights);
     a.tma_mbar = off(s->tma_mbar);
@@ -510,7 +513,7 @@ __device__ inline void run_mma_warps(
                                      ((uint32_t)(kStageTokens >> 4U) << 24U);
     constexpr uint32_t kValueIdesc = (1U << 7U) |
                                      (1U << 10U) |
-                                     (1U << 15U) |
+                                //     (1U << 15U) |
                                      (1U << 4U) |
                                      ((uint32_t)(kNumHeads >> 3U) << 17U) |
                                      ((uint32_t)(kValMmaMTile >> 4U) << 24U);
@@ -618,15 +621,8 @@ __device__ inline void run_mma_warps(
 
             for (int tile = 0; tile < kValMmaMTiles; ++tile) {
                 const int tmem_d = tmem_base + kValueTmemBase + tile * kNumHeads;
-                // Kc value slice: K-major, no swizzle, tile [kValMmaMTile, kMmaK]
-                // uint64_t kc_col_desc = make_umma_desc_from_smem<
-                //     cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
-                //     kValMmaMTile, kMmaK>(
-                //     addr.kc_stage + stage * kStageTokens * kCkvRowBytes +
-                //     tile * kValMmaMTile * sizeof(__nv_bfloat16));
                 uint64_t kc_col_desc = make_smem_desc_manual(
-                    addr.kc_stage + stage * kStageTokens * kCkvRowBytes +
-                    tile * kStageTokens * kValMmaMTile * sizeof(__nv_bfloat16),
+                    addr.kc_val_tile,
                     kValMmaMTile * 8 * sizeof(__nv_bfloat16),
                     8 * 8 * sizeof(__nv_bfloat16),
                     0, 0);
@@ -634,7 +630,7 @@ __device__ inline void run_mma_warps(
 
                 for (int ki = 0; ki < kValMmaKIters; ++ki) {
                     tcgen05_mma_f16(tmem_d, kc_col_desc, w_desc, kValueIdesc, (ki > 0) ? 1 : 0);
-                    kc_col_desc += kMmaK;
+                    kc_col_desc += kValMmaMTile * kMmaK * sizeof(__nv_bfloat16) / 16;
                     w_desc += kNumHeads * kMmaK * sizeof(__nv_bfloat16) / 16;
                 }
             }
@@ -645,6 +641,10 @@ __device__ inline void run_mma_warps(
 
 __device__ inline void wg_sync(int bar_slot) {
     asm volatile("bar.sync %0, 128;" :: "r"(bar_slot) : "memory");
+}
+
+__device__ inline void score_ep_dualwg_sync() {
+    asm volatile("bar.sync 13, 256;" ::: "memory");
 }
 
 __device__ inline float warp_reduce_max(float v) {
@@ -779,30 +779,69 @@ __device__ inline void run_score_epilogue_warps(
     float* lse_ptr
 ) {
     if (warp_id >= kScoreEpiWarps) return;
+    const int score_main_warps = kNumScoreEpiWarpgroups == 0 ? 0 : 4;
+    if (warp_id < score_main_warps) {
+        for (int local = 0; local < stages_total; ++local) {
+            const int stage = local % kNumStages;
+            const int phase = (local / kNumStages) & 1;
+
+            if (lane == 0) {
+                mbarrier_wait_parity(
+                    addr.score_mma_mbar + stage * sizeof(uint64_t),
+                    phase);
+            }
+            wg_sync(10);
+            tcgen05_fence_after_thread_sync();
+
+            const bool is_last_stage = (local + 1 >= stages_total);
+            score_ep_stage_regs(
+                s, lane, warp_id, stage, stage, sm_scale_log2e, is_last_stage, lse_ptr);
+            // Make attn_weights writes visible before signaling score->value handoff.
+            fence_proxy_async_shared_cta();
+            wg_sync(10);
+            score_ep_dualwg_sync();
+
+            if (warp_id == 0 && lane == 0) {
+                mbarrier_arrive(addr.score_epi_mbar + stage * sizeof(uint64_t));
+                mbarrier_arrive(addr.score_tmem_reuse_mbar + stage * sizeof(uint64_t));
+            }
+        }
+        return;
+    }
+
+    // Secondary score-ep warpgroup: transpose kc_stage tile-by-tile into kc_val_tile
+    // so value MMA can use standard K-major, non-transposed A descriptors.
+    const int tx_warp = warp_id - score_main_warps;
+    const int tx_tid = tx_warp * 32 + lane;
     for (int local = 0; local < stages_total; ++local) {
         const int stage = local % kNumStages;
         const int phase = (local / kNumStages) & 1;
-
         if (lane == 0) {
             mbarrier_wait_parity(
                 addr.score_mma_mbar + stage * sizeof(uint64_t),
                 phase);
         }
-        wg_sync(10);
+        wg_sync(11);
         tcgen05_fence_after_thread_sync();
 
-        const bool is_last_stage = (local + 1 >= stages_total);
-        score_ep_stage_regs(
-            s, lane, warp_id, stage, stage, sm_scale_log2e, is_last_stage, lse_ptr);
-        //wg_sync(10);
-        // Make attn_weights writes visible before signaling score->value handoff.
-        fence_proxy_async_shared_cta();
-        wg_sync(10);
+        const int src_stage_base = stage * kStageTokens * kHeadDimCkv;
+        for (int tile = 0; tile < kValMmaMTiles; ++tile) {
+            wg_sync(11);
 
-        if (warp_id == 0 && lane == 0) {
-            mbarrier_arrive(addr.score_epi_mbar + stage * sizeof(uint64_t));
-            mbarrier_arrive(addr.score_tmem_reuse_mbar + stage * sizeof(uint64_t));
+            for (int idx = tx_tid; idx < kValMmaMTile * kStageTokens; idx += 128) {
+                const int dim_in_tile = idx / kStageTokens;
+                const int tok = idx - dim_in_tile * kStageTokens;
+                const int src_dim = tile * kValMmaMTile + dim_in_tile;
+                const int src = smem_idx_kmajor_inter(kStageTokens, tok, src_dim);
+                const int dst = smem_idx_kmajor_inter(kValMmaMTile, dim_in_tile, tok);
+                s.kc_val_tile[dst] = s.kc_stage[src_stage_base + src];
+            }
+            wg_sync(11);
         }
+        // Make kc_val_tile writes visible to value MMA (tcgen05 async proxy).
+        fence_proxy_async_shared_cta();
+        wg_sync(11);
+        score_ep_dualwg_sync();
     }
 }
 
