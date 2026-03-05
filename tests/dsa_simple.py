@@ -166,14 +166,28 @@ __device__ inline uint64_t make_umma_desc_from_smem(int smem_addr) {
     return static_cast<uint64_t>(cute::UMMA::make_umma_desc<Major>(tensor));
 }
 
-__device__ inline uint64_t make_smem_desc_manual(int smem_addr, int lbo_bytes, int sbo_bytes) {
+
+__device__ inline uint64_t make_smem_desc_manual(int smem_addr, int lbo_bytes, int sbo_bytes,
+    int matrix_base_offset, int swizzle) {
     // PTX spec 9.7.16.4.1: matrix-descriptor-encode(x) = (x & 0x3FFFF) >> 4
     uint64_t d = 0;
-    d |= (uint64_t)((smem_addr & 0x3FFFF) >> 4);          // bits 0-13: start addr
-    d |= (uint64_t)((lbo_bytes & 0x3FFFF) >> 4) << 16;    // bits 16-29: LBO
-    d |= (uint64_t)((sbo_bytes & 0x3FFFF) >> 4) << 32;    // bits 32-45: SBO
-    d |= (uint64_t)(1) << 46;                               // bits 46-48: 0b001
-    // bits 61-63: 0 = no swizzle
+    const uint64_t start = (static_cast<uint64_t>(static_cast<uint32_t>(smem_addr) & 0x3FFFFu) >> 4);
+    const uint64_t lbo = (static_cast<uint64_t>(static_cast<uint32_t>(lbo_bytes) & 0x3FFFFu) >> 4);
+    const uint64_t sbo = (static_cast<uint64_t>(static_cast<uint32_t>(sbo_bytes) & 0x3FFFFu) >> 4);
+
+    const uint64_t base_off = static_cast<uint64_t>(matrix_base_offset & 0x7);
+    const int swz_in = (swizzle & 0x7);
+    const int swz = (swz_in == 0 || swz_in == 1 || swz_in == 2 || swz_in == 4 || swz_in == 6)
+        ? swz_in : 0;
+
+    d |= start;                           // bits 0-13: matrix start address (encoded)
+    d |= lbo << 16;                       // bits 16-29: leading-dimension byte offset/address (encoded)
+    d |= sbo << 32;                       // bits 32-45: stride-dimension byte offset (encoded)
+    d |= uint64_t{1} << 46;               // bits 46-48: version field = 0b001
+    d |= ((swz == 0) ? 0ull : base_off) << 49;  // bits 49-51: base offset (unused for no-swizzle)
+
+    d |= static_cast<uint64_t>(swz) << 61;      // bits 61-63: swizzle mode
+
     return d;
 }
 
@@ -184,6 +198,8 @@ __device__ inline int smem_idx_kmajor_inter(int rows, int row, int col) {
            (col & 7) +
            ((col >> 3) * rows * 8);
 }
+
+
 
 __device__ inline void mbarrier_init(int mbar_addr, int count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(mbar_addr), "r"(count));
@@ -523,14 +539,24 @@ __device__ inline void run_mma_warps(
 
             const int tmem_d = tmem_base + tmem_slot * kStageTokens;
 
-            uint64_t kc_desc = make_umma_desc_from_smem<
-                cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
-                kStageTokens, kMmaK>(
-                addr.kc_stage + stage * kStageTokens * kCkvRowBytes);
+            // uint64_t kc_desc = make_umma_desc_from_smem<
+            //     cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
+            //     kStageTokens, kMmaK>(
+            //     addr.kc_stage + stage * kStageTokens * kCkvRowBytes);
+            uint64_t kc_desc = make_smem_desc_manual(
+                addr.kc_stage + stage * kStageTokens * kCkvRowBytes,
+                kStageTokens * 8 * sizeof(__nv_bfloat16),
+                8 * 8 * sizeof(__nv_bfloat16),
+                0, 0);
 
-            uint64_t qn_desc = make_umma_desc_from_smem<
-                cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
-                kNumHeads, kMmaK>(addr.q_nope);
+            // uint64_t qn_desc = make_umma_desc_from_smem<
+            //     cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
+            //     kNumHeads, kMmaK>(addr.q_nope);
+            uint64_t qn_desc = make_smem_desc_manual(
+                addr.q_nope,
+                kNumHeads * 8 * sizeof(__nv_bfloat16),
+                8 * 8 * sizeof(__nv_bfloat16),
+                0, 0);
             #pragma unroll
             for (int ki = 0; ki < kMmaItersCkv; ++ki) {
                 tcgen05_mma_f16(tmem_d, kc_desc, qn_desc, kScoreIdesc, (ki > 0) ? 1 : 0);
@@ -539,14 +565,25 @@ __device__ inline void run_mma_warps(
             }
 
             // Kp: K-major, no swizzle, tile [kStageTokens, kMmaK]
-            uint64_t kp_desc = make_umma_desc_from_smem<
-                cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
-                kStageTokens, kMmaK>(
-                addr.kp_stage + stage * kStageTokens * kKpeRowBytes);
+            // uint64_t kp_desc = make_umma_desc_from_smem<
+            //     cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
+            //     kStageTokens, kMmaK>(
+            //     addr.kp_stage + stage * kStageTokens * kKpeRowBytes);
+            uint64_t kp_desc = make_smem_desc_manual(
+                addr.kp_stage + stage * kStageTokens * kKpeRowBytes,
+                kStageTokens * 8 * sizeof(__nv_bfloat16),
+                8 * 8 * sizeof(__nv_bfloat16),
+                0, 0);
+
             // Q_pe: K-major, tile [kNumHeads, kMmaK]
-            uint64_t qp_desc = make_umma_desc_from_smem<
-                cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
-                kNumHeads, kMmaK>(addr.q_pe);
+            // uint64_t qp_desc = make_umma_desc_from_smem<
+            //     cute::UMMA::Major::K, cute::UMMA::Layout_K_INTER_Atom<__nv_bfloat16>,
+            //     kNumHeads, kMmaK>(addr.q_pe);
+            uint64_t qp_desc = make_smem_desc_manual(
+                addr.q_pe,
+                kNumHeads * 8 * sizeof(__nv_bfloat16),
+                8 * 8 * sizeof(__nv_bfloat16),
+                0, 0);
             #pragma unroll
             for (int ki = 0; ki < kMmaItersKpe; ++ki) {
                 tcgen05_mma_f16(tmem_d, kp_desc, qp_desc, kScoreIdesc, 1);
