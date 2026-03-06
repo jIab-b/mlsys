@@ -1,0 +1,15 @@
+{
+  "status": "pass",
+  "strict": false,
+  "checks_run": [
+    "idesc"
+  ],
+  "findings": [],
+  "meta": {
+    "nodes": 10,
+    "buffers": 12,
+    "barriers": 10,
+    "descriptors": 6,
+    "tmaps": 2
+  }
+}

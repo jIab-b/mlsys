@@ -35,12 +35,12 @@ OP_ARG_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "tcgen05_cp": {
         "required": {"tmem"},
-        "optional": {"cta_group", "tmem_offset", "cols"},
+        "optional": {"cta_group", "tmem_offset", "cols", "smem_desc"},
         "ints": {"tmem_offset", "cols"},
     },
     "tcgen05_mma": {
         "required": {"tmem"},
-        "optional": {"cta_group"},
+        "optional": {"cta_group", "idesc", "smem_desc_a", "smem_desc_b"},
     },
     "tcgen05_ld": {
         "required": {"tmem"},
@@ -192,6 +192,66 @@ TMA_DTYPE_SWIZZLE_ALLOWED = {
 TCGEN_DESC_SBO_LBO_LUT: Dict[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], set[tuple[int, int]]] = {
     ("tcgen05_cp", "32x128b", "warpx4", "none", "K"): {(128, 1)},
     ("tcgen05_mma", "mxf4nvf4.block16", None, "128b", "K"): {(1024, 1)},
+}
+
+# Simple descriptor objects for static legality checks.
+TCGEN05_SMEM_DESC_LEGAL = {
+    "keys": {"raw", "start_enc", "ld_enc", "sd_enc", "base_offset", "ld_mode", "swizzle_code", "fixed_46_48"},
+    "ranges": {
+        "raw": (0, 0xFFFFFFFFFFFFFFFF),
+        "start_enc": (0, 0x3FFF),
+        "ld_enc": (0, 0x3FFF),
+        "sd_enc": (0, 0x3FFF),
+        "base_offset": (0, 0x7),
+        "ld_mode": (0, 1),
+        "swizzle_code": (0, 7),
+        "fixed_46_48": (0b001, 0b001),
+    },
+    "invalid_swizzle_code": {3, 5, 7},
+    "valid_swizzle_code": {0, 1, 2, 4, 6},
+}
+
+TCGEN05_IDESC_LEGAL = {
+    "keys": {
+        "raw",
+        # table-42 style fields
+        "sparsity_selector", "sparsity", "saturate", "dtype_d", "reserved_6",
+        "atype", "btype", "negate_a", "negate_b", "transpose_a", "transpose_b",
+        "n_over_8", "reserved_23", "m_over_16", "reserved_29", "ws_b_reuse_shift",
+        # table-43/44 extra fields
+        "reserved_0_1", "reserved_3", "b_scale_data_id", "scale_matrix_type",
+        "reserved_24_26", "m_over_128", "a_scale_data_id", "reserved_31",
+        "reserved_12", "k_dim_selector",
+    },
+    "ranges": {
+        "raw": (0, 0xFFFFFFFF),
+        "sparsity_selector": (0, 3),
+        "sparsity": (0, 1),
+        "saturate": (0, 1),
+        "dtype_d": (0, 3),
+        "reserved_6": (0, 0),
+        "atype": (0, 7),
+        "btype": (0, 7),
+        "negate_a": (0, 1),
+        "negate_b": (0, 1),
+        "transpose_a": (0, 1),
+        "transpose_b": (0, 1),
+        "n_over_8": (0, 63),
+        "reserved_23": (0, 0),
+        "m_over_16": (0, 31),
+        "reserved_29": (0, 0),
+        "ws_b_reuse_shift": (0, 3),
+        "reserved_0_1": (0, 0),
+        "reserved_3": (0, 0),
+        "b_scale_data_id": (0, 3),
+        "scale_matrix_type": (0, 1),
+        "reserved_24_26": (0, 0),
+        "m_over_128": (0, 3),
+        "a_scale_data_id": (0, 3),
+        "reserved_31": (0, 0),
+        "reserved_12": (0, 0),
+        "k_dim_selector": (0, 1),
+    },
 }
 
 

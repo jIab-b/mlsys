@@ -17,9 +17,17 @@ from graph.ir import (
 
 _MEMSPACE_MAP = {
     "gmem": MemSpace.GMEM,
+    "global": MemSpace.GMEM,
+    "globalmem": MemSpace.GMEM,
     "smem": MemSpace.SMEM,
+    "shared": MemSpace.SMEM,
+    "sharedmem": MemSpace.SMEM,
     "tmem": MemSpace.TMEM,
+    "tensor": MemSpace.TMEM,
+    "tensorcore": MemSpace.TMEM,
     "rmem": MemSpace.RMEM,
+    "reg": MemSpace.RMEM,
+    "register": MemSpace.RMEM,
 }
 
 

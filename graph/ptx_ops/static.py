@@ -12,8 +12,10 @@ from graph.ptx_ops.spec import (
     PTX_TCGEN05_CP_SHAPE_TILE,
     PTX_TCGEN05_MMA_SHAPES,
     PTX_TCGEN05_NO_TRANSPOSE_KINDS,
+    TCGEN05_IDESC_LEGAL,
     TCGEN05_LD_SHAPES,
     TCGEN05_NUM_VALUES,
+    TCGEN05_SMEM_DESC_LEGAL,
     TMA_INTERLEAVE_SET,
     TMA_SWIZZLE_SET,
     _canonical_op_name,
@@ -34,6 +36,83 @@ def _validate_cta_group(op_name: str, op_args: Dict[str, Any]) -> None:
         raise ValueError(f"{op_name}: cta_group must be integer, got {type(cta_group).__name__}")
     if cta_group not in (1, 2):
         raise ValueError(f"{op_name}: cta_group must be 1 or 2, got {cta_group}")
+
+
+def _bits_u(value: int, lo: int, hi: int) -> int:
+    return (value >> lo) & ((1 << (hi - lo + 1)) - 1)
+
+
+def _check_range(op_name: str, field_name: str, val: Any, lo: int, hi: int) -> None:
+    if not isinstance(val, int):
+        raise ValueError(f"{op_name}: {field_name} must be integer")
+    if val < lo or val > hi:
+        raise ValueError(f"{op_name}: {field_name} must be in [{lo}, {hi}], got {val}")
+
+
+def _validate_smem_desc(op_name: str, arg_name: str, desc: Any) -> None:
+    if desc is None:
+        return
+    legal = TCGEN05_SMEM_DESC_LEGAL
+    ranges = legal["ranges"]
+    if isinstance(desc, int):
+        lo, hi = ranges["raw"]
+        _check_range(op_name, arg_name, desc, lo, hi)
+        fixed = _bits_u(desc, 46, 48)
+        fixed_lo, fixed_hi = ranges["fixed_46_48"]
+        if fixed < fixed_lo or fixed > fixed_hi:
+            raise ValueError(f"{op_name}: {arg_name} bits[46:48] must be {fixed_lo}")
+        sw = _bits_u(desc, 61, 63)
+        if sw in legal["invalid_swizzle_code"] or sw not in legal["valid_swizzle_code"]:
+            raise ValueError(f"{op_name}: {arg_name} has invalid swizzle_code {sw}")
+        return
+    if not isinstance(desc, dict):
+        raise ValueError(f"{op_name}: {arg_name} must be int or dict")
+
+    unknown = set(desc.keys()) - legal["keys"]
+    if unknown:
+        raise ValueError(f"{op_name}: {arg_name} has unknown fields {sorted(unknown)}")
+
+    for field in ("start_enc", "ld_enc", "sd_enc", "base_offset", "ld_mode", "fixed_46_48", "raw"):
+        val = desc.get(field)
+        if val is None:
+            continue
+        lo, hi = ranges[field]
+        _check_range(op_name, f"{arg_name}.{field}", val, lo, hi)
+
+    swizzle = desc.get("swizzle_code")
+    if swizzle is not None:
+        lo, hi = ranges["swizzle_code"]
+        _check_range(op_name, f"{arg_name}.swizzle_code", swizzle, lo, hi)
+        if swizzle in legal["invalid_swizzle_code"] or swizzle not in legal["valid_swizzle_code"]:
+            raise ValueError(f"{op_name}: {arg_name}.swizzle_code {swizzle} is invalid")
+
+
+def _validate_idesc(op_name: str, idesc: Any) -> None:
+    if idesc is None:
+        return
+    legal = TCGEN05_IDESC_LEGAL
+    ranges = legal["ranges"]
+    if isinstance(idesc, int):
+        lo, hi = ranges["raw"]
+        _check_range(op_name, "idesc", idesc, lo, hi)
+        return
+    if not isinstance(idesc, dict):
+        raise ValueError(f"{op_name}: idesc must be int or dict")
+
+    unknown = set(idesc.keys()) - legal["keys"]
+    if unknown:
+        raise ValueError(f"{op_name}: idesc has unknown fields {sorted(unknown)}")
+
+    for field, val in idesc.items():
+        if field == "raw":
+            continue
+        lo, hi = ranges[field]
+        _check_range(op_name, f"idesc.{field}", val, lo, hi)
+
+    raw = idesc.get("raw")
+    if raw is not None:
+        lo, hi = ranges["raw"]
+        _check_range(op_name, "idesc.raw", raw, lo, hi)
 
 
 def validate_args(op_name: str, args: Dict[str, Any], loc_str: str = "") -> None:
@@ -72,6 +151,7 @@ def validate_ptx_op(op_name: str, op_args: Dict[str, Any]) -> None:
                     f"{op_name}: unsupported tcgen05.cp shape/tile {key}; "
                     f"allowed={sorted(PTX_TCGEN05_CP_SHAPE_TILE)}"
                 )
+        _validate_smem_desc(op_name, "smem_desc", op_args.get("smem_desc"))
 
     if canonical == "tcgen05_mma":
         shape = op_args.get("shape")
@@ -90,10 +170,9 @@ def validate_ptx_op(op_name: str, op_args: Dict[str, Any]) -> None:
                         f"{op_name}: transpose_a/transpose_b not supported for kind {kind} "
                         "(per PTX tcgen05 MMA spec)"
                     )
-        idesc = op_args.get("idesc")
-        if idesc is not None and isinstance(idesc, int):
-            if idesc < 0 or idesc > 0xFFFFFFFF:
-                raise ValueError(f"{op_name}: idesc must fit in 32-bit unsigned range")
+        _validate_idesc(op_name, op_args.get("idesc"))
+        _validate_smem_desc(op_name, "smem_desc_a", op_args.get("smem_desc_a"))
+        _validate_smem_desc(op_name, "smem_desc_b", op_args.get("smem_desc_b"))
 
     if canonical in ("tcgen05_ld", "tcgen05_st"):
         shape = op_args.get("shape")
